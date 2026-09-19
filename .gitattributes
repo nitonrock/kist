@@ -1,0 +1,4 @@
+secrets*.yaml filter=kist
+secrets*.yml filter=kist
+secrets/*.yaml filter=kist
+secrets/*.yml filter=kist

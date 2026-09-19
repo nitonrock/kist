@@ -1,0 +1,44 @@
+[project]
+name = "kist"
+version = "0.1.0"
+description = "A Self-Sufficient Multi-Profile Secrets Manager and Absolute Git Leak Guard"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+authors = [
+    { name = "Kist Maintainers" }
+]
+keywords = [
+    "secrets",
+    "security",
+    "git",
+    "postgresql",
+    "fernet",
+    "encryption",
+    "fastapi",
+    "git-leak-guard",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Software Development :: Build Tools",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "cryptography>=50.0.0",
+    "psycopg[binary]>=3.3.4",
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+kist = "kist:main"
+
+[build-system]
+requires = ["uv-build>=0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "kist"
+module-root = ""

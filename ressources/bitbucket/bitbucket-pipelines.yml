@@ -1,0 +1,45 @@
+image: python:3.13-slim
+
+definitions:
+  steps:
+    - step: &leak-guard
+        name: Scan for Plaintext Secrets
+        script:
+          - |
+            echo "🔍 Verifying all secret YAML files are Fernet-encrypted..."
+            for file in $(find . -maxdepth 2 -name "secrets*.yaml" -o -name "secrets*.yml"); do
+              if [ -s "$file" ]; then
+                first_chars=$(head -c 6 "$file")
+                if [ "$first_chars" != "gAAAAA" ]; then
+                  echo "🚨 CRITICAL: $file contains unencrypted secrets!"
+                  exit 1
+                fi
+              fi
+            done
+            echo "✅ Encryption verified for all secrets files."
+
+pipelines:
+  # Run leak guard on all Pull Requests
+  pull-requests:
+    '**':
+      - step: *leak-guard
+
+  # Main branch pipeline: Sync secrets & deploy
+  branches:
+    main:
+      - step: *leak-guard
+      - step:
+          name: Lock Secrets & Sync PostgreSQL
+          caches:
+            - pip
+          script:
+            - pip install uv
+            - uv sync
+            - export KIST_DATABASE_URL=$KIST_DATABASE_URL
+            - export KIST_PASSWORD_PRODUCTION=$KIST_PASSWORD_PRODUCTION
+            - echo "🔒 Updating secrets in centralized database..."
+            - uv run kist lock secrets_production.yaml
+      - step:
+          name: Deploy Application
+          script:
+            - echo "🚀 Deploying application..."
