@@ -1,0 +1,53 @@
+stages:
+  - security
+  - sync_secrets
+  - deploy
+
+default:
+  image: python:3.13-slim
+  before_script:
+    - pip install --upgrade pip
+    - pip install uv
+    - uv sync
+
+# 1. Leak detection on Merge Requests
+leak_guard_check:
+  stage: security
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+  script:
+    - |
+      echo "🔍 Scanning repository for unencrypted secret files..."
+      for file in $(find . -maxdepth 2 -name "secrets*.yaml" -o -name "secrets*.yml"); do
+        if [ -s "$file" ]; then
+          first_chars=$(head -c 6 "$file")
+          if [ "$first_chars" != "gAAAAA" ]; then
+            echo "🚨 Plaintext leak detected in $file!"
+            exit 1
+          fi
+        fi
+      done
+      echo "✅ All secrets files verified as encrypted."
+
+# 2. Lock secrets into PostgreSQL on main branch merge
+sync_production_secrets:
+  stage: sync_secrets
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+      changes:
+        - secrets*.yaml
+        - secrets*.yml
+  variables:
+    KIST_DATABASE_URL: $KIST_DATABASE_URL
+    KIST_PASSWORD_PRODUCTION: $KIST_PASSWORD_PRODUCTION
+  script:
+    - echo "🔒 Locking secrets to centralized PostgreSQL database..."
+    - uv run kist lock secrets_production.yaml
+
+# 3. Deploy application services
+deploy_prod:
+  stage: deploy
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  script:
+    - echo "🚀 Deploying updated service..."

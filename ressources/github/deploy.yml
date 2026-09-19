@@ -1,0 +1,38 @@
+name: Deploy & Sync Secrets
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'secrets*.yaml'
+      - 'secrets*.yml'
+      - 'src/**'
+
+jobs:
+  sync-secrets-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python & uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+          python-version: "3.13"
+
+      - name: Install Project & Kist
+        run: uv sync
+
+      - name: Sync Secrets to Production Database
+        env:
+          KIST_DATABASE_URL: ${{ secrets.KIST_DATABASE_URL }}
+          KIST_PASSWORD_PRODUCTION: ${{ secrets.KIST_PASSWORD_PRODUCTION }}
+        run: |
+          echo "🔒 Flattening and encrypting secrets into PostgreSQL..."
+          uv run kist lock secrets_production.yaml
+
+      - name: Deploy Application Container
+        run: |
+          echo "🚀 Deploying application (DynamicSecretStore auto-refreshes secrets via NOTIFY)..."
