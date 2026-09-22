@@ -171,7 +171,7 @@ class TestAsyncDynamicSecretStore(unittest.IsolatedAsyncioTestCase):
             "profile_id": 10,
             "secret_key": "config.json",
         })
-        store._handle_notification(mock_notify)
+        await store._handle_notification(mock_notify)
 
         val3 = await store.get("config.json")
         self.assertEqual(val3, {"nested": "new"})

@@ -1,23 +1,110 @@
-import os
-import json
-import time
-import threading
+"""Runtime secret stores with bounded, opt-in plaintext caching."""
+
+from __future__ import annotations
+
 import asyncio
+import json
+import os
+import threading
+import time
+from dataclasses import dataclass
 from typing import Any, Optional
-import psycopg
+
 from psycopg import sql
 
-from kist.core import Kist, get_profile_password, safe_db_connect, safe_async_db_connect, enforce_ssl_url
+from kist.core import Kist, get_profile_password, safe_async_db_connect, safe_db_connect
 
 
-class DynamicSecretStore:
-    """
-    Push-Based Invalidation Secret Store using PostgreSQL LISTEN / NOTIFY.
+@dataclass(frozen=True)
+class CachePolicy:
+    """Plaintext cache policy. Defaults to enabled with 30s TTL."""
 
-    Maintains an in-memory cache of secrets for sub-millisecond lookups while
-    running a background listener thread that invalidates cache entries immediately
-    when secret update notifications are broadcast on PostgreSQL.
-    """
+    enabled: bool = True
+    ttl_seconds: float = 30.0
+    max_entries: int = 128
+    clear_on_disconnect: bool = True
+
+
+def _notification_matches(payload: dict[str, Any], profile_name: str, profile_id: Optional[Any]) -> bool:
+    """Match every supplied identifier; do not use ambiguous OR matching."""
+    payload_name = payload.get("profile_name")
+    payload_id = payload.get("profile_id")
+    if payload_name is None and payload_id is None:
+        return False
+    if payload_name is not None and str(payload_name) != str(profile_name):
+        return False
+    if payload_id is not None and profile_id is not None and str(payload_id) != str(profile_id):
+        return False
+    return True
+
+
+class TTLSecretStore:
+    """Bounded TTL cache over a Kist database store."""
+
+    def __init__(
+        self,
+        ttl_seconds: float = 30.0,
+        profile_name: Optional[str] = None,
+        master_password: Optional[str] = None,
+        db_url: Optional[str] = None,
+        kist: Optional[Kist] = None,
+        cache_policy: Optional[CachePolicy] = None,
+    ) -> None:
+        self.profile_name = profile_name or os.getenv("KIST_PROFILE", "default")
+        self.kist = kist or Kist(
+            profile_name=self.profile_name,
+            master_password=master_password or get_profile_password(self.profile_name),
+            db_url=db_url,
+        )
+        self.policy = cache_policy or CachePolicy(enabled=True, ttl_seconds=ttl_seconds)
+        if self.policy.ttl_seconds <= 0 or self.policy.max_entries <= 0:
+            raise ValueError("Cache TTL and maximum entries must be positive.")
+        self._cache: dict[str, tuple[float, Any]] = {}
+        self._lock = threading.Lock()
+
+    def get(self, key: str, default: Any = ...) -> Any:
+        now = time.monotonic()
+        if self.policy.enabled:
+            with self._lock:
+                cached = self._cache.get(key)
+                if cached and now - cached[0] < self.policy.ttl_seconds:
+                    return cached[1]
+                if cached:
+                    self._cache.pop(key, None)
+        try:
+            value = self.kist.get(key)
+        except KeyError:
+            if default is not ...:
+                return default
+            raise
+        if self.policy.enabled:
+            with self._lock:
+                if len(self._cache) >= self.policy.max_entries:
+                    self._cache.pop(next(iter(self._cache)))
+                self._cache[key] = (now, value)
+        return value
+
+    def get_secret(self, key: str, default: Any = ...) -> Any:
+        return self.get(key, default)
+
+    def invalidate(self, key: Optional[str] = None) -> None:
+        with self._lock:
+            if key is None:
+                self._cache.clear()
+            else:
+                self._cache.pop(key, None)
+
+    clear = invalidate
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        self.invalidate()
+
+
+class DynamicSecretStore(TTLSecretStore):
+    """Opt-in cache invalidated by authenticated PostgreSQL notification access."""
 
     def __init__(
         self,
@@ -25,220 +112,72 @@ class DynamicSecretStore:
         master_password: Optional[str] = None,
         db_url: Optional[str] = None,
         channel: str = "kist_secret_updated",
-        auto_start: bool = True,
+        auto_start: bool = False,
         kist: Optional[Kist] = None,
-    ):
-        self.profile_name = profile_name or os.getenv("KIST_PROFILE", "default")
-        self.db_url = db_url or os.getenv("KIST_DATABASE_URL")
+        cache_policy: Optional[CachePolicy] = None,
+    ) -> None:
+        super().__init__(
+            profile_name=profile_name,
+            master_password=master_password,
+            db_url=db_url,
+            kist=kist,
+            cache_policy=cache_policy or CachePolicy(enabled=True),
+        )
+        self.db_url = db_url or self.kist.db_url
         self.channel = channel
-
-        if kist is not None:
-            self.kist = kist
-        else:
-            self.kist = Kist(
-                profile_name=self.profile_name,
-                master_password=master_password or get_profile_password(self.profile_name, auto_generate=False),
-            )
-
-        if not self.db_url and self.kist.db_url:
-            self.db_url = self.kist.db_url
-
-        self._cache: dict[str, Any] = {}
-        self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._listener_thread: Optional[threading.Thread] = None
-
-        if auto_start and self.db_url:
+        if auto_start:
             self.start()
 
-    def start(self):
-        """Starts the background PostgreSQL notification listener thread."""
+    def start(self) -> None:
+        if not self.db_url:
+            raise RuntimeError("A database URL is required for dynamic invalidation.")
         if self._listener_thread and self._listener_thread.is_alive():
             return
-
         self._stop_event.clear()
-        self._listener_thread = threading.Thread(
-            target=self._listen_for_updates,
-            name=f"kist-listener-{self.profile_name}",
-            daemon=True,
-        )
+        self._listener_thread = threading.Thread(target=self._listen_for_updates, name=f"kist-listener-{self.profile_name}", daemon=True)
         self._listener_thread.start()
 
-    def get(self, key: str, default: Any = ...) -> Any:
-        """
-        Retrieves a secret by its dot-notation key path.
-        Returns from in-memory cache if present; otherwise fetches from PostgreSQL and caches.
-        """
-        with self._lock:
-            if key in self._cache:
-                return self._cache[key]
-
-        try:
-            val = self.kist.get(key)
-        except KeyError:
-            if default is not ...:
-                return default
-            raise
-
-        with self._lock:
-            self._cache[key] = val
-        return val
-
-    def get_secret(self, key: str, default: Any = ...) -> Any:
-        """Alias for get()."""
-        return self.get(key, default=default)
-
-    def invalidate(self, key: Optional[str] = None):
-        """Invalidates a single cached key, or the entire memory cache if key is None."""
-        with self._lock:
-            if key is not None:
-                self._cache.pop(key, None)
-            else:
-                self._cache.clear()
-
-    def _listen_for_updates(self):
-        """Listens to PostgreSQL NOTIFY events to invalidate local cache in real time."""
+    def _listen_for_updates(self) -> None:
         while not self._stop_event.is_set():
             try:
                 with safe_db_connect(self.db_url, autocommit=True) as conn:
                     conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self.channel)))
                     while not self._stop_event.is_set():
                         for notification in conn.notifies(timeout=0.5):
-                            self._handle_notification(notification)
-                            if self._stop_event.is_set():
-                                break
+                            self._handle_notification(notification.payload)
             except Exception:
-                # Invalidate cache defensively on connection drop/error and wait before retrying
-                with self._lock:
-                    self._cache.clear()
+                if self.policy.clear_on_disconnect:
+                    self.invalidate()
                 if not self._stop_event.is_set():
                     time.sleep(2.0)
 
-    def _handle_notification(self, notification):
-        """Parses notification payload and evicts matching keys from local cache."""
+    def _handle_notification(self, raw_payload: Any) -> None:
         try:
-            payload = json.loads(notification.payload)
-            target_profile = payload.get("profile_name")
-            target_id = payload.get("profile_id")
-
-            # Check if this notification applies to our profile
-            matches_name = target_profile == self.profile_name if target_profile else True
-            matches_id = target_id == self.kist.profile_id if (target_id and self.kist.profile_id) else True
-
-            if matches_name or matches_id:
-                secret_key = payload.get("secret_key")
-                with self._lock:
-                    if secret_key is not None:
-                        self._cache.pop(secret_key, None)
-                    else:
-                        self._cache.clear()
+            if hasattr(raw_payload, "payload"):
+                raw_payload = raw_payload.payload
+            payload = json.loads(raw_payload) if isinstance(raw_payload, (str, bytes)) else raw_payload
+            if not isinstance(payload, dict) or not _notification_matches(payload, self.profile_name, self.kist.profile_id):
+                return
+            key = payload.get("secret_key")
+            self.invalidate(key if isinstance(key, str) else None)
         except Exception:
-            # Fallback: on malformed JSON payload, clear entire cache defensively
-            with self._lock:
-                self._cache.clear()
+            self.invalidate()
 
-    def close(self):
-        """Stops the background listener thread and clears the memory cache."""
+    def close(self) -> None:
         self._stop_event.set()
         if self._listener_thread and self._listener_thread.is_alive():
             self._listener_thread.join(timeout=1.0)
-            self._listener_thread = None
-        with self._lock:
-            self._cache.clear()
+        self._listener_thread = None
+        self.invalidate()
 
-    def __enter__(self):
-        if self.db_url and not (self._listener_thread and self._listener_thread.is_alive()):
-            self.start()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
 
-class TTLSecretStore:
-    """
-    Time-To-Live (TTL) In-Memory Secret Store.
-
-    Caches decrypted secrets in memory with a configurable expiration time (TTL).
-    When a key expires or is accessed for the first time, it re-fetches the latest
-    value from PostgreSQL.
-    """
-
-    def __init__(
-        self,
-        ttl_seconds: float = 60.0,
-        profile_name: Optional[str] = None,
-        master_password: Optional[str] = None,
-        db_url: Optional[str] = None,
-        kist: Optional[Kist] = None,
-    ):
-        self.ttl = float(ttl_seconds)
-        self.profile_name = profile_name or os.getenv("KIST_PROFILE", "default")
-
-        if kist is not None:
-            self.kist = kist
-        else:
-            self.kist = Kist(
-                profile_name=self.profile_name,
-                master_password=master_password or get_profile_password(self.profile_name, auto_generate=False),
-                db_url=db_url,
-            )
-
-        self._cache: dict[str, tuple[float, Any]] = {}
-        self._lock = threading.Lock()
-
-    def get(self, key: str, default: Any = ...) -> Any:
-        """
-        Retrieves a secret by its dot-notation key path.
-        Returns cached value if present and within TTL; otherwise queries PostgreSQL.
-        """
-        now = time.time()
-        with self._lock:
-            if key in self._cache:
-                cached_at, value = self._cache[key]
-                if now - cached_at < self.ttl:
-                    return value
-
-        try:
-            fresh_value = self.kist.get(key)
-        except KeyError:
-            if default is not ...:
-                return default
-            raise
-
-        with self._lock:
-            self._cache[key] = (now, fresh_value)
-        return fresh_value
-
-    def get_secret(self, key: str, default: Any = ...) -> Any:
-        """Alias for get()."""
-        return self.get(key, default=default)
-
-    def invalidate(self, key: Optional[str] = None):
-        """Evicts a single key or the entire cache."""
-        with self._lock:
-            if key is not None:
-                self._cache.pop(key, None)
-            else:
-                self._cache.clear()
-
-    def clear(self):
-        """Clears all cached secrets."""
-        self.invalidate()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.clear()
-
-
 class AsyncDynamicSecretStore:
-    """
-    Asynchronous Push-Based Invalidation Secret Store for asyncio / FastAPI applications.
-
-    Maintains an in-memory cache and listens to PostgreSQL NOTIFY events asynchronously.
-    """
+    """Async variant with bounded, opt-in cache and explicit listener lifecycle."""
 
     def __init__(
         self,
@@ -246,112 +185,99 @@ class AsyncDynamicSecretStore:
         master_password: Optional[str] = None,
         db_url: Optional[str] = None,
         channel: str = "kist_secret_updated",
-        auto_start: bool = True,
+        auto_start: bool = False,
         kist: Optional[Kist] = None,
-    ):
+        cache_policy: Optional[CachePolicy] = None,
+    ) -> None:
         self.profile_name = profile_name or os.getenv("KIST_PROFILE", "default")
-        self.db_url = db_url or os.getenv("KIST_DATABASE_URL")
+        self.kist = kist or Kist(
+            profile_name=self.profile_name,
+            master_password=master_password or get_profile_password(self.profile_name),
+            db_url=db_url,
+        )
+        self.db_url = db_url or self.kist.db_url
         self.channel = channel
-
-        if kist is not None:
-            self.kist = kist
-        else:
-            self.kist = Kist(
-                profile_name=self.profile_name,
-                master_password=master_password or get_profile_password(self.profile_name, auto_generate=False),
-            )
-
-        if not self.db_url and self.kist.db_url:
-            self.db_url = self.kist.db_url
-
-        self._cache: dict[str, Any] = {}
+        self.policy = cache_policy or CachePolicy(enabled=True)
+        self._cache: dict[str, tuple[float, Any]] = {}
         self._lock = asyncio.Lock()
         self._listener_task: Optional[asyncio.Task] = None
         self._closing = False
-
-        if auto_start and self.db_url:
+        if auto_start:
             try:
-                loop = asyncio.get_running_loop()
-                self._listener_task = loop.create_task(self._listen_for_updates())
+                self._listener_task = asyncio.get_running_loop().create_task(self._listen_for_updates())
             except RuntimeError:
                 pass
 
-    async def start(self):
-        """Starts the async background notification listener task."""
+    async def start(self) -> None:
+        if not self.db_url:
+            raise RuntimeError("A database URL is required for dynamic invalidation.")
         if self._listener_task and not self._listener_task.done():
             return
         self._closing = False
-        loop = asyncio.get_running_loop()
-        self._listener_task = loop.create_task(self._listen_for_updates())
+        self._listener_task = asyncio.get_running_loop().create_task(self._listen_for_updates())
 
     async def get(self, key: str, default: Any = ...) -> Any:
-        """Retrieves a secret asynchronously from memory cache or database."""
-        async with self._lock:
-            if key in self._cache:
-                return self._cache[key]
-
+        now = time.monotonic()
+        if self.policy.enabled:
+            async with self._lock:
+                cached = self._cache.get(key)
+                if cached and now - cached[0] < self.policy.ttl_seconds:
+                    return cached[1]
+                if cached:
+                    self._cache.pop(key, None)
         try:
-            val = await asyncio.to_thread(self.kist.get, key)
+            value = await asyncio.to_thread(self.kist.get, key)
         except KeyError:
             if default is not ...:
                 return default
             raise
-
-        async with self._lock:
-            self._cache[key] = val
-        return val
+        if self.policy.enabled:
+            async with self._lock:
+                if len(self._cache) >= self.policy.max_entries:
+                    self._cache.pop(next(iter(self._cache)))
+                self._cache[key] = (now, value)
+        return value
 
     async def get_secret(self, key: str, default: Any = ...) -> Any:
-        """Alias for get()."""
-        return await self.get(key, default=default)
+        return await self.get(key, default)
 
-    async def invalidate(self, key: Optional[str] = None):
-        """Invalidates a single cached key or the entire cache."""
+    async def invalidate(self, key: Optional[str] = None) -> None:
         async with self._lock:
-            if key is not None:
-                self._cache.pop(key, None)
-            else:
+            if key is None:
                 self._cache.clear()
+            else:
+                self._cache.pop(key, None)
 
-    async def _listen_for_updates(self):
-        """Listens for PostgreSQL NOTIFY events using psycopg async connection."""
+    async def _listen_for_updates(self) -> None:
         while not self._closing:
             try:
-                async with await safe_async_db_connect(self.db_url, autocommit=True) as aconn:
-                    await aconn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self.channel)))
-                    async for notification in aconn.notifies():
+                async with await safe_async_db_connect(self.db_url, autocommit=True) as conn:
+                    await conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self.channel)))
+                    async for notification in conn.notifies():
                         if self._closing:
                             break
-                        self._handle_notification(notification)
+                        await self._handle_notification(notification.payload)
             except asyncio.CancelledError:
                 break
             except Exception:
-                async with self._lock:
-                    self._cache.clear()
+                if self.policy.clear_on_disconnect:
+                    await self.invalidate()
                 if not self._closing:
                     await asyncio.sleep(2.0)
 
-    def _handle_notification(self, notification):
-        """Handles notification payload and invalidates matching keys."""
+    async def _handle_notification(self, raw_payload: Any) -> None:
         try:
-            payload = json.loads(notification.payload)
-            target_profile = payload.get("profile_name")
-            target_id = payload.get("profile_id")
-
-            matches_name = target_profile == self.profile_name if target_profile else True
-            matches_id = target_id == self.kist.profile_id if (target_id and self.kist.profile_id) else True
-
-            if matches_name or matches_id:
-                secret_key = payload.get("secret_key")
-                if secret_key is not None:
-                    self._cache.pop(secret_key, None)
-                else:
-                    self._cache.clear()
+            if hasattr(raw_payload, "payload"):
+                raw_payload = raw_payload.payload
+            payload = json.loads(raw_payload) if isinstance(raw_payload, (str, bytes)) else raw_payload
+            if not isinstance(payload, dict) or not _notification_matches(payload, self.profile_name, self.kist.profile_id):
+                return
+            key = payload.get("secret_key")
+            await self.invalidate(key if isinstance(key, str) else None)
         except Exception:
-            self._cache.clear()
+            await self.invalidate()
 
-    async def close(self):
-        """Closes the async listener task and clears cache."""
+    async def close(self) -> None:
         self._closing = True
         if self._listener_task and not self._listener_task.done():
             self._listener_task.cancel()
@@ -359,24 +285,23 @@ class AsyncDynamicSecretStore:
                 await self._listener_task
             except asyncio.CancelledError:
                 pass
-            self._listener_task = None
-        async with self._lock:
-            self._cache.clear()
+        self._listener_task = None
+        await self.invalidate()
 
     async def __aenter__(self):
         await self.start()
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         await self.close()
 
 
-# Convenient aliases
 DynamicStore = DynamicSecretStore
 TTLStore = TTLSecretStore
 AsyncDynamicStore = AsyncDynamicSecretStore
 
 __all__ = [
+    "CachePolicy",
     "DynamicSecretStore",
     "TTLSecretStore",
     "AsyncDynamicSecretStore",

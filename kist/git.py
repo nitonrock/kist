@@ -1,22 +1,60 @@
+"""Git integration for Kist.
+
+Local hooks are developer ergonomics, not a complete enforcement boundary.
+Deploy Kist Guard or an equivalent required CI/server-side secret scanner for
+organization-wide enforcement.
+"""
+
+from __future__ import annotations
+
 import os
-import sys
 import re
 import subprocess
-from typing import Optional, BinaryIO, TextIO
+import sys
+from pathlib import Path
+from typing import BinaryIO, Optional, TextIO
+
 from kist.core import (
+    DecryptionError,
+    InvalidEnvelopeError,
+    KistError,
+    MissingKeyError,
+    encrypt_envelope,
     get_profile_password,
-    derive_fernet_key,
+    git_context,
+    is_kist_envelope,
+    decrypt_envelope,
 )
 
-# Heuristic patterns for sensitive credentials in unencrypted staged files
 SENSITIVE_KEY_PATTERNS = [
-    re.compile(r"""(?i)\b(api[_-]?key|secret[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|db[_-]?password|aws_secret_access_key)\s*[:=]\s*['"]?[A-Za-z0-9_\-\+\/]{8,}"""),
+    re.compile(r"(?i)\b(api[_-]?key|secret[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|db[_-]?password|aws_secret_access_key)\s*[:=]\s*['\"]?[^\s'\"]{8,}"),
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
 ]
 
-# File extensions checked for sensitive content heuristics
-SUSPICIOUS_EXTENSIONS = (".yaml", ".yml", ".json", ".toml", ".env", ".ini", ".conf", ".cfg")
-EXCLUDED_HEURISTIC_PATHS = ("tests/", "test/", "ressources/", "resources/", "docs/", "scrapbook/")
+SUSPICIOUS_EXTENSIONS = {
+    ".yaml", ".yml", ".json", ".toml", ".env", ".ini", ".conf", ".cfg",
+    ".py", ".js", ".ts", ".sh", ".tf", ".tfvars", ".properties", ".xml",
+}
+
+KIST_ATTRIBUTE_RULES = (
+    "secrets*.yaml filter=kist",
+    "secrets*.yml filter=kist",
+    "secrets/*.yaml filter=kist",
+    "secrets/*.yml filter=kist",
+)
+KIST_HOOK_MARKER = "# kist-managed-hook-v1"
+
+
+def _stream_filepath() -> str:
+    """Recover the Git-provided filename safely from the current process arguments."""
+    for flag in ("--clean", "--smudge"):
+        if flag in sys.argv:
+            index = sys.argv.index(flag)
+            if index + 1 < len(sys.argv):
+                return sys.argv[index + 1]
+    return "<unknown-kist-path>"
 
 
 def git_clean_stream(
@@ -24,37 +62,22 @@ def git_clean_stream(
     master_password: Optional[str] = None,
     in_stream: Optional[TextIO] = None,
     out_stream: Optional[BinaryIO] = None,
-):
-    """
-    Git Clean Filter:
-    Reads plaintext YAML from stdin, generates a fresh random 16-byte salt,
-    encrypts the content with Fernet (Argon2id KDF), and writes [salt (16 bytes) + ciphertext] to stdout.
-    Fails closed if master password is not configured.
-    """
-    if in_stream is None:
-        in_stream = sys.stdin
-    if out_stream is None:
-        out_stream = sys.stdout.buffer
-
-    if not master_password:
-        master_password = get_profile_password(profile_name, auto_generate=False)
-
-    if not master_password:
-        print(
-            f"❌ Kist Error: Missing encryption password for profile '{profile_name}'. "
-            f"Set KIST_PASSWORD_{profile_name.upper()} or create ~/.kist/pwd_{profile_name}.",
-            file=sys.stderr,
+    filepath: Optional[str] = None,
+) -> None:
+    """Encrypt a Kist-managed working-tree file and write a v1 envelope to Git."""
+    in_stream = in_stream or sys.stdin
+    out_stream = out_stream or sys.stdout.buffer
+    password = master_password or get_profile_password(profile_name)
+    if not password:
+        raise MissingKeyError(
+            f"No encryption key configured for profile {profile_name!r}; refusing to stage plaintext."
         )
-        sys.exit(1)
 
     plaintext = in_stream.read()
-    if plaintext.strip():
-        # Generate fresh, unique random 16-byte salt
-        salt = os.urandom(16)
-        fernet = derive_fernet_key(master_password, salt)
-        encrypted_data = fernet.encrypt(plaintext.encode("utf-8"))
-        # Output prepended salt + fernet ciphertext
-        out_stream.write(salt + encrypted_data)
+    if not plaintext:
+        return
+    target_path = filepath or _stream_filepath()
+    out_stream.write(encrypt_envelope(plaintext.encode("utf-8"), password, git_context(profile_name, target_path)))
 
 
 def git_smudge_stream(
@@ -62,155 +85,160 @@ def git_smudge_stream(
     master_password: Optional[str] = None,
     in_stream: Optional[BinaryIO] = None,
     out_stream: Optional[TextIO] = None,
-):
-    """
-    Git Smudge Filter:
-    Reads [salt (16 bytes) + ciphertext] from repository object storage,
-    derives the decryption key using the embedded salt (Argon2id KDF), and writes plaintext to stdout.
-    """
-    if in_stream is None:
-        in_stream = sys.stdin.buffer
-    if out_stream is None:
-        out_stream = sys.stdout
-
-    data = in_stream.read()
-    if not data:
+    filepath: Optional[str] = None,
+) -> None:
+    """Decrypt a Kist-managed Git blob and fail closed on every security failure."""
+    in_stream = in_stream or sys.stdin.buffer
+    out_stream = out_stream or sys.stdout
+    envelope = in_stream.read()
+    if not envelope:
         return
 
-    if not master_password:
-        master_password = get_profile_password(profile_name, auto_generate=False)
+    password = master_password or get_profile_password(profile_name)
+    if not password:
+        raise MissingKeyError(
+            f"No decryption key configured for profile {profile_name!r}; refusing checkout of protected content."
+        )
+    if not is_kist_envelope(envelope):
+        raise InvalidEnvelopeError("Protected Git file is not a valid Kist v1 envelope.")
 
-    if not master_password:
-        # If no password found, passthrough raw data without crashing Git
-        if hasattr(out_stream, "buffer"):
-            out_stream.buffer.write(data)
-        else:
-            sys.stdout.buffer.write(data)
-        return
-
-    # Modern prepended-salt format (16 bytes salt + Fernet token)
-    if len(data) > 16:
-        salt = data[:16]
-        ciphertext = data[16:]
-        try:
-            fernet = derive_fernet_key(master_password, salt)
-            plaintext = fernet.decrypt(ciphertext).decode("utf-8")
-            out_stream.write(plaintext)
-            return
-        except Exception:
-            pass
-
-    # Fallback: passthrough unmodifiable bytes
-    if hasattr(out_stream, "buffer"):
-        out_stream.buffer.write(data)
-    else:
-        sys.stdout.buffer.write(data)
+    target_path = filepath or _stream_filepath()
+    plaintext = decrypt_envelope(envelope, password, git_context(profile_name, target_path))
+    try:
+        out_stream.write(plaintext.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise DecryptionError("Kist Git filter only supports UTF-8 text secret files.") from exc
 
 
-def run_git_setup():
-    """Sets up local repository configurations to bypass git-crypt entirely."""
-    is_git_repo = subprocess.run(
-        ["git", "rev-parse", "--is-inside-work-tree"],
-        capture_output=True,
-        check=False,
-    ).returncode == 0
+def _run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(command, check=check, text=True, capture_output=True)
 
-    if not is_git_repo:
-        subprocess.run(["git", "init"], check=True)
 
-    print("⚙️ Hooking Kist filters directly into your native local Git pipeline...")
+def _is_git_repo() -> bool:
+    return subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], capture_output=True, check=False).returncode == 0
+
+
+def _append_missing_lines(path: Path, lines: tuple[str, ...], heading: str) -> bool:
+    existing = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    existing_set = set(existing)
+    missing = [line for line in lines if line not in existing_set]
+    if not missing:
+        return False
+    with path.open("a", encoding="utf-8") as handle:
+        if existing and existing[-1].strip():
+            handle.write("\n")
+        handle.write(f"# {heading}\n")
+        handle.write("\n".join(missing))
+        handle.write("\n")
+    return True
+
+
+def _install_hook(hook_path: Path, *, force: bool = False) -> bool:
+    if hook_path.exists():
+        content = hook_path.read_text(encoding="utf-8")
+        if KIST_HOOK_MARKER in content:
+            return False
+        if not force:
+            raise KistError(
+                f"Refusing to overwrite existing hook {hook_path}. Use `kist init --print-hook` "
+                "or `kist init --force-hook` after reviewing the existing hook."
+            )
+        backup = hook_path.with_name(f"{hook_path.name}.pre-kist-backup")
+        if backup.exists():
+            raise KistError(f"Refusing to overwrite hook because backup already exists: {backup}")
+        hook_path.replace(backup)
+
+    hook_path.write_text(
+        "#!/usr/bin/env sh\n"
+        f"{KIST_HOOK_MARKER}\n"
+        "exec kist pre-commit-guard\n",
+        encoding="utf-8",
+    )
+    os.chmod(hook_path, 0o755)
+    return True
+
+
+def run_git_setup(*, force_hook: bool = False, install_hook: bool = True) -> None:
+    """Configure Git filters without overwriting unrelated repository configuration."""
+    if not _is_git_repo():
+        raise KistError("Not inside a Git repository. Initialize Git explicitly before running `kist init`.")
 
     subprocess.run(["git", "config", "filter.kist.clean", "kist --clean %f"], check=True)
     subprocess.run(["git", "config", "filter.kist.smudge", "kist --smudge %f"], check=True)
     subprocess.run(["git", "config", "filter.kist.required", "true"], check=True)
 
-    with open(".gitattributes", "w") as f:
-        f.write("secrets*.yaml filter=kist\n")
-        f.write("secrets*.yml filter=kist\n")
-        f.write("secrets/*.yaml filter=kist\n")
-        f.write("secrets/*.yml filter=kist\n")
+    attributes_changed = _append_missing_lines(Path(".gitattributes"), KIST_ATTRIBUTE_RULES, "Kist encrypted-secret filters")
+    ignore_changed = _append_missing_lines(Path(".gitignore"), (".kist/",), "Kist local profile keys")
 
-    # Ensure .kist is ignored in .gitignore
-    gitignore_path = ".gitignore"
-    kist_ignored = False
-    if os.path.exists(gitignore_path):
-        with open(gitignore_path, "r") as f:
-            if ".kist" in f.read():
-                kist_ignored = True
-    if not kist_ignored:
-        with open(gitignore_path, "a") as f:
-            f.write("\n# Kist local profile keys\n.kist/\n")
+    hook_changed = False
+    if install_hook:
+        hook_changed = _install_hook(Path(".git") / "hooks" / "pre-commit", force=force_hook)
 
-    hook_dir = ".git/hooks"
-    os.makedirs(hook_dir, exist_ok=True)
-    hook_path = os.path.join(hook_dir, "pre-commit")
-    with open(hook_path, "w") as hook_file:
-        hook_file.write("#!/usr/bin/env sh\n")
-        hook_file.write("# Kist automated pre-commit leak guard\n")
-        hook_file.write("if command -v kist >/dev/null 2>&1; then\n")
-        hook_file.write("    kist pre-commit-guard\n")
-        hook_file.write("elif [ -f .venv/bin/kist ]; then\n")
-        hook_file.write("    .venv/bin/kist pre-commit-guard\n")
-        hook_file.write("else\n")
-        hook_file.write("    python3 -c \"import sys; from kist import run_leak_guard; sys.exit(run_leak_guard())\"\n")
-        hook_file.write("fi\n")
+    changes = []
+    if attributes_changed:
+        changes.append(".gitattributes")
+    if ignore_changed:
+        changes.append(".gitignore")
+    if hook_changed:
+        changes.append("pre-commit hook")
+    print("Kist Git filters configured." + (f" Updated: {', '.join(changes)}." if changes else ""))
 
-    os.chmod(hook_path, 0o755)
-    print("🏆 Initialization Complete! The Leak Guard is armed.")
+
+def print_hook() -> None:
+    print("#!/usr/bin/env sh")
+    print(KIST_HOOK_MARKER)
+    print("exec kist pre-commit-guard")
+
+
+def _is_targeted_secret(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    name = os.path.basename(normalized)
+    return (name.startswith("secrets") and name.endswith((".yaml", ".yml"))) or normalized.startswith("secrets/")
+
+
+def _should_scan_plaintext(path: str, blob: bytes) -> bool:
+    suffix = Path(path).suffix.lower()
+    if suffix in SUSPICIOUS_EXTENSIONS:
+        return True
+    return b"-----BEGIN " in blob or b"api_key" in blob.lower() or b"secret" in blob.lower()
 
 
 def run_leak_guard() -> int:
-    """
-    Scans all staged files targeted for commit.
-    1. Ensures secrets files match the encrypted envelope format (16 bytes salt + Fernet token).
-    2. Runs heuristic detection on other staged config/data files for plaintext credentials.
-    Hard aborts (returns 1) if plaintext leaks or unencrypted sensitive keys are detected.
-    """
-    cmd = ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM"]
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    staged_files = [f.strip() for f in result.stdout.split("\n") if f.strip()]
+    """Block plaintext Kist files and likely credentials in every staged text file."""
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        print("kist: unable to inspect staged Git changes.", file=sys.stderr)
+        return 1
 
+    staged_files = [item.strip() for item in result.stdout.splitlines() if item.strip()]
     for file_path in staged_files:
-        norm_path = file_path.replace("\\", "/")
-        filename = os.path.basename(norm_path)
-
-        # 1. Inspect targeted Kist secret files
-        is_targeted_secret = (
-            (filename.startswith("secrets") and (filename.endswith(".yaml") or filename.endswith(".yml")))
-            or norm_path.startswith("secrets/")
-        )
-
-        content_res = subprocess.run(["git", "show", f":{file_path}"], capture_output=True, check=False)
-        blob = content_res.stdout
+        blob_result = subprocess.run(["git", "show", f":{file_path}"], capture_output=True, check=False)
+        if blob_result.returncode != 0:
+            print(f"kist: unable to inspect staged file: {file_path}", file=sys.stderr)
+            return 1
+        blob = blob_result.stdout
         if not blob:
             continue
 
-        is_encrypted = len(blob) > 16 and blob[16:].startswith(b"gAAAAA")
-
-        if is_targeted_secret:
-            if not is_encrypted:
-                print("\n=======================================================", file=sys.stderr)
-                print("🚨 CRITICAL SECURITY FAULT: Plaintext Secret Leak Detected!", file=sys.stderr)
-                print(f"👉 Target File: '{file_path}' is staged in plaintext without Kist encryption.", file=sys.stderr)
-                print("💡 Action Required: Configure Git filters via 'kist init' and set profile password.", file=sys.stderr)
-                print("=======================================================\n", file=sys.stderr)
+        encrypted = is_kist_envelope(blob)
+        if _is_targeted_secret(file_path):
+            if not encrypted:
+                print(f"kist: blocked plaintext protected secret file: {file_path}", file=sys.stderr)
                 return 1
             continue
 
-        # 2. Content Heuristics for other unencrypted staged configuration / data files
-        is_excluded = any(norm_path.startswith(prefix) for prefix in EXCLUDED_HEURISTIC_PATHS) or norm_path.startswith(".")
-        if not is_excluded and not is_encrypted and any(norm_path.endswith(ext) for ext in SUSPICIOUS_EXTENSIONS):
-            try:
-                text_content = blob.decode("utf-8", errors="ignore")
-                for pat in SENSITIVE_KEY_PATTERNS:
-                    if pat.search(text_content):
-                        print("\n=======================================================", file=sys.stderr)
-                        print("🚨 CRITICAL SECURITY FAULT: Unencrypted Sensitive Credential Detected!", file=sys.stderr)
-                        print(f"👉 Staged File: '{file_path}' contains unencrypted secret/key patterns.", file=sys.stderr)
-                        print("💡 Action Required: Rename file to 'secrets*.yaml' or use Kist to encrypt secrets.", file=sys.stderr)
-                        print("=======================================================\n", file=sys.stderr)
-                        return 1
-            except Exception:
-                pass
+        if encrypted or not _should_scan_plaintext(file_path, blob):
+            continue
 
+        text = blob.decode("utf-8", errors="ignore")
+        for pattern in SENSITIVE_KEY_PATTERNS:
+            if pattern.search(text):
+                print(f"kist: blocked likely plaintext credential in staged file: {file_path}", file=sys.stderr)
+                print("kist: rotate exposed credentials if this value is real, then use an approved secret workflow.", file=sys.stderr)
+                return 1
     return 0
