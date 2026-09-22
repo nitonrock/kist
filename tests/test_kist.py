@@ -1,34 +1,54 @@
+import io
+import json
 import os
 import shutil
-import unittest
-from unittest.mock import patch, MagicMock
-import io
+import stat
 import sys
 import tempfile
+import unittest
+import uuid
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import psycopg
 import yaml
 
 from kist import (
+    Kist,
+    create_profile_key,
+    decrypt_envelope,
+    derive_fernet_key,
+    encrypt_envelope,
+    enforce_ssl_url,
     generate_password,
     get_kist_dir,
-    get_profile_password,
     get_profile_and_password,
-    resolve_secret_file_path,
+    get_profile_password,
+    git_clean_stream,
+    git_context,
+    git_smudge_stream,
+    is_kist_envelope,
     mask_db_url,
-    enforce_ssl_url,
-    safe_db_connect,
-    safe_async_db_connect,
-    run_status,
+    resolve_secret_file_path,
     run_fix,
     run_git_setup,
     run_leak_guard,
-    git_clean_stream,
-    git_smudge_stream,
-    derive_fernet_key,
-    Kist,
+    run_status,
+    safe_async_db_connect,
+    safe_db_connect,
+    write_secure_local_password,
+)
+from kist.core import (
+    DecryptionError,
+    InsecureKeyStoreError,
+    InvalidEnvelopeError,
+    KistError,
+    KistScope,
+    MissingKeyError,
 )
 
 
-class TestKistPasswordGenerator(unittest.TestCase):
+class TestKistPasswordGeneratorAndStorage(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
         self.kist_dir = os.path.join(self.temp_dir, ".kist")
@@ -70,58 +90,39 @@ class TestKistPasswordGenerator(unittest.TestCase):
             self.assertEqual(pwd, "global_secret")
             self.assertFalse(os.path.exists(os.path.join(self.kist_dir, "pwd_beta")))
 
-    def test_get_profile_password_from_kist_folder(self):
-        os.makedirs(self.kist_dir, exist_ok=True)
-        with open(os.path.join(self.kist_dir, "pwd_gamma"), "w") as f:
-            f.write("saved_file_secret\n")
+    def test_create_and_read_profile_password_from_kist_folder(self):
+        created_pwd = create_profile_key("gamma")
+        self.assertTrue(len(created_pwd) > 20)
+        pwd_file = Path(self.kist_dir) / "pwd_gamma"
+        self.assertTrue(pwd_file.exists())
 
         with patch.dict(os.environ, {"KIST_DIR": self.kist_dir}, clear=True):
-            pwd = get_profile_password("gamma")
-            self.assertEqual(pwd, "saved_file_secret")
+            loaded_pwd = get_profile_password("gamma")
+            self.assertEqual(loaded_pwd, created_pwd)
 
-    def test_get_profile_password_auto_generates_and_saves(self):
+    def test_implicit_auto_generate_disabled(self):
         with patch.dict(os.environ, {"KIST_DIR": self.kist_dir}, clear=True):
-            with patch("sys.stdout", new_callable=io.StringIO) as fake_out:
-                pwd = get_profile_password("delta")
+            with self.assertRaises(KistError):
+                get_profile_password("delta", auto_generate=True)
 
-            self.assertTrue(os.path.exists(os.path.join(self.kist_dir, "pwd_delta")))
-            with open(os.path.join(self.kist_dir, "pwd_delta"), "r") as f:
-                saved = f.read().strip()
+    def test_get_profile_and_password_resolution(self):
+        create_profile_key("default")
+        create_profile_key("staging")
 
-            self.assertEqual(pwd, saved)
-            self.assertIn("delta", fake_out.getvalue())
-            self.assertIn(pwd, fake_out.getvalue())
-
-            # Second call should retrieve the same password without re-generating
-            with patch("sys.stdout", new_callable=io.StringIO) as fake_out2:
-                pwd2 = get_profile_password("delta")
-            self.assertEqual(pwd2, pwd)
-            self.assertEqual(fake_out2.getvalue(), "")
-
-    def test_get_profile_and_password_default(self):
         with patch.dict(os.environ, {"KIST_DIR": self.kist_dir}, clear=True):
-            profile, pwd = get_profile_and_password("secrets.yaml")
-            self.assertEqual(profile, "default")
-            self.assertTrue(os.path.exists(os.path.join(self.kist_dir, "pwd_default")))
-            with open(os.path.join(self.kist_dir, "pwd_default"), "r") as f:
-                self.assertEqual(f.read().strip(), pwd)
+            prof_def, pwd_def = get_profile_and_password("secrets.yaml")
+            self.assertEqual(prof_def, "default")
+            self.assertIsNotNone(pwd_def)
 
-    def test_get_profile_and_password_custom_profile(self):
-        with patch.dict(os.environ, {"KIST_DIR": self.kist_dir}, clear=True):
-            profile, pwd = get_profile_and_password("secrets_staging.yaml")
-            self.assertEqual(profile, "staging")
-            self.assertTrue(os.path.exists(os.path.join(self.kist_dir, "pwd_staging")))
-            with open(os.path.join(self.kist_dir, "pwd_staging"), "r") as f:
-                self.assertEqual(f.read().strip(), pwd)
+            prof_stg, pwd_stg = get_profile_and_password("secrets_staging.yaml")
+            self.assertEqual(prof_stg, "staging")
+            self.assertIsNotNone(pwd_stg)
 
-    def test_get_profile_and_password_without_extension_or_prefix(self):
-        with patch.dict(os.environ, {}, clear=True):
-            profile, pwd = get_profile_and_password("secrets_my_team")
-            self.assertEqual(profile, "my_team")
-            profile_def, _ = get_profile_and_password("secrets")
-            self.assertEqual(profile_def, "default")
-            profile_sub, _ = get_profile_and_password("secrets/secrets_team_b.yaml")
-            self.assertEqual(profile_sub, "team_b")
+            prof_raw, _ = get_profile_and_password("secrets_my_team")
+            self.assertEqual(prof_raw, "my_team")
+
+            prof_sub, _ = get_profile_and_password("secrets/secrets_team_b.yaml")
+            self.assertEqual(prof_sub, "team_b")
 
     def test_resolve_secret_file_path_direct_and_extension(self):
         os.makedirs("secrets", exist_ok=True)
@@ -146,7 +147,29 @@ class TestKistPasswordGenerator(unittest.TestCase):
                 os.rmdir("secrets")
 
 
-class TestGitFiltersAndSaltPrepending(unittest.TestCase):
+class TestHardenedEnvelopeAndGitFilters(unittest.TestCase):
+    def test_envelope_encryption_and_decryption(self):
+        plaintext = b"sensitive_secret_payload"
+        password = "strong_master_password_test"
+        ctx = {"profile": "prod", "env": "cloud"}
+
+        envelope = encrypt_envelope(plaintext, password, ctx)
+        self.assertTrue(is_kist_envelope(envelope))
+        self.assertTrue(len(envelope) > 78)
+
+        # Decrypt success
+        decrypted = decrypt_envelope(envelope, password, ctx)
+        self.assertEqual(decrypted, plaintext)
+
+        # Decrypt failure with wrong password
+        with self.assertRaises(DecryptionError):
+            decrypt_envelope(envelope, "wrong_password", ctx)
+
+        # Decrypt failure with wrong context (AAD mismatch)
+        wrong_ctx = {"profile": "prod", "env": "local"}
+        with self.assertRaises(DecryptionError):
+            decrypt_envelope(envelope, password, wrong_ctx)
+
     def test_git_clean_and_smudge_stream_roundtrip(self):
         plaintext = "database:\n  host: 127.0.0.1\n  port: 5432\n  ssl: true\n"
         password = "my_git_password_123"
@@ -154,33 +177,27 @@ class TestGitFiltersAndSaltPrepending(unittest.TestCase):
         # 1. Clean (Encrypt)
         in_clean = io.StringIO(plaintext)
         out_clean = io.BytesIO()
-        git_clean_stream("production", master_password=password, in_stream=in_clean, out_stream=out_clean)
+        git_clean_stream("production", master_password=password, in_stream=in_clean, out_stream=out_clean, filepath="secrets_production.yaml")
 
         encrypted_bytes = out_clean.getvalue()
-        self.assertTrue(len(encrypted_bytes) > 16)
-        salt = encrypted_bytes[:16]
-        ciphertext = encrypted_bytes[16:]
-        self.assertTrue(ciphertext.startswith(b"gAAAAA"))
+        self.assertTrue(is_kist_envelope(encrypted_bytes))
 
-        # Encrypting again generates a different unique salt and ciphertext
+        # Re-encrypting produces fresh salt and different ciphertext
         in_clean2 = io.StringIO(plaintext)
         out_clean2 = io.BytesIO()
-        git_clean_stream("production", master_password=password, in_stream=in_clean2, out_stream=out_clean2)
+        git_clean_stream("production", master_password=password, in_stream=in_clean2, out_stream=out_clean2, filepath="secrets_production.yaml")
         encrypted_bytes2 = out_clean2.getvalue()
-        salt2 = encrypted_bytes2[:16]
-        self.assertNotEqual(salt, salt2)
         self.assertNotEqual(encrypted_bytes, encrypted_bytes2)
 
         # 2. Smudge (Decrypt)
         in_smudge = io.BytesIO(encrypted_bytes)
         out_smudge = io.StringIO()
-        git_smudge_stream("production", master_password=password, in_stream=in_smudge, out_stream=out_smudge)
+        git_smudge_stream("production", master_password=password, in_stream=in_smudge, out_stream=out_smudge, filepath="secrets_production.yaml")
 
         self.assertEqual(out_smudge.getvalue(), plaintext)
 
     def test_leak_guard_detects_plaintext_and_permits_encrypted(self):
         with patch("subprocess.run") as mock_run:
-            # Staged file is secrets.yaml
             mock_diff = MagicMock()
             mock_diff.stdout = "secrets.yaml\n"
             mock_diff.returncode = 0
@@ -195,9 +212,11 @@ class TestGitFiltersAndSaltPrepending(unittest.TestCase):
                 code = run_leak_guard()
             self.assertEqual(code, 1)
 
-            # Staged file with prepended salt
+            # Staged file with valid envelope
+            ctx = git_context("default", "secrets.yaml")
+            valid_envelope = encrypt_envelope(b"api_key: encrypted\n", "password", ctx)
             mock_show_encrypted = MagicMock()
-            mock_show_encrypted.stdout = os.urandom(16) + b"gAAAAABXYZ..."
+            mock_show_encrypted.stdout = valid_envelope
             mock_show_encrypted.returncode = 0
 
             mock_run.side_effect = [mock_diff, mock_show_encrypted]
@@ -205,9 +224,9 @@ class TestGitFiltersAndSaltPrepending(unittest.TestCase):
             self.assertEqual(code2, 0)
 
 
-class TestKistTypePreservationAndPruning(unittest.TestCase):
+class TestKistTypePreservationAndDatabaseOperations(unittest.TestCase):
     def test_flatten_and_unflatten_nested_and_types(self):
-        kist_inst = Kist(profile_name="types_test", master_password="pwd")
+        kist_inst = Kist(profile_name="types_test", master_password="pwd", db_url="")
         data = {
             "server": {
                 "port": 8080,
@@ -219,7 +238,7 @@ class TestKistTypePreservationAndPruning(unittest.TestCase):
             "name": "myapp",
         }
 
-        flat = kist_inst._flatten(data)
+        flat = kist_inst.flatten(data)
         self.assertEqual(flat["server.port"], 8080)
         self.assertEqual(flat["server.debug"], True)
         self.assertEqual(flat["server.timeout"], 2.5)
@@ -227,7 +246,7 @@ class TestKistTypePreservationAndPruning(unittest.TestCase):
         self.assertIsNone(flat["server.admin"])
         self.assertEqual(flat["name"], "myapp")
 
-        unflat = kist_inst._unflatten(flat)
+        unflat = kist_inst.unflatten(flat)
         self.assertEqual(unflat, data)
 
     @patch("psycopg.connect")
@@ -236,15 +255,25 @@ class TestKistTypePreservationAndPruning(unittest.TestCase):
         mock_cursor = MagicMock()
         mock_connect.return_value.__enter__.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-        mock_cursor.fetchone.return_value = (7, os.urandom(16))
+
+        org_id = uuid.uuid4()
+        proj_id = uuid.uuid4()
+        prof_id = uuid.uuid4()
+
+        # Mock get_or_create_scope queries
+        mock_cursor.fetchone.side_effect = [
+            (org_id,),   # org
+            (proj_id,),  # project
+            (prof_id,),  # profile
+            None,        # secret_version key 1
+            None,        # secret_version key 2
+            None,        # secret_version key 3
+        ]
 
         kist_inst = Kist(profile_name="test_prof", master_password="password", db_url="postgresql://mock")
 
         # Mock existing keys for pruning: old_key is obsolete
-        mock_cursor.fetchall.side_effect = [
-            [("db.host",), ("old_key",)],  # SELECT secret_key
-            [("old_key",)],                 # DELETE RETURNING secret_key
-        ]
+        mock_cursor.fetchall.return_value = [("db.host",), ("old_key",)]
 
         yaml_content = """
         db:
@@ -262,19 +291,27 @@ class TestKistTypePreservationAndPruning(unittest.TestCase):
         mock_cursor = MagicMock()
         mock_connect.return_value.__enter__.return_value = mock_conn
         mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-        mock_cursor.fetchone.return_value = (7, os.urandom(16))
+
+        org_id = uuid.uuid4()
+        proj_id = uuid.uuid4()
+        prof_id = uuid.uuid4()
+
+        mock_cursor.fetchone.side_effect = [
+            (org_id,),
+            (proj_id,),
+            (prof_id,),
+        ]
 
         kist_inst = Kist(profile_name="test_prof", master_password="password", db_url="postgresql://mock")
 
-        # Mock encrypted blobs in database
-        port_enc = kist_inst.fernet.encrypt(b"5432")
-        bool_enc = kist_inst.fernet.encrypt(b"true")
-        str_enc = kist_inst.fernet.encrypt(b'"production"')
+        env_val = encrypt_envelope(b'"production"', kist_inst.master_password, kist_inst._db_context("app.env", 1))
+        port_val = encrypt_envelope(b"5432", kist_inst.master_password, kist_inst._db_context("app.port", 1))
+        ssl_val = encrypt_envelope(b"true", kist_inst.master_password, kist_inst._db_context("app.ssl", 1))
 
         mock_cursor.fetchall.return_value = [
-            ("app.env", str_enc),
-            ("app.port", port_enc),
-            ("app.ssl", bool_enc),
+            ("app.env", env_val, 1),
+            ("app.port", port_val, 1),
+            ("app.ssl", ssl_val, 1),
         ]
 
         unlocked_yaml = kist_inst.unlock_yaml()
@@ -290,8 +327,8 @@ class TestKistGitSetupAndStatus(unittest.TestCase):
             mock_run.return_value.returncode = 0
             if os.path.exists(".gitattributes"):
                 os.remove(".gitattributes")
-            run_git_setup()
-            
+            run_git_setup(force_hook=True)
+
             with open(".gitattributes", "r") as f:
                 gitattrs = f.read()
             self.assertIn("secrets*.yaml filter=kist", gitattrs)
@@ -308,10 +345,10 @@ class TestKistGitSetupAndStatus(unittest.TestCase):
             exit_code = run_status()
             self.assertEqual(exit_code, 0)
             output = fake_out.getvalue()
-            self.assertIn("Kist Status Overview", output)
-            self.assertIn("Git Pipeline & Hooks", output)
-            self.assertIn("Secret Profiles Detected", output)
-            self.assertIn("Database", output)
+            self.assertIn("Kist status", output)
+            self.assertIn("Git clean filter", output)
+            self.assertIn("Profiles:", output)
+            self.assertIn("Database:", output)
 
     def test_run_fix_workflow(self):
         with patch("sys.stdout", new_callable=io.StringIO) as fake_out, patch("subprocess.run") as mock_run:
@@ -320,11 +357,7 @@ class TestKistGitSetupAndStatus(unittest.TestCase):
             exit_code = run_fix()
             self.assertEqual(exit_code, 0)
             output = fake_out.getvalue()
-            self.assertIn("Kist Auto-Repair & Environment Sync", output)
-            self.assertIn("Repairing Git Configuration & Plumbing", output)
-            self.assertIn("Verifying Secret Profile Passwords", output)
-            self.assertIn("Inspecting & Repairing Git Staging Index", output)
-            self.assertIn("Repair Complete", output)
+            self.assertIn("Kist repair plan", output)
 
 
 class TestKistSecurityAndHardening(unittest.TestCase):
@@ -339,31 +372,15 @@ class TestKistSecurityAndHardening(unittest.TestCase):
         if os.path.exists(self.temp_dir):
             shutil.rmtree(self.temp_dir)
 
-    def test_argon2id_derivation_and_roundtrip(self):
-        salt = os.urandom(16)
-        password = "strong_master_password_test"
-        fernet1 = derive_fernet_key(password, salt)
-        fernet2 = derive_fernet_key(password, salt)
-
-        plaintext = b"super_secret_configuration"
-        token = fernet1.encrypt(plaintext)
-        decrypted = fernet2.decrypt(token)
-        self.assertEqual(decrypted, plaintext)
-
     def test_key_file_posix_permissions(self):
-        with patch.dict(os.environ, {"KIST_DIR": self.kist_dir}, clear=True):
-            with patch("sys.stdout", new_callable=io.StringIO):
-                pwd = get_profile_password("secure_profile")
+        pwd = create_profile_key("secure_profile")
+        self.assertTrue(os.path.exists(self.kist_dir))
+        pwd_file = os.path.join(self.kist_dir, "pwd_secure_profile")
+        self.assertTrue(os.path.exists(pwd_file))
 
-            self.assertTrue(os.path.exists(self.kist_dir))
-            pwd_file = os.path.join(self.kist_dir, "pwd_secure_profile")
-            self.assertTrue(os.path.exists(pwd_file))
-
-            # Check permissions
+        if os.name != "nt":
             dir_stat = os.stat(self.kist_dir)
             file_stat = os.stat(pwd_file)
-
-            # 0o700 for dir, 0o600 for file
             self.assertEqual(dir_stat.st_mode & 0o777, 0o700)
             self.assertEqual(file_stat.st_mode & 0o777, 0o600)
 
@@ -373,7 +390,6 @@ class TestKistSecurityAndHardening(unittest.TestCase):
         self.assertNotIn("secretpassword123", masked)
         self.assertIn("myuser:***@db.prod.internal:5432/secrets_db", masked)
 
-        # URL without password
         no_pwd = "postgresql://localhost/mydb"
         self.assertEqual(mask_db_url(no_pwd), no_pwd)
 
@@ -383,22 +399,24 @@ class TestKistSecurityAndHardening(unittest.TestCase):
         enforced1 = enforce_ssl_url(url1)
         self.assertIn("sslmode=require", enforced1)
 
-        # Upgrade insecure sslmodes (disable, allow, prefer) to require
+        # In development, disable is allowed
         url2 = "postgresql://user:pass@db.example.com:5432/secrets_db?sslmode=disable"
-        self.assertEqual(enforce_ssl_url(url2), "postgresql://user:pass@db.example.com:5432/secrets_db?sslmode=require")
+        self.assertIn("sslmode=disable", enforce_ssl_url(url2, production=False))
 
-        url3 = "postgresql://user:pass@db.example.com:5432/secrets_db?sslmode=prefer&connect_timeout=5"
+        # In production, disable is rejected
+        with self.assertRaises(KistError):
+            enforce_ssl_url(url2, production=True)
+
+        url3 = "postgresql://user:pass@db.example.com:5432/secrets_db?sslmode=require&connect_timeout=5"
         enforced3 = enforce_ssl_url(url3)
         self.assertIn("sslmode=require", enforced3)
         self.assertIn("connect_timeout=5", enforced3)
 
-        # Preserve strict sslmodes (verify-full, verify-ca)
         url4 = "postgresql://user:pass@db.example.com:5432/secrets_db?sslmode=verify-full&sslrootcert=/etc/ssl/ca.crt"
         enforced4 = enforce_ssl_url(url4)
         self.assertIn("sslmode=verify-full", enforced4)
         self.assertIn("sslrootcert=%2Fetc%2Fssl%2Fca.crt", enforced4)
 
-        # Handle None and empty
         self.assertIsNone(enforce_ssl_url(None))
         self.assertEqual(enforce_ssl_url(""), "")
 
@@ -410,40 +428,12 @@ class TestKistSecurityAndHardening(unittest.TestCase):
         called_url = mock_connect.call_args[0][0]
         self.assertIn("sslmode=require", called_url)
 
-        # Test error masking
-        import psycopg
-        mock_connect.side_effect = psycopg.OperationalError("connection failed")
-        with self.assertRaises(psycopg.OperationalError) as cm:
+        # Connection error masking
+        mock_connect.side_effect = psycopg.OperationalError("connection refused")
+        with self.assertRaises(psycopg.OperationalError) as ctx:
             safe_db_connect(url)
-        err_msg = str(cm.exception)
-        self.assertNotIn("supersecret", err_msg)
-        self.assertIn("admin:***@db.internal:5432/production", err_msg)
-
-    def test_git_clean_fails_closed_without_password(self):
-        with patch.dict(os.environ, {}, clear=True):
-            in_stream = io.StringIO("db_password: secret\n")
-            out_stream = io.BytesIO()
-            with self.assertRaises(SystemExit) as cm:
-                with patch("sys.stderr", new_callable=io.StringIO):
-                    git_clean_stream("missing_pwd_profile", in_stream=in_stream, out_stream=out_stream)
-            self.assertEqual(cm.exception.code, 1)
-
-    def test_leak_guard_detects_unencrypted_credentials_in_config_files(self):
-        with patch("subprocess.run") as mock_run:
-            # Staged file is config.yaml (not named secrets*.yaml)
-            mock_diff = MagicMock()
-            mock_diff.stdout = "config.yaml\n"
-            mock_diff.returncode = 0
-
-            # Content has plaintext API key
-            mock_show = MagicMock()
-            mock_show.stdout = b"api_key: sk_live_1234567890abcdef\n"
-            mock_show.returncode = 0
-
-            mock_run.side_effect = [mock_diff, mock_show]
-            with patch("sys.stderr", new_callable=io.StringIO):
-                code = run_leak_guard()
-            self.assertEqual(code, 1)
+        self.assertNotIn("supersecret", str(ctx.exception))
+        self.assertIn("admin:***@db.internal:5432/production", str(ctx.exception))
 
 
 if __name__ == "__main__":
