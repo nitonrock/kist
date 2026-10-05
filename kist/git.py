@@ -19,11 +19,11 @@ from kist.core import (
     InvalidEnvelopeError,
     KistError,
     MissingKeyError,
+    decrypt_envelope,
     encrypt_envelope,
     get_profile_password,
     git_context,
     is_kist_envelope,
-    decrypt_envelope,
 )
 
 SENSITIVE_KEY_PATTERNS = [
@@ -161,7 +161,7 @@ def _install_hook(hook_path: Path, *, force: bool = False) -> bool:
 def run_git_setup(*, force_hook: bool = False, install_hook: bool = True) -> None:
     """Configure Git filters without overwriting unrelated repository configuration."""
     if not _is_git_repo():
-        raise KistError("Not inside a Git repository. Initialize Git explicitly before running `kist init`.")
+        raise KistError("Not inside a Git repository. Initialize Git explicitly before running `kist init` (run `git init`).")
 
     subprocess.run(["git", "config", "filter.kist.clean", "kist --clean %f"], check=True)
     subprocess.run(["git", "config", "filter.kist.smudge", "kist --smudge %f"], check=True)

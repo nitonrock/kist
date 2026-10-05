@@ -8,26 +8,45 @@ default:
   before_script:
     - pip install --upgrade pip
     - pip install uv
-    - uv sync
+    - uv sync || pip install kist
 
 # 1. Leak detection on Merge Requests
 leak_guard_check:
   stage: security
   rules:
     - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+    - if: $CI_COMMIT_BRANCH != "main"
   script:
+    - echo "🔍 Scanning repository for unencrypted secret files..."
     - |
-      echo "🔍 Scanning repository for unencrypted secret files..."
-      for file in $(find . -maxdepth 2 -name "secrets*.yaml" -o -name "secrets*.yml"); do
-        if [ -s "$file" ]; then
-          first_chars=$(head -c 6 "$file")
-          if [ "$first_chars" != "gAAAAA" ]; then
-            echo "🚨 Plaintext leak detected in $file!"
-            exit 1
-          fi
-        fi
-      done
-      echo "✅ All secrets files verified as encrypted."
+      python - << 'EOF'
+      import sys
+      from pathlib import Path
+      from kist.core import is_kist_envelope
+
+      secret_files = list(Path('.').glob('secrets*.yaml')) + \
+                     list(Path('.').glob('secrets*.yml')) + \
+                     list(Path('secrets').glob('*.yaml') if Path('secrets').is_dir() else []) + \
+                     list(Path('secrets').glob('*.yml') if Path('secrets').is_dir() else [])
+
+      failed = False
+      checked = 0
+      for file_path in set(secret_files):
+          if file_path.is_file() and file_path.stat().st_size > 0:
+              checked += 1
+              content = file_path.read_bytes()
+              if not is_kist_envelope(content):
+                  print(f"🚨 CRITICAL: {file_path} is NOT an encrypted Kist envelope! Plaintext commit detected.", file=sys.stderr)
+                  failed = True
+              else:
+                  print(f"🔒 OK: {file_path} verified as valid Kist encrypted envelope.")
+
+      if failed:
+          print("\n❌ Merge request check failed: Unencrypted secret files detected.", file=sys.stderr)
+          sys.exit(1)
+
+      print(f"\n✅ All {checked} secret file(s) successfully verified.")
+      EOF
 
 # 2. Lock secrets into PostgreSQL on main branch merge
 sync_production_secrets:
@@ -37,12 +56,14 @@ sync_production_secrets:
       changes:
         - secrets*.yaml
         - secrets*.yml
+        - secrets/**
   variables:
     KIST_DATABASE_URL: $KIST_DATABASE_URL
     KIST_PASSWORD_PRODUCTION: $KIST_PASSWORD_PRODUCTION
   script:
     - echo "🔒 Locking secrets to centralized PostgreSQL database..."
-    - uv run kist lock secrets_production.yaml
+    - uv run kist --profile production lock secrets/production.yaml
+    - echo "✅ PostgreSQL secret state updated."
 
 # 3. Deploy application services
 deploy_prod:

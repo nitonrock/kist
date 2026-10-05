@@ -19,24 +19,22 @@ def _inside_git_repo() -> bool:
     return subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], capture_output=True, check=False).returncode == 0
 
 
-def _discover_profiles() -> dict[str, str | None]:
-    profiles: dict[str, str | None] = {}
-    candidates: list[Path] = []
-    candidates.extend(Path(".").glob("secrets*.yaml"))
-    candidates.extend(Path(".").glob("secrets*.yml"))
+def _discover_profiles() -> dict[str, str]:
+    profiles: dict[str, str] = {}
+    candidate_paths: set[Path] = set()
+    candidate_paths.update(Path(".").glob("secrets*.yaml"))
+    candidate_paths.update(Path(".").glob("secrets*.yml"))
     if Path("secrets").is_dir():
-        candidates.extend(Path("secrets").glob("*.yaml"))
-        candidates.extend(Path("secrets").glob("*.yml"))
+        candidate_paths.update(Path("secrets").glob("*.yaml"))
+        candidate_paths.update(Path("secrets").glob("*.yml"))
+        candidate_paths.update(Path("secrets").glob("**/*.yaml"))
+        candidate_paths.update(Path("secrets").glob("**/*.yml"))
 
-    for path in candidates:
+    for path in sorted(candidate_paths):
         base = path.name.removesuffix(".yaml").removesuffix(".yml")
         profile = "default" if base == "secrets" else base.removeprefix("secrets_")
         profiles[profile] = str(path)
 
-    key_dir = Path(get_kist_dir())
-    if key_dir.is_dir():
-        for key_path in key_dir.glob("pwd_*"):
-            profiles.setdefault(key_path.name[len("pwd_"):], None)
     return profiles
 
 

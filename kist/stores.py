@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
 import time
@@ -13,6 +14,8 @@ from typing import Any, Optional
 from psycopg import sql
 
 from kist.core import Kist, get_profile_password, safe_async_db_connect, safe_db_connect
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -68,9 +71,12 @@ class TTLSecretStore:
             with self._lock:
                 cached = self._cache.get(key)
                 if cached and now - cached[0] < self.policy.ttl_seconds:
+                    logger.debug("Cache hit for secret key %r (profile: %s)", key, self.profile_name)
                     return cached[1]
                 if cached:
+                    logger.debug("Cache expired for secret key %r (profile: %s)", key, self.profile_name)
                     self._cache.pop(key, None)
+        logger.debug("Cache miss for secret key %r (profile: %s)", key, self.profile_name)
         try:
             value = self.kist.get(key)
         except KeyError:
@@ -80,8 +86,11 @@ class TTLSecretStore:
         if self.policy.enabled:
             with self._lock:
                 if len(self._cache) >= self.policy.max_entries:
-                    self._cache.pop(next(iter(self._cache)))
+                    evicted_key = next(iter(self._cache))
+                    self._cache.pop(evicted_key)
+                    logger.debug("Evicted oldest cache entry %r (profile: %s, max_entries: %d)", evicted_key, self.profile_name, self.policy.max_entries)
                 self._cache[key] = (now, value)
+                logger.debug("Cached secret key %r (profile: %s)", key, self.profile_name)
         return value
 
     def get_secret(self, key: str, default: Any = ...) -> Any:
@@ -91,8 +100,10 @@ class TTLSecretStore:
         with self._lock:
             if key is None:
                 self._cache.clear()
+                logger.debug("Cleared entire cache for profile: %s", self.profile_name)
             else:
                 self._cache.pop(key, None)
+                logger.debug("Invalidated cached secret key %r for profile: %s", key, self.profile_name)
 
     clear = invalidate
 
@@ -136,6 +147,7 @@ class DynamicSecretStore(TTLSecretStore):
         if self._listener_thread and self._listener_thread.is_alive():
             return
         self._stop_event.clear()
+        logger.debug("Starting notification listener thread for profile %s on channel %s", self.profile_name, self.channel)
         self._listener_thread = threading.Thread(target=self._listen_for_updates, name=f"kist-listener-{self.profile_name}", daemon=True)
         self._listener_thread.start()
 
@@ -144,13 +156,16 @@ class DynamicSecretStore(TTLSecretStore):
             try:
                 with safe_db_connect(self.db_url, autocommit=True) as conn:
                     conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self.channel)))
+                    logger.debug("Notification listener connected on channel %s (profile: %s)", self.channel, self.profile_name)
                     while not self._stop_event.is_set():
                         for notification in conn.notifies(timeout=0.5):
                             self._handle_notification(notification.payload)
-            except Exception:
+            except Exception as exc:
                 if self.policy.clear_on_disconnect:
                     self.invalidate()
+                    logger.debug("Cleared cache on disconnect for profile: %s", self.profile_name)
                 if not self._stop_event.is_set():
+                    logger.warning("Notification listener disconnected for profile %s; reconnecting in 2.0s (%s)", self.profile_name, type(exc).__name__)
                     time.sleep(2.0)
 
     def _handle_notification(self, raw_payload: Any) -> None:
@@ -161,8 +176,10 @@ class DynamicSecretStore(TTLSecretStore):
             if not isinstance(payload, dict) or not _notification_matches(payload, self.profile_name, self.kist.profile_id):
                 return
             key = payload.get("secret_key")
+            logger.debug("Notification received on channel %s; invalidating key %r for profile: %s", self.channel, key, self.profile_name)
             self.invalidate(key if isinstance(key, str) else None)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to process notification payload for profile %s; invalidating cache (%s)", self.profile_name, type(exc).__name__)
             self.invalidate()
 
     def close(self) -> None:
@@ -171,6 +188,7 @@ class DynamicSecretStore(TTLSecretStore):
             self._listener_thread.join(timeout=1.0)
         self._listener_thread = None
         self.invalidate()
+        logger.debug("Closed notification listener for profile: %s", self.profile_name)
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
@@ -214,6 +232,7 @@ class AsyncDynamicSecretStore:
         if self._listener_task and not self._listener_task.done():
             return
         self._closing = False
+        logger.debug("Starting async notification listener for profile %s on channel %s", self.profile_name, self.channel)
         self._listener_task = asyncio.get_running_loop().create_task(self._listen_for_updates())
 
     async def get(self, key: str, default: Any = ...) -> Any:
@@ -222,9 +241,12 @@ class AsyncDynamicSecretStore:
             async with self._lock:
                 cached = self._cache.get(key)
                 if cached and now - cached[0] < self.policy.ttl_seconds:
+                    logger.debug("Cache hit for secret key %r (profile: %s)", key, self.profile_name)
                     return cached[1]
                 if cached:
+                    logger.debug("Cache expired for secret key %r (profile: %s)", key, self.profile_name)
                     self._cache.pop(key, None)
+        logger.debug("Cache miss for secret key %r (profile: %s)", key, self.profile_name)
         try:
             value = await asyncio.to_thread(self.kist.get, key)
         except KeyError:
@@ -234,8 +256,11 @@ class AsyncDynamicSecretStore:
         if self.policy.enabled:
             async with self._lock:
                 if len(self._cache) >= self.policy.max_entries:
-                    self._cache.pop(next(iter(self._cache)))
+                    evicted_key = next(iter(self._cache))
+                    self._cache.pop(evicted_key)
+                    logger.debug("Evicted oldest cache entry %r (profile: %s, max_entries: %d)", evicted_key, self.profile_name, self.policy.max_entries)
                 self._cache[key] = (now, value)
+                logger.debug("Cached secret key %r (profile: %s)", key, self.profile_name)
         return value
 
     async def get_secret(self, key: str, default: Any = ...) -> Any:
@@ -245,24 +270,30 @@ class AsyncDynamicSecretStore:
         async with self._lock:
             if key is None:
                 self._cache.clear()
+                logger.debug("Cleared entire cache for profile: %s", self.profile_name)
             else:
                 self._cache.pop(key, None)
+                logger.debug("Invalidated cached secret key %r for profile: %s", key, self.profile_name)
 
     async def _listen_for_updates(self) -> None:
         while not self._closing:
             try:
                 async with await safe_async_db_connect(self.db_url, autocommit=True) as conn:
                     await conn.execute(sql.SQL("LISTEN {}").format(sql.Identifier(self.channel)))
+                    logger.debug("Async notification listener connected on channel %s (profile: %s)", self.channel, self.profile_name)
                     async for notification in conn.notifies():
                         if self._closing:
                             break
                         await self._handle_notification(notification.payload)
             except asyncio.CancelledError:
+                logger.debug("Async notification listener cancelled for profile: %s", self.profile_name)
                 break
-            except Exception:
+            except Exception as exc:
                 if self.policy.clear_on_disconnect:
                     await self.invalidate()
+                    logger.debug("Cleared cache on disconnect for profile: %s", self.profile_name)
                 if not self._closing:
+                    logger.warning("Async notification listener disconnected for profile %s; reconnecting in 2.0s (%s)", self.profile_name, type(exc).__name__)
                     await asyncio.sleep(2.0)
 
     async def _handle_notification(self, raw_payload: Any) -> None:
@@ -273,8 +304,10 @@ class AsyncDynamicSecretStore:
             if not isinstance(payload, dict) or not _notification_matches(payload, self.profile_name, self.kist.profile_id):
                 return
             key = payload.get("secret_key")
+            logger.debug("Notification received on channel %s; invalidating key %r for profile: %s", self.channel, key, self.profile_name)
             await self.invalidate(key if isinstance(key, str) else None)
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to process notification payload for profile %s; invalidating cache (%s)", self.profile_name, type(exc).__name__)
             await self.invalidate()
 
     async def close(self) -> None:
@@ -287,6 +320,7 @@ class AsyncDynamicSecretStore:
                 pass
         self._listener_task = None
         await self.invalidate()
+        logger.debug("Closed async notification listener for profile: %s", self.profile_name)
 
     async def __aenter__(self):
         await self.start()
