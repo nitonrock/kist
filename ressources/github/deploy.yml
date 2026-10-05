@@ -1,4 +1,4 @@
-name: Deploy & Sync Secrets
+name: Deploy & Sync Secrets to PostgreSQL
 
 on:
   push:
@@ -7,10 +7,12 @@ on:
     paths:
       - 'secrets*.yaml'
       - 'secrets*.yml'
+      - 'secrets/**'
       - 'src/**'
 
 jobs:
   sync-secrets-and-deploy:
+    name: Sync Secrets & Deploy Application
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -23,16 +25,20 @@ jobs:
           python-version: "3.13"
 
       - name: Install Project & Kist
-        run: uv sync
+        run: |
+          uv sync || pip install kist
 
       - name: Sync Secrets to Production Database
         env:
           KIST_DATABASE_URL: ${{ secrets.KIST_DATABASE_URL }}
           KIST_PASSWORD_PRODUCTION: ${{ secrets.KIST_PASSWORD_PRODUCTION }}
         run: |
-          echo "🔒 Flattening and encrypting secrets into PostgreSQL..."
-          uv run kist lock secrets_production.yaml
+          echo "🔒 Locking and flattening secrets into PostgreSQL..."
+          uv run kist --profile production lock secrets/production.yaml
+          echo "✅ Secrets successfully synced to PostgreSQL (LISTEN/NOTIFY signals emitted)."
 
       - name: Deploy Application Container
         run: |
-          echo "🚀 Deploying application (DynamicSecretStore auto-refreshes secrets via NOTIFY)..."
+          echo "🚀 Deploying application..."
+          # Application nodes using DynamicSecretStore or AsyncDynamicSecretStore
+          # automatically receive instant cache invalidation via PostgreSQL NOTIFY.

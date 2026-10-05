@@ -1,31 +1,38 @@
 [project]
 name = "kist"
 version = "0.1.0"
-description = "A Self-Sufficient Multi-Profile Secrets Manager and Absolute Git Leak Guard"
+description = "A Self-Sufficient Multi-Profile Secrets Manager and Git Leak Guard"
 readme = "README.md"
 requires-python = ">=3.13"
-license = { text = "MIT" }
+license = "Apache-2.0"
+license-files = ["LICENCE", "NOTICE"]
 authors = [
-    { name = "Kist Maintainers" }
+    { name = "nitonrock", email = "info@nitonrock.com"}
 ]
+
+
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Security :: Cryptography",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Typing :: Typed",
+]
+
 keywords = [
     "secrets",
     "security",
     "git",
     "postgresql",
-    "fernet",
     "encryption",
     "fastapi",
     "git-leak-guard",
 ]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Developers",
-    "Topic :: Security :: Cryptography",
-    "Topic :: Software Development :: Build Tools",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.13",
-]
+
 dependencies = [
     "cryptography>=50.0.0",
     "psycopg[binary]>=3.3.4",
@@ -42,3 +49,13 @@ build-backend = "uv_build"
 [tool.uv.build-backend]
 module-name = "kist"
 module-root = ""
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

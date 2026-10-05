@@ -2,468 +2,710 @@
   <img src="ressources/kist.png" alt="Kist" width="500" />
 </p>
 
+<h1 align="center">Kist</h1>
 
-**Kist is a Self-Sufficient, Multi-Profile Secrets Manager & Absolute Git Leak Guard**
+<p align="center">
+  <strong>Keep It Simple and Trusted.</strong><br />
+  Git-governed encrypted secret storage for Python applications.
+</p>
 
-Kist is an automated, zero-overhead secrets management engine built for modern engineering teams. It bridges the gap between **GitOps convenience** (editing human-readable YAML configuration files) and **production-grade security** (centralized PostgreSQL storage with Fernet encryption, dynamic in-memory caching, and zero plaintext in Git).
+<p align="center">
+  <a href="#status">Status</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#git-workflow">Git workflow</a> ·
+  <a href="#cicd-integration--gitops">CI/CD & GitOps</a> ·
+  <a href="#security-boundaries">Security boundaries</a> ·
+  <a href="#license">License</a>
+</p>
 
----
+> **Alpha software — Kist 0.1.0.** Kist is suitable for evaluation and controlled self-hosted deployments. Its API, database schema, and encrypted-envelope format may evolve before a stable release. Review the code, test recovery procedures, and do not treat a local Git hook as an organisational security control.
 
-## 📖 Table of Contents
+Kist is a Python library and CLI for teams that want secret changes reviewed in Git, stored encrypted in PostgreSQL, and retrieved by Python applications—without operating a separate Vault cluster.
 
-- [Philosophy & Key Concepts](#-philosophy--key-concepts)
-- [How Kist Works](#-how-kist-works)
-  - [Hierarchical Flattening & Type Preservation](#hierarchical-flattening--type-preservation)
-  - [Dual-Context Salt Strategy](#dual-context-salt-strategy)
-  - [Zero-Downtime Secret Propagation](#zero-downtime-secret-propagation)
-- [Installation](#-installation)
-- [CLI Reference & Workflows](#-cli-reference--workflows)
-  - [1. Initialize Repository & Arm Leak Guard (`kist init`)](#1-initialize-repository--arm-leak-guard-kist-init)
-  - [2. Inspect Status & Sync Health (`kist status`)](#2-inspect-status--sync-health-kist-status)
-  - [3. Auto-Repair & Fix Environment (`kist fix`)](#3-auto-repair--fix-environment-kist-fix)
-  - [4. Multi-Profile Secrets & Password Resolution](#4-multi-profile-secrets--password-resolution)
-  - [5. Storing Secrets into Database (`kist lock`)](#5-storing-secrets-into-database-kist-lock)
-  - [6. Extracting Secrets from Database (`kist unlock`)](#6-extracting-secrets-from-database-kist-unlock)
-  - [7. Git Clean & Smudge Filters](#7-git-clean--smudge-filters)
-- [Using Kist in Your Application (Python Library)](#-using-kist-in-your-application-python-library)
-  - [Core `Kist` Client](#core-kist-client)
-  - [In-Memory Dynamic Store (`DynamicSecretStore`)](#in-memory-dynamic-store-dynamicsecretstore)
-  - [Asynchronous Dynamic Store (`AsyncDynamicSecretStore`)](#asynchronous-dynamic-store-asyncdynamicsecretstore)
-  - [FastAPI Production Integration](#fastapi-production-integration)
-  - [TTL Caching Store (`TTLSecretStore`)](#ttl-caching-store-ttlsecretstore)
-- [CI/CD Pipelines & Leak Prevention](#-cicd-pipelines--leak-prevention)
-- [Database Schema Reference](#-database-schema-reference)
-- [Troubleshooting](#-troubleshooting)
+Kist means **Keep It Simple and Trusted**.
 
----
+It is built for teams that want encrypted secrets and a reviewable Git workflow
+without turning secret storage into a second full-time infrastructure project.
+The model stays deliberately small: a profile password, authenticated
+encryption, PostgreSQL, and clear operational boundaries.
 
-## 🧠 Philosophy & Key Concepts
+## What Kist does
 
-Traditional secrets management often forces teams into one of two extremes:
-1. **Cumbersome External Vaults**: Heavy infrastructure (e.g., dedicated Vault clusters, complex IAM federation, network latency, and high operational overhead).
-2. **Insecure Git Practices**: Plaintext `.env` files, unencrypted configs accidentally committed to Git, or static `.git-crypt` setups that do not synchronize with runtime databases.
+- Encrypts JSON-compatible secret values with **Argon2id-derived AES-256-GCM** keys.
+- Stores encrypted values in PostgreSQL, scoped by organisation, project, and profile.
+- Locks nested YAML mappings into dot-separated secret keys while preserving JSON-compatible types.
+- Unlocks a profile back into readable YAML when the correct password is available.
+- Uses Git clean/smudge filters to keep selected YAML secret files encrypted in Git while exposing plaintext only in the authorised working tree.
+- Provides an optional local pre-commit guard that detects plaintext in configured Kist secret paths and common credential patterns.
+- Integrates with CI/CD pipelines (**GitHub Actions**, **GitLab CI/CD**, **Bitbucket Pipelines**) for automated PR leak scanning and continuous secret synchronization (GitOps).
+- Supports bounded in-memory caches and PostgreSQL `LISTEN` / `NOTIFY` invalidation through the optional runtime store helpers.
 
-**Kist provides a lightweight, unified alternative:**
-- **Zero Additional Services**: Leverages PostgreSQL—which your stack already runs—as the central encrypted secret store.
-- **Native Git Filter Integration**: Transparently encrypts secrets during `git add` (`clean` filter) and decrypts them during `git checkout` (`smudge` filter).
-- **Hardened Git Leak Guard**: A pre-commit hook and CI/CD scanner inspect staged blobs and hard-abort if unencrypted plaintext secrets are about to be committed.
-- **Hierarchical Dot-Notation with Type Preservation**: Write structured, nested YAML files (`secrets_production.yaml`) that flatten into dot-delimited keys (`database.postgres.port: 5432`) while retaining native data types (integers, booleans, floats, arrays, nulls).
-- **Real-Time Push Invalidation**: When a secret is rotated with `kist lock`, PostgreSQL emits `pg_notify` events to instantly invalidate in-memory caches across all running microservice replicas without restarts.
+## What Kist does not do
 
----
+Kist 0.1.0 deliberately stays small:
 
-## ⚙️ How Kist Works
+- It does **not** provide the sharks surrounding the island in the image above (you will have to supply your own biological perimeter defense).
+- It is **not** a replacement for HashiCorp Vault, a cloud secret manager, or a full identity and governance platform.
+- It does **not** include Kist Guard, cloud KMS, HSM, or managed key-release support yet.
+- It does **not** protect a secret after an authorised application has decrypted it.
+- It does **not** make a local Git hook impossible to bypass (`git commit --no-verify` will always remain an effective way to shoot oneself in the foot).
+- It does **not** replace key backup, password-sharing procedures, CI access policy, incident response, or the people responsible for operating them.
 
-```
-┌────────────────────────────────────────────────────────────────────────┐
-│                             Developer / CI                             │
-│                                                                        │
-│   secrets_prod.yaml (Plaintext in local working tree)                  │
-│          │                                                             │
-│          ├─────────► [git add] ──► Git Clean Filter ──► [Salt + Fernet]│
-│          │                         (Random 16B Salt)    in Git Repo    │
-│          │                                                             │
-│          └─────────► [kist lock] ──► Flatten + Fernet Encrypt          │
-│                      (--prune)                                         │
-└──────────────────────────────────────────────┬─────────────────────────┘
-                                               │
-                                               ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                        PostgreSQL Database                             │
-│                                                                        │
-│   kist_profiles (profile_name, crypto_salt)                            │
-│   kist (profile_id, secret_key, encrypted_blob)                        │
-│                                                                        │
-│   ──► Emits NOTIFY kist_secret_updated ──────────────────┐             │
-└──────────────────────────────────────────────────────────┼─────────────┘
-                                                           │
-                                                           ▼
-┌────────────────────────────────────────────────────────────────────────┐
-│                    Application Replicas (FastAPI / Flask)              │
-│                                                                        │
-│   DynamicSecretStore (Memory Cache <0.01ms)                            │
-│   Background thread listening to PostgreSQL LISTEN                     │
-│   Instant cache invalidation on rotation (Zero Downtime)               │
-└────────────────────────────────────────────────────────────────────────┘
+Kist reduces moving parts in a secret workflow; it does not replace operational judgement, incident response, or the uncomfortable meeting after a leaked credential.
+## Status
+
+Kist is currently an **alpha** project.
+
+The 0.1.0 release supports only the `password-v1` encryption mode:
+
+```text
+profile password
+    + random salt
+    ↓ Argon2id
+AES-256 key
+    + random nonce + authenticated context
+    ↓ AES-256-GCM
+encrypted Kist envelope
+    ↓
+PostgreSQL or Git
 ```
 
-### Hierarchical Flattening & Type Preservation
-Kist allows teams to organize secrets logically in YAML hierarchies while preserving native data types:
+Planned but **not included** in 0.1.0:
+
+```text
+KMS data-encryption keys
+Kist Guard integration
+Cloud KMS providers
+Managed hosting
+Key rotation and migration tooling
+```
+
+## Installation
+
+Install from PyPI with `uv` or `pip`:
+
+```bash
+uv add kist
+```
+
+```bash
+pip install kist
+```
+
+Check that the package and CLI are available:
+
+```bash
+python -c "import kist; print(kist.__version__)"
+python -m kist --help
+kist --help
+```
+
+## Quick start
+
+### 1. Configure Kist
+
+For local development, configure PostgreSQL and a profile password. Never commit these values to Git.
+
+```bash
+export KIST_ENV=development
+export KIST_TLS_MODE=disable
+
+export KIST_DATABASE_URL='postgresql://kist_user:replace-me@127.0.0.1:5432/kist'
+export KIST_PASSWORD='replace-with-a-long-random-password'
+
+# Optional scope values.
+export KIST_ORG_ID='local'
+export KIST_PROJECT_ID='default'
+export KIST_PROFILE='default'
+```
+
+For a remote production PostgreSQL service, use TLS with certificate verification:
+
+```bash
+export KIST_ENV=production
+export KIST_TLS_MODE=verify-full
+export PGSSLROOTCERT='/run/secrets/postgres-ca.pem'
+
+export KIST_DATABASE_URL='postgresql://kist_user:replace-me@db.example.internal:5432/kist?sslmode=verify-full'
+export KIST_PASSWORD='provided-by-your-runtime-secret-injection-mechanism'
+```
+
+`sslmode=require` encrypts transport but does not verify the database server identity. Prefer `verify-full` for remote production databases.
+
+### 2. Initialise the database schema
+
+Schema setup is explicit. Run it using a controlled deployment/setup identity:
+
+```bash
+kist init-db
+```
+
+A normal runtime application should ideally have only the database permissions required to read and write Kist data; it should not need permission to create tables.
+
+### 3. Store and retrieve a value
+
+```bash
+kist set example.api_key 'example-value'
+kist get example.api_key
+```
+
+Output:
+
+```text
+example-value
+```
+
+Avoid placing real production secrets directly on a shell command line: terminal history, process inspection, and CI logs can all turn a convenient command into an inconvenient incident report.
+
+### 4. Use Kist from Python
+
+```python
+import os
+
+from kist import Kist, KistScope
+
+# Automatic resolution: checks KIST_PASSWORD_<PROFILE> -> KIST_PASSWORD -> ~/.kist/pwd_<profile>
+store = Kist(
+    profile_name=os.getenv("KIST_PROFILE", "default"),
+    db_url=os.environ.get("KIST_DATABASE_URL"),
+    scope=KistScope.from_environment(),
+)
+
+# Alternatively, pass master_password explicitly:
+# store = Kist(profile_name="production", master_password=os.environ["KIST_PASSWORD_PRODUCTION"])
+
+api_key = store.get("example.api_key")
+print(api_key)
+```
+
+The public 0.1.0 API is intentionally small:
+
+```python
+from kist import (
+    DecryptionError,
+    InvalidEnvelopeError,
+    Kist,
+    KistError,
+    KistScope,
+    MissingKeyError,
+)
+```
+
+## How it works
+
+### Password-v1 envelopes
+
+Kist stores an encrypted binary envelope, not a plaintext secret value.
+
+```text
+plaintext value
+    ↓
+JSON serialisation
+    ↓
+AES-256-GCM encryption
+    ↑
+Argon2id(profile password, random salt)
+    ↑
+profile password
+```
+
+Each envelope contains, conceptually:
+
+| Component | Purpose | Secret? |
+|---|---|---:|
+| Magic/version fields | Identifies the Kist format and supported algorithms | No |
+| Argon2id parameters | Allows the same password-derived key to be recreated | No |
+| Salt | Makes each password-key derivation distinct | No |
+| Nonce | Makes every AES-GCM encryption distinct | No |
+| Ciphertext and authentication tag | Stores the protected secret value | Protected, but safe to store |
+| Context commitment | Binds the envelope to its intended scope and identity | No |
+
+The **salt** is used before encryption to derive a key from a password. The **nonce** is used for every AES-GCM encryption. Both are stored with the ciphertext; neither is a secret. The important rule is that Kist uses a fresh nonce for every encryption under a key.
+
+### Authenticated context
+
+Kist binds each database value to authenticated context that includes:
+
+```text
+organisation ID
+project ID
+profile ID
+profile name
+logical secret key
+secret version
+```
+
+That means an encrypted value should not successfully decrypt if it is copied to a different profile, secret key, scope, or version.
+
+For example, ciphertext created for:
+
+```text
+local/default/production/database.password/version-4
+```
+
+cannot simply be relabelled as:
+
+```text
+local/default/production/payment.api_key/version-4
+```
+
+and accepted by Kist. The authentication check fails closed.
+
+### YAML lock and unlock
+
+Kist accepts nested YAML mappings and flattens them into dot-separated keys.
 
 ```yaml
 # secrets_production.yaml
 sql:
   pg:
-    user: "master_user"
+    host: db.internal
     port: 5432
     ssl_enabled: true
-    timeout: 5.5
 third_party:
   stripe:
-    live_token: "sk_live_123456789"
+    api_key: sk_example_value
 ```
 
-When locked, Kist flattens this tree into dot-notation database keys with JSON serialization to preserve numbers, booleans, and nested structures:
-- `sql.pg.user` &rarr; `"master_user"`
-- `sql.pg.port` &rarr; `5432` (integer preserved)
-- `sql.pg.ssl_enabled` &rarr; `true` (boolean preserved)
-- `third_party.stripe.live_token` &rarr; `"sk_live_123456789"`
+This becomes values similar to:
 
-### Dual-Context Salt Strategy & Memory-Hard KDF
-- **Argon2id Key Derivation**: Kist derives 256-bit cryptographic Fernet keys using **Argon2id** ($m=64\text{ MB}, t=2, p=4$). Argon2id provides state-of-the-art memory hardness, completely neutralizing GPU, ASIC, and FPGA parallel dictionary and brute-force cracking attacks.
-- **Production Context (with Database)**: When `KIST_DATABASE_URL` is configured, Kist generates a unique cryptographically secure 16-byte random salt per profile in `kist_profiles`.
-- **Local Context (Git Filters & Envelope Prepending)**: When staging and pulling files, Kist generates a fresh 16-byte random salt (`os.urandom(16)`) and prepends it to the ciphertext header (`[16 bytes salt + Fernet ciphertext]`). This completely eliminates rainbow table precomputation attacks while keeping Git operations 100% offline and decoupled from database access.
-- **Strict POSIX Permissions**: Auto-generated credentials in `~/.kist/` are created with `0700` (`drwx------`) directory permissions and `0600` (`-rw-------`) file permissions to prevent local privilege escalation or world-readable key exposures.
-- **Enforced TLS/SSL Transport Security**: All PostgreSQL connections automatically enforce TLS/SSL encryption (`sslmode=require` by default, or `verify-full`). Insecure connection modes (`disable`, `allow`, `prefer`) are strictly disallowed and upgraded to prevent man-in-the-middle attacks across networks.
+```text
+sql.pg.host                    → "db.internal"
+sql.pg.port                    → 5432
+sql.pg.ssl_enabled             → true
+third_party.stripe.api_key     → "sk_example_value"
+```
 
-### Zero-Downtime Secret Propagation
-Static caches require restarting containers or polling databases periodically. Kist's `DynamicSecretStore` uses PostgreSQL `LISTEN / NOTIFY` to push invalidation signals to applications the millisecond `kist lock` runs.
+JSON-compatible types are preserved. Kist uses `yaml.safe_load`; YAML roots must be mappings and mapping keys must be non-empty strings without dots.
 
----
-
-## 📦 Installation
-
-Install Kist using `pip` or `uv`:
+Lock a YAML file into PostgreSQL:
 
 ```bash
-# Using uv (recommended)
-uv add kist
-
-# Or using pip
-pip install kist
+kist lock secrets/production.yaml
 ```
 
----
+Explicitly specify or override a profile:
 
-## 🛠️ CLI Reference & Workflows
+```bash
+kist --profile production lock secrets/production.yaml
+```
 
-### 1. Initialize Repository & Arm Leak Guard (`kist init`)
+> **Defense-in-Depth Safety:** By default, `kist lock` verifies that the active profile matches the target file basename (e.g. `--profile production` expects `production.yaml` or `secrets/production.yaml`). Accidental mismatches are blocked to prevent cross-profile data corruption.
+> To explicitly load a differently named file for custom workflows, use `--allow-mismatch` or `--force`:
+> ```bash
+> kist --profile production lock secrets/custom_seed.yaml --allow-mismatch
+> ```
 
-Run `kist init` inside your Git repository root:
+Prune database values that no longer appear in the YAML source:
+
+```bash
+kist lock secrets/production.yaml --prune
+```
+
+> **Destructive Flag Protection:** In interactive terminals, `--prune` prompts for explicit user confirmation before permanently deleting obsolete database rows. In automated pipelines or scripted workflows, supply `--force` or `--yes` to proceed without interactive confirmation.
+
+Reconstruct a profile as YAML:
+
+```bash
+kist unlock secrets/production.yaml
+```
+
+> **Writer model & concurrency:** Kist serializes concurrent profile writes (such as overlapping CI deployment runs) using PostgreSQL transaction-level advisory locks (`pg_advisory_xact_lock`), and protects programmatic single-key updates (`kist.set`) with row-level locks (`SELECT ... FOR UPDATE`) and automatic retry loops.
+
+### Runtime cache invalidation
+
+When Kist changes a value, it sends a PostgreSQL notification on the `kist_secret_updated` channel. `DynamicSecretStore` and `AsyncDynamicSecretStore` can listen for these events and clear the affected in-memory cache entry.
+
+```text
+Git/deployment writer updates Kist database
+    ↓
+PostgreSQL NOTIFY
+    ↓
+running application cache invalidates the affected key
+    ↓
+next read decrypts the current stored value
+```
+
+This is cache invalidation, not secret telepathy: each application still needs its configured database access and profile password to retrieve a value.
+
+## Git workflow
+
+Kist integrates with Git clean/smudge filters for selected YAML secret files.
+
+```text
+authorised working tree       Git index / repository
+-----------------------       ----------------------
+plaintext secrets.yaml
+        │
+        ├── git add ── clean filter ──> encrypted Kist envelope
+        │
+        └── git checkout <── smudge filter <── encrypted Kist envelope
+                                      │
+                                      └── plaintext working-tree file
+```
+
+### Initialise a repository
+
+Inside a Git work tree:
 
 ```bash
 kist init
 ```
 
-This command automatically:
-1. Configures Git clean/smudge filters (`filter.kist.clean`, `filter.kist.smudge`).
-2. Creates `.gitattributes` mapping `secrets*.yaml` and `secrets*.yml` to the Kist filter.
-3. Appends `.kist/` (local profile password directory) to `.gitignore`.
-4. Installs a virtualenv-resilient `.git/hooks/pre-commit` hook to prevent plaintext secret leaks.
+Kist configures local clean/smudge filters, appends missing Kist rules to `.gitattributes`, adds `.kist/` to `.gitignore`, and installs a local pre-commit guard when safe to do so.
 
----
+Expected Kist attribute rules include:
 
-### 2. Inspect Status & Sync Health (`kist status`)
+```gitattributes
+secrets*.yaml filter=kist
+secrets*.yml filter=kist
+secrets/*.yaml filter=kist
+secrets/*.yml filter=kist
+```
 
-Run `kist status` at any time to verify your environment health across Git filters, local profiles, staging encryption, and database synchronization:
+Kist will not silently overwrite an unrelated pre-commit hook. Review the hook first, then use the explicit force option only when appropriate.
+
+### Check and repair local setup
 
 ```bash
+kist diagnose
+kist fix
+kist fix --apply
 kist status
 ```
 
-Example Output:
+`kist fix` is a dry run. `kist fix --apply` repairs only local Git integration. It does not create profile keys, restage files, or modify encrypted secret values.
+
+### Local hook limits
+
+The local pre-commit guard blocks likely plaintext credentials and plaintext files in Kist-managed secret paths before a normal commit. It is useful fast feedback, but it is **not an absolute Git leak guard**.
+
+Any developer who controls a local clone can bypass a client-side hook, for example with:
+
+```bash
+git commit --no-verify
+```
+
+Treat local hooks as a seatbelt, not an indestructible force field.
+
+For organisation-wide enforcement:
+
+1. Run an equivalent secret scanner in required CI.
+2. Protect production/default branches.
+3. Require merge requests and passing security checks.
+4. Restrict who can modify CI configuration and security policy.
+5. Where you administer the Git server, consider a server-side pre-receive scanner that rejects pushes before refs are updated.
+
+## CI/CD integration & GitOps
+
+Kist turns Git into a secure, reviewable control plane for application secrets (**GitOps for Secrets**) while keeping raw credentials strictly outside of unencrypted Git history and log streams.
+
 ```text
-📦 Kist Status Overview
-==================================================
-
-🛡️  Git Pipeline & Hooks:
-  ✔ Git clean filter configured
-  ✔ Git smudge filter configured
-  ✔ .gitattributes configured (secrets*.yaml)
-  ✔ .gitignore protects .kist/
-  ✔ Pre-commit leak guard installed & active
-
-🔑 Secret Profiles Detected:
-  • Profile 'default' (secrets.yaml)
-    - Password: Found via ~/.kist/pwd_default
-    - Git Staging: Clean / unstaged working copy
-    - DB Sync: 4 secrets synced (Last updated: 2026-09-18 10:30)
-
-  • Profile 'production' (secrets/secrets_production.yaml)
-    - Password: Found via env $KIST_PASSWORD_PRODUCTION
-    - Git Staging: Clean (Encrypted blob in index)
-    - DB Sync: 8 secrets synced (Last updated: 2026-09-18 10:45)
-
-  • Profile 'staging' (secrets/secrets_staging.yaml)
-    - Password: ⚠️  MISSING (Set KIST_PASSWORD_STAGING)
-    - DB Sync: Not configured / uninitialized
-
-🗄️  Database:
-  ✔ postgresql://user:***@localhost:5432/secrets_db (Connected)
+┌───────────────────────────────┐     Pull Request     ┌────────────────────────────────────┐
+│ Developer pushes branch       │ ───────────────────> │ CI Server: PR Leak Guard           │
+│ (secrets encrypted by filter) │                      │ - Verifies valid Kist envelopes    │
+└───────────────────────────────┘                      │ - Blocks unencrypted files/tokens  │
+                                                       └─────────────────┬──────────────────┘
+                                                                         │ Approved & Merged
+                                                                         ▼
+┌───────────────────────────────┐     PostgreSQL       ┌────────────────────────────────────┐
+│ Application Runtime Containers│ <─────────────────── │ CI/CD Server: Secret Sync          │
+│ - DynamicSecretStore caches   │    LISTEN/NOTIFY     │ - Runs `kist lock secrets.yaml`    │
+│ - Instant auto-invalidation   │                      │ - Updates database ciphertext      │
+└───────────────────────────────┘                      └────────────────────────────────────┘
 ```
 
----
+### 1. Server-side PR leak protection
 
-### 3. Auto-Repair & Fix Environment (`kist fix`)
+While local pre-commit hooks provide fast feedback for developers, server-side CI checks guarantee that no unencrypted secret file or exposed credential ever merges into protected branches (e.g., `main`, `staging`).
 
-Run `kist fix` whenever you clone a repository, switch branches, encounter staging desynchronization, or find unencrypted plaintext warnings in `kist status`:
+In Pull Requests / Merge Requests, CI verifies that all tracked `secrets*.yaml` files are valid `kist-v1` binary envelopes:
 
-```bash
-kist fix
-```
-
-This command automatically:
-1. **Repairs Git Plumbing**: Ensures Git clean/smudge filters, `.gitattributes`, `.gitignore`, and the pre-commit leak guard hook are active.
-2. **Generates Missing Profile Keys**: Inspects all discovered YAML secret files and auto-generates master keys in `~/.kist/pwd_<profile>` for any profile lacking credentials.
-3. **Repairs Staging Index**: Detects unencrypted plaintext secret files or out-of-sync entries in the Git staging index and cleanly re-stages them through the encryption filter.
-
-Example Output:
-```text
-🔧 Kist Auto-Repair & Environment Sync
-==================================================
-
-🛠️  1. Repairing Git Configuration & Plumbing:
-⚙️ Hooking Kist filters directly into your native local Git pipeline...
-🏆 Initialization Complete! The Leak Guard is armed.
-
-🔑 2. Verifying Secret Profile Passwords:
-  ✔ Profile 'default': Key found in ~/.kist/pwd_default
-  ✔ Profile 'production': Key found in environment variable ($KIST_PASSWORD_PRODUCTION)
-
-🛡️  3. Inspecting & Repairing Git Staging Index:
-  ⚠️  Found unencrypted plaintext for 'secrets.yaml' in Git index. Re-staging...
-  ✔ Staged 'secrets.yaml' encrypted via Kist clean filter.
-
-==================================================
-🎉 Repair Complete! Your Git filters, profile keys, and staging index are now healthy.
-```
-
----
-
-### 4. Multi-Profile Secrets & Password Resolution
-
-Kist determines the profile name directly from the file name:
-- `secrets.yaml` &rarr; Profile: `default`
-- `secrets_production.yaml` &rarr; Profile: `production`
-- `secrets_staging.yaml` &rarr; Profile: `staging`
-- `secrets_team_a.yaml` &rarr; Profile: `team_a`
-
-#### Password Resolution Order:
-1. Environment Variable:
-   - For `default`: `KIST_PASSWORD_DEFAULT` or `KIST_PASSWORD`
-   - For `<profile>`: `KIST_PASSWORD_<PROFILE>` (e.g. `KIST_PASSWORD_PRODUCTION`) or `KIST_PASSWORD`
-2. Local Key File: `~/.kist/pwd_<profile>`
-3. Auto-Generation: If neither is found, Kist generates a cryptographically secure token, saves it to `~/.kist/pwd_<profile>`, and prints it to stdout.
-
----
-
-### 5. Storing Secrets into Database (`kist lock`)
-
-Flattens a local YAML file, encrypts each leaf node with Fernet, writes the records to the `kist` table in PostgreSQL, and emits real-time notifications to all connected applications.
-
-> **💡 Flexible Path & Name Resolution**: You don't need to specify exact subfolder paths (e.g., `secrets/`) or extensions (`.yaml`). Kist automatically locates files in `secrets/` or the project root. For example, `kist lock secrets_production`, `kist lock secrets_production.yaml`, and `kist lock secrets/secrets_production.yaml` all work identically!
-
-```bash
-export KIST_DATABASE_URL="postgresql://user:password@localhost:5432/secrets_db?sslmode=require"
-export KIST_PASSWORD_PRODUCTION="your_secure_passphrase"
-
-kist lock secrets_production
-```
-
-#### Pruning Obsolete Secrets (`--prune` / `-p`)
-If you removed keys from your YAML file and want them automatically deleted from PostgreSQL:
-
-```bash
-kist lock secrets_production --prune
-```
-
-Output:
-```text
-🔒 Locked 8 secrets into DB for profile 'production'. (Pruned 2 obsolete secrets)
-```
-
----
-
-### 6. Extracting Secrets from Database (`kist unlock`)
-
-Fetches all encrypted secrets for the corresponding profile from PostgreSQL, decrypts them, reconstructs the nested YAML hierarchy with data types preserved, and prints the result:
-
-```bash
-kist unlock secrets_production
-```
-
-Output:
 ```yaml
-sql:
-  pg:
-    user: master_user
-    port: 5432
-    ssl_enabled: true
-third_party:
-  stripe:
-    live_token: sk_live_123456789
+- name: Verify Secret Envelope Encryption
+  run: |
+    python - << 'EOF'
+    import sys
+    from pathlib import Path
+    from kist.core import is_kist_envelope
+
+    secret_files = list(Path('.').glob('secrets*.yaml')) + list(Path('.').glob('secrets*.yml'))
+    for file_path in secret_files:
+        if file_path.is_file() and file_path.stat().st_size > 0:
+            if not is_kist_envelope(file_path.read_bytes()):
+                print(f"🚨 Plaintext secret leak detected in {file_path}!", file=sys.stderr)
+                sys.exit(1)
+    print("✅ All secret files verified as encrypted Kist envelopes.")
+    EOF
 ```
 
----
+### 2. Automated secret deployment & live reload
 
-### 7. Git Clean & Smudge Filters
+When a reviewed PR merges to `main`, CI securely synchronizes the updated secrets to your centralized PostgreSQL database:
 
-Kist integrates with Git's native filter pipeline:
-- **`clean`** (`kist --clean %f`): Reads plaintext from stdin, generates a fresh 16-byte random salt, encrypts it, and writes the `[salt + ciphertext]` blob to Git staging.
-- **`smudge`** (`kist --smudge %f`): Reads the encrypted blob from repository object storage, extracts the salt, decrypts it, and populates the plaintext working tree.
+```bash
+# In CI with KIST_DATABASE_URL and KIST_PASSWORD_PRODUCTION configured:
+kist --profile production lock secrets_production.yaml
+```
 
----
+When secrets are locked into PostgreSQL, Kist emits a `NOTIFY kist_updates` event. Applications running `DynamicSecretStore` or `AsyncDynamicSecretStore` receive the signal in real time and automatically refresh cached values without container restarts or downtime.
 
-## 🐍 Using Kist in Your Application (Python Library)
+### 3. Production-ready CI templates
 
-### Core `Kist` Client
+Standalone, copy-paste templates are available in the [`ressources/`](ressources/) directory:
 
-Use the `Kist` class for direct database retrieval:
+- **GitHub Actions** ([`ressources/github/`](ressources/github/)):
+  - [`leak-guard.yml`](ressources/github/leak-guard.yml): PR scan and leak prevention.
+  - [`deploy.yml`](ressources/github/deploy.yml): PostgreSQL secret sync on merge to `main`.
+- **GitLab CI/CD** ([`ressources/gitlab/`](ressources/gitlab/)):
+  - [`.gitlab-ci.yml`](ressources/gitlab/.gitlab-ci.yml): Multi-stage pipeline with security scanning, secret sync, and deployment.
+- **Bitbucket Pipelines** ([`ressources/bitbucket/`](ressources/bitbucket/)):
+  - [`bitbucket-pipelines.yml`](ressources/bitbucket/bitbucket-pipelines.yml): Step definitions for PR leak guard and automated deployment.
+
+For detailed setup instructions and variable configuration, see the [CI/CD Resources Guide](ressources/README.md).
+
+## Password resolution and local profile keys
+
+For any profile named `<name>`, Kist resolves the required password in the following order of precedence:
+
+1. **Profile-Specific Environment Variable**: `KIST_PASSWORD_<NAME_UPPERCASE>` (e.g., `KIST_PASSWORD_PRODUCTION`, `KIST_PASSWORD_STAGING`, `KIST_PASSWORD_DEFAULT`)
+2. **Global Fallback Environment Variable**: `KIST_PASSWORD` (used across profiles if no specific variable is defined)
+3. **Local Key File**: `~/.kist/pwd_<name>` (e.g., `~/.kist/pwd_production`, `~/.kist/pwd_staging`, `~/.kist/pwd_default`)
+
+### Managing multiple profiles with the CLI
+
+When running CLI commands with the `--profile` flag, Kist automatically resolves the corresponding profile password:
+
+```bash
+# 1. Using profile-specific environment variables (recommended for CI/CD & Cloud)
+export KIST_PASSWORD_PRODUCTION='super-secret-random-production-key'
+export KIST_PASSWORD_STAGING='staging-specific-random-key'
+
+kist --profile production lock secrets_production.yaml
+kist --profile staging status
+
+# 2. Using local key files (recommended for local development)
+kist profile create development
+kist profile create staging
+
+kist --profile staging status
+```
+
+Create a local profile password explicitly:
+
+```bash
+kist profile create production
+```
+
+Kist intentionally does **not** generate profile keys implicitly during normal operations. A surprise key is a fine way to create a surprise recovery problem.
+
+On POSIX systems, Kist uses owner-only protections for local key material:
+
+```text
+~/.kist/                 0700
+~/.kist/pwd_<profile>    0600
+```
+
+Keep local profile keys out of Git, backups with broad access, screenshots, and chat messages. Prefer runtime-injected environment variables or a purpose-built secret delivery mechanism for deployed applications.
+
+## Python runtime stores
+
+Kist includes optional bounded in-memory cache wrappers in `kist.stores`.
 
 ```python
-import os
-from kist import Kist
+from kist.stores import TTLSecretStore
 
-# Initialize client (derives profile key from environment or ~/.kist/)
-kist = Kist(
-    profile_name=os.getenv("KIST_PROFILE", "production"),
-    master_password=os.getenv("KIST_PASSWORD")
+store = TTLSecretStore(
+    profile_name="production",
+    ttl_seconds=30,
 )
 
-# Fetch decrypted secret by dot-notation path (types preserved!)
-db_port = kist.get("sql.pg.port")        # Returns int 5432
-ssl_on = kist.get("sql.pg.ssl_enabled")  # Returns bool True
-api_key = kist.get("third_party.stripe.live_token")
+api_key = store.get("third_party.stripe.api_key")
 ```
 
----
-
-### In-Memory Dynamic Store (`DynamicSecretStore`)
-
-`DynamicSecretStore` caches secrets in memory for `<0.01ms` lookups and uses a background thread listening for PostgreSQL `LISTEN` notifications to invalidate cached keys instantly when secrets rotate.
+For PostgreSQL notification-driven invalidation:
 
 ```python
-from kist import DynamicSecretStore
+from kist.stores import DynamicSecretStore
 
-# Automatically derives connection params from environment:
-# KIST_DATABASE_URL, KIST_PROFILE, KIST_PASSWORD
-store = DynamicSecretStore()
+store = DynamicSecretStore(
+    profile_name="production",
+    auto_start=True,
+)
 
-# 1. First lookup: Fetches from PostgreSQL, decrypts, and populates memory cache
-db_password = store.get("sql.pg.pwd")
-
-# 2. Subsequent lookups: Sub-millisecond in-memory cache hit
-db_password = store.get("sql.pg.pwd")
-
-# Clean shutdown
-store.close()
+try:
+    api_key = store.get("third_party.stripe.api_key")
+finally:
+    store.close()
 ```
 
----
-
-### Asynchronous Dynamic Store (`AsyncDynamicSecretStore`)
-
-For asynchronous Python applications (FastAPI, Litestar, Sanic, asyncio), `AsyncDynamicSecretStore` provides non-blocking async reads and an async notification listener:
+For asynchronous applications:
 
 ```python
-from kist import AsyncDynamicSecretStore
+from kist.stores import AsyncDynamicSecretStore
 
-async def main():
-    async with AsyncDynamicSecretStore(profile_name="production") as store:
-        db_user = await store.get("sql.pg.user")
-        print(f"User: {db_user}")
+async def use_secrets() -> None:
+    async with AsyncDynamicSecretStore(
+        profile_name="production",
+    ) as store:
+        api_key = await store.get("third_party.stripe.api_key")
 ```
 
----
+### Caching warning
 
-### FastAPI Production Integration
+Caching makes reads faster by retaining **plaintext** in process memory for a bounded period. Use it only when that trade-off is acceptable for your application. Set an explicit cache policy or disable caching if you need every read to go back through Kist.
 
-Here is a complete, production-ready example using FastAPI's lifespan context and dependency injection:
+## Security boundaries
 
-```python
-import os
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, HTTPException
-from kist import DynamicSecretStore
+Kist is deliberately explicit about what it protects and what it does not.
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Initialize the real-time secrets listener on startup
-    app.state.secrets = DynamicSecretStore(
-        profile_name=os.getenv("KIST_PROFILE", "production"),
-        db_url=os.getenv("KIST_DATABASE_URL"),
-        master_password=os.getenv("KIST_PASSWORD"),
-    )
-    yield
-    # Clean shutdown of background listener thread
-    app.state.secrets.close()
+### Kist helps protect against
 
-app = FastAPI(title="Secure API Service", lifespan=lifespan)
+- Accidental storage of plaintext secret values in the Kist PostgreSQL tables.
+- Accidental storage of configured Kist YAML files as plaintext Git blobs when filters are installed and used normally.
+- Undetected modification or substitution of encrypted values across authenticated Kist scope/context.
+- Simple reuse of a database dump or Git blob without the corresponding profile password.
+- Stale in-process cache values after a Kist update, when notification invalidation is configured and connected.
 
-def get_secret_store() -> DynamicSecretStore:
-    return app.state.secrets
+### Kist does not protect against
 
-@app.get("/api/db-config")
-def get_db_config(secrets: DynamicSecretStore = Depends(get_secret_store)):
-    try:
-        db_user = secrets.get("sql.pg.user")
-        db_port = secrets.get("sql.pg.port")
-        # Rotated database credentials propagate instantly without restarting the server!
-        return {"status": "ok", "db_user": db_user, "db_port": db_port}
-    except KeyError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+- A compromised authorised application process that can legitimately retrieve a secret.
+- Malware, debug tooling, crash dumps, or hostile dependencies reading application memory.
+- A leaked profile password.
+- A developer intentionally bypassing or removing a local Git hook.
+- A Git server, CI system, database administrator, or operating-system administrator compromised at a higher trust level.
+- Deletion, rollback, availability failures, or backup loss unless your infrastructure handles them.
+- Business-sensitive metadata in logical secret names, project names, or environment variables.
+
+Do not put plaintext secret values, bearer tokens, passwords, or private keys into:
+
+```text
+Git commit messages
+CI logs
+issue trackers
+URLs or query strings
+KMS/encryption context
+error messages
+screenshots
 ```
 
----
+## Database model
 
-### TTL Caching Store (`TTLSecretStore`)
+Kist 0.1.0 uses PostgreSQL tables conceptually organised as:
 
-For simpler deployments where a dedicated listener thread is not needed, `TTLSecretStore` caches secrets in memory and automatically re-fetches and decrypts them after a configurable duration:
-
-```python
-from kist import TTLSecretStore
-
-# Cache secrets in memory with a 60-second expiration TTL
-store = TTLSecretStore(ttl_seconds=60)
-
-db_password = store.get("sql.pg.pwd")
+```text
+kist_organizations
+    └── kist_projects
+            └── kist_profiles
+                    └── kist
 ```
 
----
+The `kist` table stores:
 
-## 🚀 CI/CD Pipelines & Leak Prevention
-
-Kist provides ready-to-use CI/CD templates for the 3 main Git providers in the `ressources/` folder:
-
-| Provider | Path | Capabilities |
-| :--- | :--- | :--- |
-| **GitHub Actions** | `ressources/github/deploy.yml`<br>`ressources/github/leak-guard.yml` | Push-to-DB sync (`kist lock`) + PR Plaintext Leak Guard |
-| **GitLab CI/CD** | `ressources/gitlab/.gitlab-ci.yml` | Multi-stage test and deploy pipelines |
-| **Bitbucket Pipelines** | `ressources/bitbucket/bitbucket-pipelines.yml` | Pull request validation and production synchronization |
-
----
-
-## 🗄️ Database Schema Reference
-
-Kist requires only standard PostgreSQL tables with no specialized extensions or foreign data wrappers:
-
-```sql
-CREATE TABLE IF NOT EXISTS kist_profiles (
-    id SERIAL PRIMARY KEY,
-    profile_name VARCHAR(100) UNIQUE NOT NULL,
-    crypto_salt BYTEA NOT NULL,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS kist (
-    id SERIAL PRIMARY KEY,
-    profile_id INT REFERENCES kist_profiles(id) ON DELETE CASCADE,
-    secret_key VARCHAR(255) NOT NULL,
-    encrypted_blob BYTEA NOT NULL,
-    updated_at TIMESTAMP DEFAULT NOW(),
-    CONSTRAINT unique_profile_secret UNIQUE (profile_id, secret_key)
-);
-
-CREATE INDEX IF NOT EXISTS idx_kist_profile_lookup ON kist(profile_id, secret_key);
+```text
+profile ID
+logical secret key
+encrypted binary envelope
+crypto mode: password-v1
+crypto version
+logical secret version
+update timestamp
 ```
 
+The database stores encrypted values, not profile passwords or plaintext values. The profile password remains external to PostgreSQL.
+
+For production, use separate roles:
+
+```text
+migration/setup role
+→ creates or migrates schema
+
+runtime application role
+→ reads/writes only required Kist data
+→ does not have broad DDL permissions
+```
+
+## Troubleshooting
+
+### `MissingKeyError` or “No encryption key configured”
+
+Set the relevant profile environment variable:
+
+```bash
+export KIST_PASSWORD_PRODUCTION='...'
+```
+
+or create an explicit local key:
+
+```bash
+kist profile create production
+```
+
+### PostgreSQL connection fails
+
+Check that the URL points to a running PostgreSQL server and that local TLS settings are intentional:
+
+```bash
+pg_isready -h 127.0.0.1 -p 5432
+```
+
+For a local non-TLS development server:
+
+```bash
+export KIST_ENV=development
+export KIST_TLS_MODE=disable
+```
+
+For production remote PostgreSQL, use `verify-full` and provide a trusted CA certificate.
+
+### Git checkout refuses to decrypt a secret file
+
+Check that the correct profile password is available and that the repository/path/scope context matches the one used when the file was encrypted:
+
+```bash
+kist status
+kist diagnose
+```
+
+Kist fails closed when the password, encrypted content, profile, scope, or path does not match.
+
+### Kist pre-commit guard blocks a commit
+
+First, assume the warning is useful. Check the staged content:
+
+```bash
+git diff --cached
+```
+
+If a real credential was staged in plaintext, remove it, rotate it if needed, and use the approved Kist workflow. If you believe it is a false positive, adjust policy deliberately rather than treating `--no-verify` as a normal workflow.
+
+## Development and release notes
+
+Kist 0.1.0 is designed to be understandable before it is expansive. If you find a security issue, report it privately through the repository’s security-advisory process rather than opening a public issue with exploit details.
+
+Before using Kist for sensitive production workloads, review:
+
+- profile-password generation, storage, backup, and rotation;
+- PostgreSQL authentication, authorisation, network exposure, and backups;
+- TLS verification for remote database connections;
+- CI/server-side secret scanning and protected branch policy;
+- runtime process security and logging;
+- recovery procedures after a lost profile password or leaked credential.
+
+## License
+
+Kist is licensed under the [Apache License, Version 2.0](LICENCE).
+
+Apache-2.0 is a permissive license: you may use, modify, redistribute, and use Kist commercially, subject to the license terms and preservation of applicable notices. It includes an explicit patent grant from contributors.
+
+Cryptographic primitives (AES-256-GCM AEAD and Argon2id KDF) are powered by the standard Python Cryptographic Authority ([`cryptography`](https://github.com/pyca/cryptography)) library.
+
+See [LICENCE](LICENCE) and [NOTICE](NOTICE).
+
 ---
 
-## 🔍 Troubleshooting
-
-- **`🚨 Plaintext Leak Detected` on `git commit`**:
-  Run `kist status` to check whether the profile's password is set or whether `kist init` was run.
-- **`❌ Missing encryption password key for profile`**:
-  Set the environment variable (e.g., `export KIST_PASSWORD_PRODUCTION="your-secret"`) or ensure `~/.kist/pwd_<profile>` exists.
-- **`❌ Cryptographic failure. Password configuration incorrect`**:
-  Verify that the password provided matches the one used to encrypt the profile's secrets.
+<p align="center">
+  <strong>Keep It Simple and Trusted.</strong><br />
+  Encrypt the value. Review the change. Protect the boundary. Keep the drama for production incidents you did not have.
+</p>

@@ -28,6 +28,7 @@ dist/
 
 # JetBrains IDE
 .idea/
+.junie/
 
 # Unit test reports
 TEST*.xml
