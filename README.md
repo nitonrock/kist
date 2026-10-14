@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="ressources/kist.png" alt="Kist" width="500" />
+  <img src="https://raw.githubusercontent.com/nitonrock/kist/main/ressources/kist.png" alt="Kist" width="500" />
 </p>
 
 <h1 align="center">Kist</h1>
@@ -43,7 +43,7 @@ encryption, PostgreSQL, and clear operational boundaries.
 
 ## What Kist does not do
 
-Kist 0.1.0 deliberately stays small:
+Kist 0.1.1 deliberately stays small:
 
 - It does **not** provide the sharks surrounding the island in the image above (you will have to supply your own biological perimeter defense).
 - It is **not** a replacement for HashiCorp Vault, a cloud secret manager, or a full identity and governance platform.
@@ -57,7 +57,7 @@ Kist reduces moving parts in a secret workflow; it does not replace operational 
 
 Kist is currently an **alpha** project.
 
-The 0.1.0 release supports only the `password-v1` encryption mode:
+The 0.1.1 release supports only the `password-v1` encryption mode:
 
 ```text
 profile password + random salt
@@ -71,7 +71,7 @@ Encrypted Kist Envelope
 PostgreSQL (`kist_secrets`) or Git (`secrets/*.yaml`)
 ```
 
-Planned but **not included** in 0.1.0:
+Planned but **not included** in 0.1.1:
 
 ```text
 KMS data-encryption keys
@@ -212,7 +212,7 @@ billing_store = Kist(profile_name="billing")
 stripe_key = billing_store.get("stripe.api_key")
 ```
 
-The public 0.1.0 API is intentionally small:
+The public 0.1.1 API is intentionally small:
 
 ```python
 from kist import (
@@ -744,7 +744,7 @@ If a real credential was staged in plaintext, remove it, rotate it if needed, an
 
 ## Development and release notes
 
-Kist 0.1.0 is designed to be understandable before it is expansive. If you find a security issue, report it privately through the repository’s security-advisory process rather than opening a public issue with exploit details.
+Kist 0.1.1 is designed to be understandable before it is expansive. If you find a security issue, report it privately through the repository’s security-advisory process rather than opening a public issue with exploit details.
 
 Before using Kist for sensitive production workloads, review:
 
