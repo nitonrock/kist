@@ -1122,6 +1122,11 @@ def test_cli_unlock_defaults_to_active_profile(tmp_path, monkeypatch, capsys):
         assert "a: 1\n" in captured.out
 
 
+def test_kist_version():
+    import kist
+    assert kist.__version__ == "0.1.1"
+
+
 def test_kist_class_defaults_to_kist_profile_env(monkeypatch):
     monkeypatch.setenv("KIST_PROFILE", "team_a")
     k = Kist()
