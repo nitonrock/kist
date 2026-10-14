@@ -182,6 +182,7 @@ def run_git_setup(*, force_hook: bool = False, install_hook: bool = True) -> Non
     if hook_changed:
         changes.append("pre-commit hook")
     print("Kist Git filters configured." + (f" Updated: {', '.join(changes)}." if changes else ""))
+    print("Next step: Run 'kist init-db' to initialize your database schema if not already configured.")
 
 
 def print_hook() -> None:

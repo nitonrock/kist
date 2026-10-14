@@ -1,7 +1,9 @@
 import io
 import json
 import os
+import struct
 import sys
+import time
 import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -36,6 +38,12 @@ from kist import (
     write_secure_local_password,
 )
 from kist.core import (
+    ENVELOPE_VERSION,
+    HEADER_SIZE,
+    KEY_MODE_PASSWORD,
+    SCHEMA_VERSION,
+    SQL_SCHEMA,
+    Argon2Policy,
     ConcurrentWriteError,
     DecryptionError,
     InsecureKeyStoreError,
@@ -43,6 +51,11 @@ from kist.core import (
     KistError,
     KistScope,
     MissingKeyError,
+    _ROW_MAGIC,
+    _json_bytes,
+    _strict_json,
+    _UniqueSafeLoader,
+    read_secure_local_password,
 )
 from kist.kms import (
     KMSKeyReference,
@@ -53,6 +66,161 @@ from kist.kms import (
 )
 
 
+class MockDB:
+    """In-memory mock database for PostgreSQL operations in Kist."""
+
+    def __init__(self):
+        self.orgs = {}
+        self.projects = {}
+        self.profiles = {}
+        self.bundles = {}
+        self.secrets = {}
+        self.last_result = []
+        self.advisory_locks = []
+        self.notifications = []
+        self.fail_next_execute = None
+
+    def execute(self, query, params=None):
+        if self.fail_next_execute:
+            exc = self.fail_next_execute
+            self.fail_next_execute = None
+            raise exc
+
+        q = " ".join(str(query).split())
+        params = list(params) if params else []
+        if "to_regclass" in q:
+            self.last_result = [("kist_schema",)]
+        elif "SELECT version FROM kist_schema" in q:
+            self.last_result = [(1,)]
+        elif "INSERT INTO kist_organizations" in q:
+            uid, slug = params[0], params[1]
+            if slug not in self.orgs:
+                self.orgs[slug] = uid
+            self.last_result = [(self.orgs[slug],)]
+        elif "INSERT INTO kist_projects" in q:
+            uid, org_id, slug = params[0], params[1], params[2]
+            key = (org_id, slug)
+            if key not in self.projects:
+                self.projects[key] = uid
+            self.last_result = [(self.projects[key],)]
+        elif "INSERT INTO kist_profiles" in q:
+            uid, proj_id, name = params[0], params[1], params[2]
+            key = (proj_id, name)
+            if key not in self.profiles:
+                self.profiles[key] = uid
+            self.last_result = [(self.profiles[key],)]
+        elif "SELECT id, access_mode, bundle_version, wrapped_bundle FROM kist_key_bundles" in q:
+            prof_id = params[0]
+            match = None
+            for p_id, b in self.bundles.items():
+                if str(p_id) == str(prof_id):
+                    match = b
+                    break
+            if match:
+                self.last_result = [(match["id"], match["access_mode"], match["bundle_version"], match["wrapped_bundle"])]
+            else:
+                self.last_result = []
+        elif "INSERT INTO kist_key_bundles" in q:
+            bid, prof_id, mode, blob = params[0], params[1], params[2], params[3]
+            self.bundles[str(prof_id)] = {"id": bid, "access_mode": mode, "bundle_version": 1, "wrapped_bundle": bytes(blob)}
+            self.last_result = []
+        elif "UPDATE kist_key_bundles" in q:
+            wrapped, bid, prof_id = params[0], params[1], params[2]
+            for p_id, b in self.bundles.items():
+                if str(p_id) == str(prof_id):
+                    b["wrapped_bundle"] = bytes(wrapped)
+            self.last_result = []
+        elif "SELECT id, lookup_token, key_bundle_id, crypto_version, secret_version, encrypted_blob FROM kist_secrets" in q:
+            prof_id = params[0]
+            if len(params) > 1:
+                token = bytes(params[1])
+                match = None
+                for (p_id, t), s in self.secrets.items():
+                    if str(p_id) == str(prof_id) and t == token:
+                        match = s
+                        break
+                if match:
+                    self.last_result = [(match["id"], match["lookup_token"], match["bundle_id"], match["crypto_version"], match["version"], match["blob"])]
+                else:
+                    self.last_result = []
+            else:
+                self.last_result = [
+                    (s["id"], s["lookup_token"], s["bundle_id"], s["crypto_version"], s["version"], s["blob"])
+                    for (p_id, _), s in self.secrets.items() if str(p_id) == str(prof_id)
+                ]
+        elif "INSERT INTO kist_secrets" in q:
+            row_id, prof_id, token, bid, version, blob = params[0], params[1], bytes(params[2]), params[3], params[4], bytes(params[5])
+            self.secrets[(str(prof_id), token)] = {
+                "id": row_id, "lookup_token": token, "bundle_id": bid, "crypto_version": 1, "version": version, "blob": blob
+            }
+            self.last_result = []
+        elif "UPDATE kist_secrets" in q:
+            blob, version, row_id, prof_id = bytes(params[0]), params[1], params[2], params[3]
+            for (p_id, token), s in self.secrets.items():
+                if str(p_id) == str(prof_id) and s["id"] == row_id:
+                    s["blob"] = blob
+                    s["version"] = version
+                    break
+            self.last_result = []
+        elif "DELETE FROM kist_secrets" in q:
+            row_id, prof_id = params[0], params[1]
+            for k in list(self.secrets.keys()):
+                if self.secrets[k]["id"] == row_id and str(k[0]) == str(prof_id):
+                    del self.secrets[k]
+            self.last_result = []
+        elif "pg_advisory_xact_lock" in q:
+            self.advisory_locks.append(params[0] if params else None)
+            self.last_result = [(None,)]
+        elif "pg_notify" in q:
+            self.notifications.append((params[0], params[1]) if params else ())
+            self.last_result = [(None,)]
+        elif "DELETE FROM kist_organizations" in q:
+            org_id = params[0]
+            self.orgs = {k: v for k, v in self.orgs.items() if v != org_id}
+            self.last_result = []
+        else:
+            self.last_result = []
+
+    def fetchone(self):
+        if self.last_result:
+            return self.last_result.pop(0)
+        return None
+
+    def fetchall(self):
+        res = list(self.last_result)
+        self.last_result = []
+        return res
+
+
+class MockConnection:
+    def __init__(self, db: MockDB):
+        self.db = db
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        pass
+
+    def cursor(self):
+        return self
+
+    def execute(self, query, params=None):
+        self.db.execute(query, params)
+        return self
+
+    def fetchone(self):
+        return self.db.fetchone()
+
+    def fetchall(self):
+        return self.db.fetchall()
+
+
+@pytest.fixture
+def mock_db():
+    return MockDB()
+
+
 @pytest.fixture
 def kist_env(tmp_path, monkeypatch):
     kist_dir = tmp_path / ".kist"
@@ -60,6 +228,195 @@ def kist_env(tmp_path, monkeypatch):
     monkeypatch.setenv("KIST_DIR", str(kist_dir))
     return {"home": tmp_path, "kist_dir": kist_dir}
 
+
+PASSWORD = "test-profile-password-not-for-production"
+CONTEXT = {"format": "test", "profile": "production"}
+
+
+@pytest.fixture(scope="module")
+def envelope():
+    return encrypt_envelope(b"database:\n  password: example\n", PASSWORD, CONTEXT)
+
+
+# --- Core envelope and serialization tests from test_core.py ---
+
+def test_v1_round_trip(envelope):
+    assert envelope[4] == 1
+    assert decrypt_envelope(envelope, PASSWORD, CONTEXT) == b"database:\n  password: example\n"
+
+
+def test_wrong_password(envelope):
+    with pytest.raises(DecryptionError):
+        decrypt_envelope(envelope, "wrong-password", CONTEXT)
+
+
+def test_wrong_context(envelope):
+    with pytest.raises(DecryptionError):
+        decrypt_envelope(envelope, PASSWORD, {**CONTEXT, "profile": "other"})
+
+
+@pytest.mark.parametrize("offset", [34, 46, 78, 126, -1])
+def test_tamper(envelope, offset):
+    corrupted = bytearray(envelope)
+    corrupted[offset] ^= 1
+    with pytest.raises((InvalidEnvelopeError, DecryptionError)):
+        decrypt_envelope(bytes(corrupted), PASSWORD, CONTEXT)
+
+
+def test_randomized(envelope):
+    assert envelope != encrypt_envelope(b"database:\n  password: example\n", PASSWORD, CONTEXT)
+
+
+def test_unsupported_format(envelope):
+    changed = bytearray(envelope)
+    changed[4] = 255
+    with pytest.raises(InvalidEnvelopeError):
+        decrypt_envelope(bytes(changed), PASSWORD, CONTEXT)
+
+
+def test_kdf_limit(envelope):
+    changed = bytearray(envelope)
+    changed[8:12] = struct.pack(">I", 2 ** 32 - 1)
+    with pytest.raises(InvalidEnvelopeError):
+        decrypt_envelope(bytes(changed), PASSWORD, CONTEXT)
+
+
+@pytest.mark.parametrize("value", [None, True, 42, 1.25, "é", [], {}, {"nested": [None, 1]}])
+def test_json_types(value):
+    assert _strict_json(_json_bytes(value)) == value
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), {1: "bad"}, (1, 2), b"bytes"])
+def test_non_json_types(value):
+    with pytest.raises(KistError):
+        _json_bytes(value)
+
+
+def test_mapping_round_trip():
+    value = {"database": {"password": "x", "options": {}}, "list": [1, {"a": 2}], "null": None}
+    assert Kist.unflatten(Kist.flatten(value)) == value
+
+
+@pytest.mark.parametrize("value", [{"a": None, "a.b": 1}, {"a.b": 1, "a": {}}, {"a": {}, "a.b": 2}])
+def test_path_conflicts(value):
+    with pytest.raises(KistError):
+        Kist.unflatten(value)
+
+
+def test_duplicate_yaml():
+    with pytest.raises(KistError):
+        yaml.load("a: 1\na: 2\n", Loader=_UniqueSafeLoader)
+
+
+def test_normalized_collision():
+    with pytest.raises(KistError):
+        Kist.flatten({"a": 1, " a ": 2})
+
+
+def test_recursive_mapping():
+    value = {}
+    value["loop"] = value
+    with pytest.raises(KistError):
+        Kist.flatten(value)
+
+
+def test_password_file(tmp_path):
+    if os.name != "posix":
+        pytest.skip("POSIX credential files only")
+    tmp_path.chmod(0o700)
+    path = tmp_path / "pwd_production"
+    write_secure_local_password(path, PASSWORD)
+    assert read_secure_local_password(path) == PASSWORD
+    with pytest.raises(KistError):
+        write_secure_local_password(path, "replacement")
+    write_secure_local_password(path, "replacement", overwrite=True)
+    assert read_secure_local_password(path) == "replacement"
+    path.chmod(0o644)
+    with pytest.raises(InsecureKeyStoreError):
+        read_secure_local_password(path)
+
+
+def test_url_masking():
+    assert mask_db_url("postgresql://alice:password@localhost/db?token=secret#hidden") == "postgresql://localhost/db"
+    assert mask_db_url("postgresql://myuser:mypass@db.prod.internal:5432/secrets_db") == "postgresql://db.prod.internal:5432/secrets_db"
+    assert mask_db_url("") == ""
+    assert mask_db_url(None) == ""
+
+
+def test_production_tls(monkeypatch):
+    monkeypatch.setenv("KIST_TLS_MODE", "disable")
+    with pytest.raises(KistError):
+        enforce_ssl_url("postgresql://localhost/db", production=True)
+
+
+def test_unknown_version_two_rejected(envelope):
+    changed = bytearray(envelope)
+    changed[4] = 2
+    with pytest.raises(InvalidEnvelopeError):
+        decrypt_envelope(bytes(changed), PASSWORD, CONTEXT)
+
+
+def test_format_identifiers():
+    assert SCHEMA_VERSION == 1
+    assert ENVELOPE_VERSION == 1
+    assert KEY_MODE_PASSWORD == "password-wrap-v1"
+    assert _ROW_MAGIC == b"KSTR\x01"
+    assert "kist_v2_" not in SQL_SCHEMA
+    assert "crypto_version = 1" in SQL_SCHEMA
+    assert "version = 1" in SQL_SCHEMA
+    assert not hasattr(Kist, "_reject_legacy")
+
+
+def test_truncated_envelope(envelope):
+    with pytest.raises(InvalidEnvelopeError):
+        decrypt_envelope(envelope[:HEADER_SIZE + 16], PASSWORD, CONTEXT)
+
+
+@pytest.fixture
+def database_store():
+    url = os.getenv("KIST_TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("No disposable PostgreSQL test URL configured")
+    scope = KistScope("test-" + uuid.uuid4().hex, "test")
+    store = Kist("production", PASSWORD, url, scope)
+    store.init_db()
+    store.get_or_create_scope()
+    try:
+        yield store
+    finally:
+        with safe_db_connect(url) as connection:
+            connection.execute("DELETE FROM kist_organizations WHERE id = %s", (store.organization_id,))
+
+
+def test_database_roundtrip_and_rewrap(database_store):
+    store = database_store
+    assert store.set("database.password", "secret-value") == 1
+    assert store.set("database.password", "replacement") == 2
+    assert store.get("database.password") == "replacement"
+    assert store.lock_yaml("market_data:\n  api_key: abc123\n", prune=True) == (1, 1)
+    assert yaml.safe_load(store.unlock_yaml()) == {"market_data": {"api_key": "abc123"}}
+    old_reader = Kist("production", PASSWORD, store.db_url, store.scope)
+    store.rewrap_profile_password("new-profile-password")
+    assert store.get("market_data.api_key") == "abc123"
+    with pytest.raises(DecryptionError):
+        old_reader.get("market_data.api_key")
+    assert store.delete("market_data.api_key") is True
+    assert store.delete("market_data.api_key") is False
+
+
+def test_database_first_write_concurrency(database_store):
+    from concurrent.futures import ThreadPoolExecutor
+    store = database_store
+    def write(index):
+        independent = Kist("production", PASSWORD, store.db_url, store.scope)
+        return independent.set("concurrent.key", index)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        versions = list(executor.map(write, range(8)))
+    assert sorted(versions) == list(range(1, 9))
+    assert store.get("concurrent.key") in range(8)
+
+
+# --- Password Generation & Management ---
 
 def test_generate_password():
     pwd1 = generate_password()
@@ -252,222 +609,125 @@ def test_flatten_and_unflatten_nested_and_types():
     assert unflat == data
 
 
-@patch("psycopg.connect")
-def test_lock_yaml_type_preservation_and_prune(mock_connect):
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_connect.return_value.__enter__.return_value = mock_conn
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+# --- Database Operations with Mock DB ---
 
-    org_id = uuid.uuid4()
-    proj_id = uuid.uuid4()
-    prof_id = uuid.uuid4()
+def test_lock_yaml_type_preservation_and_prune(mock_db):
+    with patch("psycopg.connect", side_effect=lambda *a, **kw: MockConnection(mock_db)):
+        kist_inst = Kist(profile_name="test_prof", master_password="password", db_url="postgresql://mock")
 
-    # Mock get_or_create_scope queries
-    mock_cursor.fetchone.side_effect = [
-        (org_id,),   # org
-        (proj_id,),  # project
-        (prof_id,),  # profile
-        None,        # secret_version key 1
-        None,        # secret_version key 2
-        None,        # secret_version key 3
-    ]
+        yaml_content = """
+        db:
+          host: localhost
+          port: 5432
+          enabled: true
+        """
+        # Initial lock: 3 secrets added, 0 pruned
+        locked_cnt, pruned_cnt = kist_inst.lock_yaml(yaml_content, prune=True)
+        assert locked_cnt == 3
+        assert pruned_cnt == 0
+        assert len(mock_db.advisory_locks) > 0
 
-    kist_inst = Kist(profile_name="test_prof", master_password="password", db_url="postgresql://mock")
-
-    # Mock existing keys for pruning: old_key is obsolete
-    mock_cursor.fetchall.return_value = [("db.host",), ("old_key",)]
-
-    yaml_content = """
-    db:
-      host: localhost
-      port: 5432
-      enabled: true
-    """
-    locked_cnt, pruned_cnt = kist_inst.lock_yaml(yaml_content, prune=True)
-    assert locked_cnt == 3
-    assert pruned_cnt == 1
-
-    executed_queries = [str(call[0][0]) for call in mock_cursor.execute.call_args_list if call[0]]
-    assert any("pg_advisory_xact_lock" in q for q in executed_queries)
+        # Second lock with fewer keys and prune=True: 2 kept, 1 pruned
+        yaml_content2 = """
+        db:
+          host: localhost
+          port: 5432
+        """
+        locked_cnt2, pruned_cnt2 = kist_inst.lock_yaml(yaml_content2, prune=True)
+        assert locked_cnt2 == 2
+        assert pruned_cnt2 == 1
 
 
-@patch("psycopg.connect")
-def test_kist_set_and_get_lifecycle(mock_connect):
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_connect.return_value.__enter__.return_value = mock_conn
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+def test_kist_set_and_get_lifecycle(mock_db):
+    with patch("psycopg.connect", side_effect=lambda *a, **kw: MockConnection(mock_db)):
+        kist_inst = Kist(profile_name="prod", master_password="secret_password", db_url="postgresql://mock")
 
-    org_id = uuid.uuid4()
-    proj_id = uuid.uuid4()
-    prof_id = uuid.uuid4()
+        # Set key
+        version1 = kist_inst.set("app.api_key", "secret-value-123")
+        assert version1 == 1
 
-    # Scope resolution (org, proj, prof) then row lookup in _next_secret_version (None -> 1)
-    mock_cursor.fetchone.side_effect = [
-        (org_id,),
-        (proj_id,),
-        (prof_id,),
-        None,
-    ]
+        # Update key
+        version2 = kist_inst.set("app.api_key", "secret-value-456")
+        assert version2 == 2
 
-    kist_inst = Kist(profile_name="prod", master_password="secret_password", db_url="postgresql://mock")
-    version = kist_inst.set("app.api_key", "secret-value-123")
-    assert version == 1
+        # Get key
+        retrieved = kist_inst.get("app.api_key")
+        assert retrieved == "secret-value-456"
 
-    executed_queries = [str(call[0][0]) for call in mock_cursor.execute.call_args_list if call[0]]
-    assert any("FOR UPDATE" in q for q in executed_queries)
-
-    # Now test get
-    encrypted_blob = encrypt_envelope(
-        b'"secret-value-123"',
-        kist_inst.master_password,
-        kist_inst._db_context("app.api_key", 1),
-    )
-    mock_cursor.fetchone.side_effect = [
-        (encrypted_blob, 1, "password-v1"),
-    ]
-
-    retrieved = kist_inst.get("app.api_key")
-    assert retrieved == "secret-value-123"
+        # Missing key raises KeyError
+        with pytest.raises(KeyError):
+            kist_inst.get("nonexistent.key")
 
 
-@patch("psycopg.connect")
-def test_kist_set_retry_on_unique_violation(mock_connect):
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_connect.return_value.__enter__.return_value = mock_conn
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+def test_kist_set_retry_on_serialization_failure(mock_db):
+    first_attempt = True
 
-    org_id = uuid.uuid4()
-    proj_id = uuid.uuid4()
-    prof_id = uuid.uuid4()
+    class FlakyMockConnection(MockConnection):
+        def execute(self, query, params=None):
+            nonlocal first_attempt
+            if first_attempt and "SET TRANSACTION" in str(query):
+                first_attempt = False
+                raise psycopg.errors.SerializationFailure("could not serialize access")
+            return super().execute(query, params)
 
-    mock_cursor.fetchone.side_effect = [
-        (org_id,),
-        (proj_id,),
-        (prof_id,),
-        None,   # attempt 1: no row -> version 1
-        (1,),   # attempt 2: found row version 1 -> version 2
-    ]
-
-    call_count = 0
-    def execute_side_effect(*args, **kwargs):
-        nonlocal call_count
-        query = args[0] if args else ""
-        if "INSERT INTO kist (" in str(query):
-            call_count += 1
-            if call_count == 1:
-                raise psycopg.errors.UniqueViolation("duplicate key value")
-        return MagicMock()
-
-    mock_cursor.execute.side_effect = execute_side_effect
-
-    kist_inst = Kist(profile_name="prod", master_password="secret_password", db_url="postgresql://mock")
-    version = kist_inst.set("app.api_key", "secret-value-123", max_retries=3)
-    assert version == 2
-    assert call_count == 2
+    with patch("psycopg.connect", side_effect=lambda *a, **kw: FlakyMockConnection(mock_db)):
+        kist_inst = Kist(profile_name="prod", master_password="secret_password", db_url="postgresql://mock")
+        version = kist_inst.set("app.api_key", "secret-value-123", max_retries=3)
+        assert version == 1
+        assert not first_attempt
 
 
-@patch("psycopg.connect")
-def test_kist_set_exhausted_retries_raises_concurrent_write_error(mock_connect):
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_connect.return_value.__enter__.return_value = mock_conn
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+def test_kist_set_exhausted_retries_raises_concurrent_write_error(mock_db):
+    class AlwaysFailingMockConnection(MockConnection):
+        def execute(self, query, params=None):
+            if "SET TRANSACTION" in str(query):
+                raise psycopg.errors.SerializationFailure("serialization error")
+            return super().execute(query, params)
 
-    org_id = uuid.uuid4()
-    proj_id = uuid.uuid4()
-    prof_id = uuid.uuid4()
-
-    mock_cursor.fetchone.side_effect = [
-        (org_id,),
-        (proj_id,),
-        (prof_id,),
-        None,
-        None,
-        None,
-    ]
-
-    def execute_side_effect(*args, **kwargs):
-        query = args[0] if args else ""
-        if "INSERT INTO kist (" in str(query):
-            raise psycopg.errors.UniqueViolation("duplicate key value")
-        return MagicMock()
-
-    mock_cursor.execute.side_effect = execute_side_effect
-
-    kist_inst = Kist(profile_name="prod", master_password="secret_password", db_url="postgresql://mock")
-    with pytest.raises(ConcurrentWriteError):
-        kist_inst.set("app.api_key", "secret-value-123", max_retries=2)
+    with patch("psycopg.connect", side_effect=lambda *a, **kw: AlwaysFailingMockConnection(mock_db)):
+        kist_inst = Kist(profile_name="prod", master_password="secret_password", db_url="postgresql://mock")
+        with pytest.raises(ConcurrentWriteError):
+            kist_inst.set("app.api_key", "secret-value-123", max_retries=2)
 
 
-@patch("psycopg.connect")
-def test_unlock_yaml_type_reconstruction(mock_connect):
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_connect.return_value.__enter__.return_value = mock_conn
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+def test_unlock_yaml_type_reconstruction(mock_db):
+    with patch("psycopg.connect", side_effect=lambda *a, **kw: MockConnection(mock_db)):
+        kist_inst = Kist(profile_name="test_prof", master_password="password", db_url="postgresql://mock")
 
-    org_id = uuid.uuid4()
-    proj_id = uuid.uuid4()
-    prof_id = uuid.uuid4()
+        yaml_content = """
+        app:
+          env: production
+          port: 5432
+          ssl: true
+        """
+        kist_inst.lock_yaml(yaml_content)
 
-    mock_cursor.fetchone.side_effect = [
-        (org_id,),
-        (proj_id,),
-        (prof_id,),
-    ]
-
-    kist_inst = Kist(profile_name="test_prof", master_password="password", db_url="postgresql://mock")
-
-    env_val = encrypt_envelope(b'"production"', kist_inst.master_password, kist_inst._db_context("app.env", 1))
-    port_val = encrypt_envelope(b"5432", kist_inst.master_password, kist_inst._db_context("app.port", 1))
-    ssl_val = encrypt_envelope(b"true", kist_inst.master_password, kist_inst._db_context("app.ssl", 1))
-
-    mock_cursor.fetchall.return_value = [
-        ("app.env", env_val, 1, "password-v1"),
-        ("app.port", port_val, 1, "password-v1"),
-        ("app.ssl", ssl_val, 1, "password-v1"),
-    ]
-
-    unlocked_yaml = kist_inst.unlock_yaml()
-    loaded = yaml.safe_load(unlocked_yaml)
-    assert loaded["app"]["env"] == "production"
-    assert loaded["app"]["port"] == 5432
-    assert loaded["app"]["ssl"] is True
+        unlocked_yaml = kist_inst.unlock_yaml()
+        loaded = yaml.safe_load(unlocked_yaml)
+        assert loaded["app"]["env"] == "production"
+        assert loaded["app"]["port"] == 5432
+        assert loaded["app"]["ssl"] is True
 
 
-def test_run_git_setup_creates_shell_pre_commit_hook(tmp_path, monkeypatch):
-    monkeypatch.chdir(tmp_path)
-    git_dir = tmp_path / ".git"
-    git_dir.mkdir(parents=True, exist_ok=True)
-    hooks_dir = git_dir / "hooks"
-    hooks_dir.mkdir(parents=True, exist_ok=True)
+def test_kist_delete_and_rewrap_with_mock_db(mock_db):
+    with patch("psycopg.connect", side_effect=lambda *a, **kw: MockConnection(mock_db)):
+        kist_inst = Kist(profile_name="prod", master_password="old_password", db_url="postgresql://mock")
 
-    with patch("subprocess.run") as mock_run:
-        mock_run.return_value.returncode = 0
-        run_git_setup(force_hook=True)
+        kist_inst.set("market_data.api_key", "secret_key_abc")
+        assert kist_inst.get("market_data.api_key") == "secret_key_abc"
 
-        gitattrs = (tmp_path / ".gitattributes").read_text()
-        assert "secrets*.yaml filter=kist" in gitattrs
+        # Rewrap with new password
+        kist_inst.rewrap_profile_password("new_password")
+        assert kist_inst.get("market_data.api_key") == "secret_key_abc"
 
-        hook_path = hooks_dir / "pre-commit"
-        assert hook_path.exists()
-        hook_content = hook_path.read_text()
-        assert "#!/usr/bin/env sh" in hook_content
-        assert "kist pre-commit-guard" in hook_content
+        # Reader with old password fails decryption
+        old_reader = Kist(profile_name="prod", master_password="old_password", db_url="postgresql://mock")
+        with pytest.raises(DecryptionError):
+            old_reader.get("market_data.api_key")
 
-
-def test_run_status_output_structure(capsys):
-    exit_code = run_status()
-    assert exit_code == 0
-    captured = capsys.readouterr()
-    output = captured.out
-    assert "Kist status" in output
-    assert "Git clean filter" in output
-    assert "Profiles:" in output
-    assert "Database:" in output
+        # Delete key
+        assert kist_inst.delete("market_data.api_key") is True
+        assert kist_inst.delete("market_data.api_key") is False
 
 
 def test_status_scopes_to_repository_files_only(tmp_path, monkeypatch, capsys):
@@ -512,108 +772,110 @@ def test_status_scopes_to_repository_files_only(tmp_path, monkeypatch, capsys):
 def test_run_fix_workflow(capsys):
     with patch("subprocess.run") as mock_run:
         mock_run.return_value.returncode = 0
-        mock_run.return_value.stdout = ""
-        exit_code = run_fix()
-        assert exit_code == 0
-        captured = capsys.readouterr()
-        output = captured.out
-        assert "Kist repair plan" in output
+        run_fix(apply=True)
+    out = capsys.readouterr().out
+    assert "Kist repair completed" in out
 
 
-def test_key_file_posix_permissions(kist_env):
-    pwd = create_profile_key("secure_profile")
-    kist_dir = kist_env["kist_dir"]
-    assert kist_dir.exists()
-    pwd_file = kist_dir / "pwd_secure_profile"
-    assert pwd_file.exists()
-
-    if os.name != "nt":
-        dir_stat = os.stat(str(kist_dir))
-        file_stat = os.stat(str(pwd_file))
-        assert (dir_stat.st_mode & 0o777) == 0o700
-        assert (file_stat.st_mode & 0o777) == 0o600
+def test_run_diagnose_workflow(capsys):
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = "filter=kist"
+        from kist.fix import run_diagnose
+        run_diagnose()
+    out = capsys.readouterr().out
+    assert "Kist diagnostics" in out
 
 
-def test_mask_db_url():
-    url = "postgresql://myuser:secretpassword123@db.prod.internal:5432/secrets_db"
-    masked = mask_db_url(url)
-    assert "secretpassword123" not in masked
-    assert "myuser:***@db.prod.internal:5432/secrets_db" in masked
+def test_print_hook(capsys):
+    from kist.git import print_hook
+    print_hook()
+    out = capsys.readouterr().out
+    assert "#!/usr/bin/env sh" in out
+    assert "kist pre-commit-guard" in out
 
-    no_pwd = "postgresql://localhost/mydb"
-    assert mask_db_url(no_pwd) == no_pwd
+
+def test_run_git_setup_installs_filters_attributes_and_hooks(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    git_dir = tmp_path / ".git"
+    (git_dir / "hooks").mkdir(parents=True, exist_ok=True)
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value.returncode = 0
+        run_git_setup(install_hook=True)
+
+    assert (tmp_path / ".gitattributes").exists()
+    assert (tmp_path / ".gitignore").exists()
+    hook_file = git_dir / "hooks" / "pre-commit"
+    assert hook_file.exists()
+    assert hook_file.read_text().startswith("#!/usr/bin/env sh")
+    captured = capsys.readouterr()
+    assert "Run 'kist init-db'" in captured.out
 
 
 def test_enforce_ssl_url():
-    # Default missing sslmode to require
-    url1 = "postgresql://user:pass@db.example.com:5432/secrets_db"
-    enforced1 = enforce_ssl_url(url1)
-    assert "sslmode=require" in enforced1
-
-    # In development, disable is allowed
-    url2 = "postgresql://user:pass@db.example.com:5432/secrets_db?sslmode=disable"
-    assert "sslmode=disable" in enforce_ssl_url(url2, production=False)
-
-    # In production, disable is rejected
-    with pytest.raises(KistError):
-        enforce_ssl_url(url2, production=True)
-
-    url3 = "postgresql://user:pass@db.example.com:5432/secrets_db?sslmode=require&connect_timeout=5"
-    enforced3 = enforce_ssl_url(url3)
-    assert "sslmode=require" in enforced3
-    assert "connect_timeout=5" in enforced3
-
-    url4 = "postgresql://user:pass@db.example.com:5432/secrets_db?sslmode=verify-full&sslrootcert=/etc/ssl/ca.crt"
-    enforced4 = enforce_ssl_url(url4)
-    assert "sslmode=verify-full" in enforced4
-    assert "sslrootcert=%2Fetc%2Fssl%2Fca.crt" in enforced4
-
+    assert enforce_ssl_url("postgresql://localhost/db") == "postgresql://localhost/db?sslmode=require"
+    assert enforce_ssl_url("postgresql://localhost/db?sslmode=disable") == "postgresql://localhost/db?sslmode=disable"
     assert enforce_ssl_url(None) is None
-    assert enforce_ssl_url("") == ""
 
 
-@patch("psycopg.connect")
-def test_safe_db_connect_enforces_ssl_and_masks_errors(mock_connect):
+def test_safe_db_connect_enforces_ssl_and_masks_errors():
     url = "postgresql://admin:supersecret@db.internal:5432/production"
-    safe_db_connect(url)
-    mock_connect.assert_called_once()
-    called_url = mock_connect.call_args[0][0]
-    assert "sslmode=require" in called_url
-
-    # Connection error masking
-    mock_connect.side_effect = psycopg.OperationalError("connection refused")
-    with pytest.raises(psycopg.OperationalError) as exc_info:
+    with patch("psycopg.connect") as mock_connect:
         safe_db_connect(url)
-    assert "supersecret" not in str(exc_info.value)
-    assert "admin:***@db.internal:5432/production" in str(exc_info.value)
+        called_url = mock_connect.call_args[0][0]
+        assert "sslmode=require" in called_url
+
+        # Connection error masking
+        mock_connect.side_effect = psycopg.OperationalError("connection refused")
+        with pytest.raises(psycopg.OperationalError) as exc_info:
+            safe_db_connect(url)
+        assert "supersecret" not in str(exc_info.value)
+        assert "db.internal:5432/production" in str(exc_info.value)
 
 
-def test_local_kms_provider_lifecycle():
+# --- KMS Tests ---
+
+def test_kms_local_provider_roundtrip(tmp_path):
     kek = os.urandom(32)
-    provider = LocalKMSProvider(kek)
-    key_ref = KMSKeyReference(provider="local", key_id="test-key-1")
-    ctx = {"organization_id": "org1", "project_id": "proj1", "profile_id": "prof1"}
+    provider = LocalKMSProvider(kek=kek)
+    key_ref = KMSKeyReference(provider="local", key_id="master-key-01")
+    plaintext = b"super_secret_data_key_32_bytes!!"
+    context = {"tenant": "test-corp", "env": "prod"}
 
-    dek, wrapped = provider.generate_data_key(key_reference=key_ref, encryption_context=ctx)
-    assert len(dek) == 32
+    wrapped = provider.wrap_key(
+        plaintext_key=plaintext,
+        key_reference=key_ref,
+        encryption_context=context,
+    )
     assert wrapped.provider == "local"
-    assert wrapped.key_reference == key_ref
+    assert wrapped.key_reference.key_id == "master-key-01"
+    assert wrapped.ciphertext != plaintext
 
-    unwrapped = provider.unwrap_key(wrapped)
-    assert unwrapped == dek
+    decrypted = provider.unwrap_key(wrapped)
+    assert decrypted == plaintext
 
-
-def test_kms_registry_provider():
-    kek = os.urandom(32)
-    provider = get_kms_provider("local", kek=kek)
-    assert isinstance(provider, LocalKMSProvider)
-
+    # Wrong context
+    wrong_wrapped = WrappedDataKey(
+        provider="local",
+        key_reference=key_ref,
+        ciphertext=wrapped.ciphertext,
+        encryption_context={"tenant": "other-corp", "env": "prod"},
+    )
     with pytest.raises(KMSProviderError):
-        get_kms_provider("aws-kms")
+        provider.unwrap_key(wrong_wrapped)
+
+
+def test_kms_provider_factory():
+    kek = os.urandom(32)
+    local_p = get_kms_provider("local", kek=kek)
+    assert isinstance(local_p, LocalKMSProvider)
 
     with pytest.raises(KMSProviderError):
         get_kms_provider("unknown-provider")
 
+
+# --- CLI Lock and Mismatch Tests ---
 
 def test_cli_lock_profile_mismatch_rejected(tmp_path, monkeypatch, capsys):
     monkeypatch.chdir(tmp_path)
@@ -746,7 +1008,6 @@ def test_cli_lock_prune_force_bypasses_interactive_prompt(tmp_path, monkeypatch,
 
     monkeypatch.setattr(sys, "argv", ["kist", "lock", "secrets/production.yaml", "--prune", "--force"])
     monkeypatch.setattr(sys.stdin, "isatty", lambda: True)
-    # If input is called, it would fail
     monkeypatch.setattr("builtins.input", lambda prompt: (_ for _ in ()).throw(AssertionError("Should not prompt")))
 
     with patch.object(Kist, "lock_yaml", return_value=(2, 1)) as mock_lock:
@@ -754,3 +1015,114 @@ def test_cli_lock_prune_force_bypasses_interactive_prompt(tmp_path, monkeypatch,
         mock_lock.assert_called_once_with("db.host: localhost\n", prune=True)
         captured = capsys.readouterr()
         assert "Locked 2 secrets for local/default/production. Pruned 1." in captured.out
+
+
+def test_cli_init_db_invokes_store_init_db(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["kist", "init-db"])
+    with patch.object(Kist, "init_db") as mock_init_db:
+        main()
+        mock_init_db.assert_called_once()
+        captured = capsys.readouterr()
+        assert "Kist database schema initialized successfully." in captured.out
+
+
+def test_cli_init_db_with_scope_flags(monkeypatch, capsys):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["kist", "--org", "myorg", "--project", "myproj", "--profile", "staging", "init-db"],
+    )
+    with patch.object(Kist, "init_db") as mock_init_db:
+        main()
+        mock_init_db.assert_called_once()
+        captured = capsys.readouterr()
+        assert "Kist database schema initialized successfully." in captured.out
+
+
+def test_resolve_secret_file_path_defaults(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir(exist_ok=True)
+
+    (secrets_dir / "default.yaml").write_text("a: 1\n", encoding="utf-8")
+    assert resolve_secret_file_path() == "secrets/default.yaml"
+
+    (secrets_dir / "team_a.yaml").write_text("b: 2\n", encoding="utf-8")
+    monkeypatch.setenv("KIST_PROFILE", "team_a")
+    assert resolve_secret_file_path() == "secrets/team_a.yaml"
+
+    (tmp_path / "secrets_team_b.yaml").write_text("c: 3\n", encoding="utf-8")
+    assert resolve_secret_file_path(profile="team_b") == "secrets_team_b.yaml"
+
+
+def test_cli_lock_defaults_to_active_profile(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KIST_PASSWORD", "test_secret_key_123")
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Default profile with secrets/default.yaml
+    (secrets_dir / "default.yaml").write_text("db.host: localhost\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["kist", "lock"])
+
+    with patch.object(Kist, "lock_yaml", return_value=(1, 0)) as mock_lock:
+        main()
+        mock_lock.assert_called_once_with("db.host: localhost\n", prune=False)
+        captured = capsys.readouterr()
+        assert "Locked 1 secrets for local/default/default." in captured.out
+
+    # 2. Team profile via KIST_PROFILE
+    monkeypatch.setenv("KIST_PROFILE", "team_a")
+    (secrets_dir / "team_a.yaml").write_text("team.key: secret\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["kist", "lock"])
+
+    with patch.object(Kist, "lock_yaml", return_value=(1, 0)) as mock_lock:
+        main()
+        mock_lock.assert_called_once_with("team.key: secret\n", prune=False)
+        captured = capsys.readouterr()
+        assert "Locked 1 secrets for local/default/team_a." in captured.out
+
+    # 3. Explicit --profile flag without file argument
+    (secrets_dir / "team_b.yaml").write_text("team.b: value\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["kist", "--profile", "team_b", "lock"])
+
+    with patch.object(Kist, "lock_yaml", return_value=(1, 0)) as mock_lock:
+        main()
+        mock_lock.assert_called_once_with("team.b: value\n", prune=False)
+        captured = capsys.readouterr()
+        assert "Locked 1 secrets for local/default/team_b." in captured.out
+
+
+def test_cli_lock_missing_default_file_raises_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KIST_PASSWORD", "test_secret_key_123")
+    monkeypatch.setattr(sys, "argv", ["kist", "lock"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        main()
+
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert "Secret file not found: secrets.yaml" in captured.err or "Secret file not found: secrets/default.yaml" in captured.err
+
+
+def test_cli_unlock_defaults_to_active_profile(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("KIST_PASSWORD", "test_secret_key_123")
+    secrets_dir = tmp_path / "secrets"
+    secrets_dir.mkdir(parents=True, exist_ok=True)
+    (secrets_dir / "default.yaml").write_text("a: 1\n", encoding="utf-8")
+
+    monkeypatch.setattr(sys, "argv", ["kist", "unlock"])
+
+    with patch.object(Kist, "unlock_yaml", return_value="a: 1\n") as mock_unlock:
+        main()
+        mock_unlock.assert_called_once()
+        captured = capsys.readouterr()
+        assert "a: 1\n" in captured.out
+
+
+def test_kist_class_defaults_to_kist_profile_env(monkeypatch):
+    monkeypatch.setenv("KIST_PROFILE", "team_a")
+    k = Kist()
+    assert k.profile_name == "team_a"

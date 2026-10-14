@@ -1,38 +1,31 @@
-"""Kist core: password-backed encrypted secret storage.
+"""Kist core: password-unlocked envelope encryption and opaque PostgreSQL storage.
 
-Kist 0.1.0 stores JSON-serializable secret values encrypted in PostgreSQL and
-supports encrypted Git clean/smudge workflows through helpers used by
-``kist.git``.
+Initial v1 format for unshipped Kist. Only this format is supported; there are
+no older-format readers or migrations. Disposable test data should be recreated
+when the format changes. Git writes encrypt the whole file.
+One existing profile password unlocks a randomly generated content/index key
+bundle. Names and values are encrypted together; exact name lookup uses HMAC.
+All mutations through this module share a transaction-scoped profile lock.
 
-Security model:
-- Secret values are encrypted with AES-256-GCM.
-- Password-derived encryption keys use Argon2id.
-- Every encryption receives a fresh random salt and nonce.
-- Authenticated context binds ciphertext to a Kist scope, profile, secret key,
-  secret version, or Git repository path.
-- Password-v1 is the only supported database envelope mode in this release.
-
-Non-goals for 0.1.0:
-- KMS data-encryption keys.
-- Kist Guard integration.
-- Automatic key rotation.
-
-This module does not contact a hosted Kist service. It uses only the configured
-PostgreSQL database and local runtime key material.
+No KMS, recipients, Guard, key caching, automatic content-key rotation,
+collection-completeness proof, or rollback protection is implemented here.
+Future access constructions must have explicit versions and fail closed.
+Profile labels, row counts, sizes, revisions, and access patterns remain visible.
 """
-
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import secrets
 import stat
 import struct
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import psycopg
@@ -41,1731 +34,913 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 
-
-# ---------------------------------------------------------------------------
-# Public constants and envelope format
-# ---------------------------------------------------------------------------
-
 KIST_DATABASE_URL = os.getenv("KIST_DATABASE_URL")
-
-KEY_MODE_PASSWORD = "password-v1"
-
+KEY_MODE_PASSWORD = "password-wrap-v1"
+SCHEMA_VERSION = 1
 MAGIC = b"KIST"
 ENVELOPE_VERSION = 1
 ALGORITHM_AES_256_GCM = 1
 KDF_ARGON2ID = 1
 ENVELOPE_FLAGS = 0
-
 ARGON2_MEMORY_COST = 65_536
 ARGON2_ITERATIONS = 2
 ARGON2_LANES = 4
 ARGON2_KEY_LENGTH = 32
-
 SALT_LENGTH = 16
 NONCE_LENGTH = 12
 AAD_HASH_LENGTH = 32
 AES_GCM_TAG_LENGTH = 16
-
-MAGIC_OFFSET = 0
-VERSION_OFFSET = 4
-ALGORITHM_OFFSET = 5
-KDF_OFFSET = 6
-FLAGS_OFFSET = 7
-
-MEMORY_COST_OFFSET = 8
-ITERATIONS_OFFSET = 12
-LANES_OFFSET = 16
-SALT_OFFSET = 18
-NONCE_OFFSET = SALT_OFFSET + SALT_LENGTH
-AAD_HASH_OFFSET = NONCE_OFFSET + NONCE_LENGTH
-CIPHERTEXT_OFFSET = AAD_HASH_OFFSET + AAD_HASH_LENGTH
-
-HEADER_SIZE = CIPHERTEXT_OFFSET
-
-
-# ---------------------------------------------------------------------------
-# Errors and configuration types
-# ---------------------------------------------------------------------------
+# Prefix: magic, version, cipher, KDF, flags, memory, iterations, lanes.
+_PREFIX = struct.Struct(">4sBBBBIIH")
+HEADER_SIZE = _PREFIX.size + SALT_LENGTH + NONCE_LENGTH + AAD_HASH_LENGTH
+# v1 has a wrapped random content key after the password header.
+WRAPPED_KEY_LENGTH = ARGON2_KEY_LENGTH + AES_GCM_TAG_LENGTH
+_ROW_MAGIC = b"KSTR\x01"
+_MAX_PASSWORD_BYTES = 1_048_576
 
 class KistError(Exception):
-    """Base class for expected Kist errors."""
-
+    """Expected Kist failure."""
 
 class MissingKeyError(KistError):
-    """Raised when no password is available for a requested Kist profile."""
-
+    """No usable profile password."""
 
 class InvalidEnvelopeError(KistError):
-    """Raised when content is not a supported Kist encrypted envelope."""
-
+    """Unsupported or malformed envelope."""
 
 class DecryptionError(KistError):
-    """Raised when ciphertext cannot be authenticated or decrypted."""
-
+    """Authentication or decrypted-record validation failed."""
 
 class InsecureKeyStoreError(KistError):
-    """Raised when a local password file lacks minimum POSIX protections."""
-
+    """Unsafe local credential storage."""
 
 class ConcurrentWriteError(KistError):
-    """Raised when Kist cannot safely serialize a secret update."""
+    """A mutation exhausted its transaction retries."""
 
+class SchemaVersionError(KistError):
+    """Explicit initialization is required or the schema version is unsupported."""
 
 @dataclass(frozen=True)
 class Argon2Policy:
-    """Parameters recorded in a password-v1 envelope."""
-
     memory_cost: int = ARGON2_MEMORY_COST
     iterations: int = ARGON2_ITERATIONS
     lanes: int = ARGON2_LANES
 
-    def validated(self) -> "Argon2Policy":
-        """Return validated KDF policy parameters."""
-        if not 19 * 1024 <= self.memory_cost <= 1024 * 1024:
-            raise KistError(
-                "Argon2 memory cost must be between 19456 and 1048576 KiB."
-            )
-
-        if not 1 <= self.iterations <= 20:
-            raise KistError(
-                "Argon2 iterations must be between 1 and 20."
-            )
-
-        if not 1 <= self.lanes <= 32:
-            raise KistError(
-                "Argon2 lanes must be between 1 and 32."
-            )
-
+    def validated(self) -> Argon2Policy:
+        if any(type(v) is not int for v in (self.memory_cost, self.iterations, self.lanes)):
+            raise KistError("Argon2 parameters must be integers.")
+        # Deliberately bounded reader workload: reject hostile high-cost headers.
+        if not 19_456 <= self.memory_cost <= 262_144:
+            raise KistError("Argon2 memory must be 19456..262144 KiB.")
+        if not 1 <= self.iterations <= 10 or not 1 <= self.lanes <= 16:
+            raise KistError("Argon2 iterations must be 1..10 and lanes 1..16.")
         if self.memory_cost < 8 * self.lanes:
-            raise KistError(
-                "Argon2 memory cost must be at least eight times the lane count."
-            )
-
+            raise KistError("Argon2 memory must be at least eight times lanes.")
         return self
-
 
 @dataclass(frozen=True)
 class KistScope:
-    """Logical Kist organization and project boundary."""
-
     organization: str = "local"
     project: str = "default"
 
     @classmethod
-    def from_environment(cls) -> "KistScope":
-        """Load scope settings from the process environment."""
-        return cls(
-            organization=os.getenv("KIST_ORG_ID", "local"),
-            project=os.getenv("KIST_PROJECT_ID", "default"),
-        ).validated()
+    def from_environment(cls) -> KistScope:
+        return cls(os.getenv("KIST_ORG_ID", "local"),
+                   os.getenv("KIST_PROJECT_ID", "default")).validated()
 
-    def validated(self) -> "KistScope":
-        """Validate and normalize the organization/project values."""
-        return KistScope(
-            organization=_validate_scope_name(
-                self.organization,
-                "organization",
-            ),
-            project=_validate_scope_name(
-                self.project,
-                "project",
-            ),
-        )
-
-
-# ---------------------------------------------------------------------------
-# PostgreSQL schema
-# ---------------------------------------------------------------------------
+    def validated(self) -> KistScope:
+        return KistScope(_validate_scope_name(self.organization, "organization"),
+                         _validate_scope_name(self.project, "project"))
 
 SQL_SCHEMA = """
+CREATE TABLE IF NOT EXISTS kist_schema (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    version INTEGER NOT NULL CHECK (version = 1)
+);
+INSERT INTO kist_schema (singleton, version) VALUES (TRUE, 1)
+ON CONFLICT (singleton) DO NOTHING;
 CREATE TABLE IF NOT EXISTS kist_organizations (
     id UUID PRIMARY KEY,
     slug VARCHAR(100) UNIQUE NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
 CREATE TABLE IF NOT EXISTS kist_projects (
     id UUID PRIMARY KEY,
-    organization_id UUID NOT NULL
-        REFERENCES kist_organizations(id)
-        ON DELETE CASCADE,
+    organization_id UUID NOT NULL REFERENCES kist_organizations(id) ON DELETE CASCADE,
     slug VARCHAR(100) NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT unique_kist_project UNIQUE (organization_id, slug)
+    UNIQUE (organization_id, slug)
 );
-
 CREATE TABLE IF NOT EXISTS kist_profiles (
     id UUID PRIMARY KEY,
-    organization_id UUID NOT NULL
-        REFERENCES kist_organizations(id)
-        ON DELETE CASCADE,
-    project_id UUID NOT NULL
-        REFERENCES kist_projects(id)
-        ON DELETE CASCADE,
+    project_id UUID NOT NULL REFERENCES kist_projects(id) ON DELETE CASCADE,
     profile_name VARCHAR(100) NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT unique_kist_profile UNIQUE (project_id, profile_name)
+    UNIQUE (project_id, profile_name)
 );
-
-CREATE TABLE IF NOT EXISTS kist (
+CREATE TABLE IF NOT EXISTS kist_key_bundles (
     id UUID PRIMARY KEY,
-    profile_id UUID NOT NULL
-        REFERENCES kist_profiles(id)
-        ON DELETE CASCADE,
-    secret_key VARCHAR(255) NOT NULL,
-    encrypted_blob BYTEA NOT NULL,
-    crypto_mode VARCHAR(32) NOT NULL DEFAULT 'password-v1',
-    crypto_version SMALLINT NOT NULL DEFAULT 1,
-    secret_version BIGINT NOT NULL DEFAULT 1,
+    profile_id UUID UNIQUE NOT NULL REFERENCES kist_profiles(id) ON DELETE CASCADE,
+    access_mode VARCHAR(32) NOT NULL,
+    bundle_version SMALLINT NOT NULL CHECK (bundle_version = 1),
+    wrapped_bundle BYTEA NOT NULL,
+    wrapper_revision BIGINT NOT NULL DEFAULT 1 CHECK (wrapper_revision >= 1),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT unique_profile_secret UNIQUE (profile_id, secret_key)
+    UNIQUE (profile_id, id)
 );
-
-CREATE INDEX IF NOT EXISTS idx_kist_profile_lookup
-    ON kist (profile_id, secret_key);
+CREATE TABLE IF NOT EXISTS kist_secrets (
+    id UUID PRIMARY KEY,
+    profile_id UUID NOT NULL REFERENCES kist_profiles(id) ON DELETE CASCADE,
+    lookup_token BYTEA NOT NULL CHECK (octet_length(lookup_token) = 32),
+    key_bundle_id UUID NOT NULL,
+    crypto_version SMALLINT NOT NULL CHECK (crypto_version = 1),
+    secret_version BIGINT NOT NULL CHECK (secret_version >= 1),
+    encrypted_blob BYTEA NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (profile_id, key_bundle_id)
+        REFERENCES kist_key_bundles(profile_id, id),
+    UNIQUE (profile_id, lookup_token)
+);
 """
 
-
-# ---------------------------------------------------------------------------
-# Naming and local-password helpers
-# ---------------------------------------------------------------------------
-
 def generate_password(length: int = 32) -> str:
-    """Generate a high-entropy URL-safe profile password."""
-    if length < 16:
-        raise KistError(
-            "Generated profile passwords must contain at least 16 bytes."
-        )
-
+    """Length is entropy bytes, not the final string character count."""
+    if type(length) is not int or length < 16:
+        raise KistError("Generated passwords need at least 16 entropy bytes.")
     return secrets.token_urlsafe(length)
 
-
 def get_kist_dir() -> str:
-    """Return the directory that holds optional local profile password files."""
     return os.getenv("KIST_DIR") or os.path.expanduser("~/.kist")
 
-
 def _validate_scope_name(value: str, label: str) -> str:
-    """Validate a profile, organization, or project name."""
     if not isinstance(value, str):
-        raise KistError(
-            f"{label.capitalize()} names must be strings."
-        )
+        raise KistError(f"{label} must be a string.")
+    value = value.strip()
+    if not 1 <= len(value) <= 100 or value in {".", ".."}:
+        raise KistError(f"Invalid {label} name.")
+    if any(c in value for c in ("/", "\\", "\x00")):
+        raise KistError(f"{label} cannot contain separators or NUL.")
+    return value
 
-    normalized = value.strip()
+def _validate_profile_name(value: str) -> str:
+    return _validate_scope_name(value, "profile")
 
-    if not normalized or len(normalized) > 100:
-        raise KistError(
-            f"{label.capitalize()} names must contain between 1 and "
-            "100 characters."
-        )
-
-    if any(character in normalized for character in ("/", "\\", "\x00")):
-        raise KistError(
-            f"{label.capitalize()} names cannot contain path separators "
-            "or NUL bytes."
-        )
-
-    return normalized
-
-
-def _validate_profile_name(profile_name: str) -> str:
-    """Validate a profile name."""
-    return _validate_scope_name(profile_name, "profile")
-
-
-def _validate_secret_key(secret_key: str) -> str:
-    """Validate a dot-separated logical secret key."""
-    if not isinstance(secret_key, str):
+def _validate_secret_key(value: str) -> str:
+    if not isinstance(value, str):
         raise KistError("Secret keys must be strings.")
+    value = value.strip()
+    if not 1 <= len(value) <= 255 or "\x00" in value:
+        raise KistError("Invalid secret key length or NUL.")
+    if any(not part or part != part.strip() for part in value.split(".")):
+        raise KistError("Secret keys require non-empty, unpadded dot segments.")
+    return value
 
-    normalized = secret_key.strip()
-
-    if not normalized:
-        raise KistError("Secret keys must not be empty.")
-
-    if len(normalized) > 255:
-        raise KistError(
-            "Secret keys must contain at most 255 characters."
-        )
-
-    if "\x00" in normalized:
-        raise KistError("Secret keys cannot contain NUL bytes.")
-
-    if (
-        normalized.startswith(".")
-        or normalized.endswith(".")
-        or ".." in normalized
-    ):
-        raise KistError(
-            "Secret keys must use non-empty dot-separated path segments."
-        )
-
-    return normalized
-
+def _password_bytes(password: str) -> bytes:
+    if not isinstance(password, str) or not password:
+        raise MissingKeyError("A non-empty profile password is required.")
+    raw = password.encode("utf-8")
+    if len(raw) > _MAX_PASSWORD_BYTES:
+        raise KistError("Profile password is too large.")
+    return raw
 
 def profile_password_path(profile_name: str) -> Path:
-    """Return the expected local password-file path for a profile."""
-    profile = _validate_profile_name(profile_name)
-    return Path(get_kist_dir()) / f"pwd_{profile}"
+    return Path(get_kist_dir()) / f"pwd_{_validate_profile_name(profile_name)}"
 
+def _secure_status(status: os.stat_result, directory: bool = False) -> None:
+    valid_kind = stat.S_ISDIR(status.st_mode) if directory else stat.S_ISREG(status.st_mode)
+    if not valid_kind or status.st_uid != os.getuid() or stat.S_IMODE(status.st_mode) & 0o077:
+        raise InsecureKeyStoreError("Credential storage must be owner-only and owned by this user.")
 
-def _check_secure_directory(path: Path) -> None:
-    """Ensure a local password directory is owner-only on POSIX."""
-    if os.name == "nt":
-        return
-
-    status = path.stat()
-
-    if status.st_uid != os.getuid():
-        raise InsecureKeyStoreError(
-            "Kist directory is not owned by the current user: "
-            f"{path}"
-        )
-
-    if stat.S_IMODE(status.st_mode) & 0o077:
-        raise InsecureKeyStoreError(
-            "Kist directory must not be readable, writable, or searchable "
-            f"by group or other users: {path}"
-        )
-
-
-def read_secure_local_password(path: Path) -> str:
-    """Read an owner-only local password file without following symlinks."""
-    if os.name == "nt":
-        return path.read_text(encoding="utf-8").strip()
-
-    status = path.lstat()
-
-    if stat.S_ISLNK(status.st_mode) or not stat.S_ISREG(status.st_mode):
-        raise InsecureKeyStoreError(
-            "Credential path is not a regular non-symlink file: "
-            f"{path}"
-        )
-
-    if status.st_uid != os.getuid():
-        raise InsecureKeyStoreError(
-            "Credential file is not owned by the current user: "
-            f"{path}"
-        )
-
-    if stat.S_IMODE(status.st_mode) & 0o077:
-        raise InsecureKeyStoreError(
-            "Credential file must not be readable or writable by group "
-            f"or other users: {path}"
-        )
-
-    return path.read_text(encoding="utf-8").strip()
-
-
-def write_secure_local_password(
-    path: Path,
-    password: str,
-    *,
-    overwrite: bool = False,
-) -> None:
-    """Write a local profile password with POSIX owner-only protections."""
-    if not password:
-        raise KistError("Profile passwords must not be empty.")
-
-    directory = path.parent
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-
-    if os.name == "nt":
-        if path.exists() and not overwrite:
-            raise KistError(
-                f"Credential file already exists: {path}"
-            )
-
-        path.write_text(password, encoding="utf-8")
-        return
-
-    os.chmod(directory, 0o700)
-    _check_secure_directory(directory)
-
-    flags = os.O_WRONLY | os.O_CREAT
-
-    if overwrite:
-        flags |= os.O_TRUNC
-    else:
-        flags |= os.O_EXCL
-
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-
+def _open_secure_directory(path: Path) -> int:
+    if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+        raise InsecureKeyStoreError("Local credential files require POSIX no-follow support; use environment credentials.")
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        descriptor = os.open(str(path), flags, 0o600)
-    except FileExistsError as exc:
-        raise KistError(
-            f"Credential file already exists: {path}"
-        ) from exc
-
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(password)
-            handle.flush()
-            os.fsync(handle.fileno())
+        _secure_status(os.fstat(fd), directory=True)
+        return fd
     except BaseException:
-        if not overwrite:
-            path.unlink(missing_ok=True)
+        os.close(fd)
         raise
 
+def _check_secure_directory(path: Path) -> None:
+    fd = _open_secure_directory(path)
+    os.close(fd)
 
-def get_profile_password(
-    profile_name: str,
-    auto_generate: bool = False,
-    *,
-    allow_env: bool = True,
-    allow_local_file: bool = True,
-) -> Optional[str]:
-    """Find a profile password from explicit environment or local file sources.
+def read_secure_local_password(path: Path) -> str:
+    """Validate the opened descriptor, not a preceding path-stat result."""
+    path = Path(path)
+    directory = _open_secure_directory(path.parent)
+    try:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(fd, "rb") as handle:
+            _secure_status(os.fstat(handle.fileno()))
+            raw = handle.read(_MAX_PASSWORD_BYTES + 1)
+            if len(raw) > _MAX_PASSWORD_BYTES:
+                raise InsecureKeyStoreError("Credential file is too large.")
+            return raw.decode("utf-8").strip()
+    finally:
+        os.close(directory)
 
-    ``auto_generate`` is retained for compatibility but intentionally does not
-    generate a secret implicitly. Use :func:`create_profile_key` instead.
-    """
+def write_secure_local_password(path: Path, password: str, *, overwrite: bool = False) -> None:
+    """Atomic owner-only writes; do not silently repair unsafe existing directories."""
+    raw = _password_bytes(password)
+    if password != password.strip():
+        raise KistError("Local-file passwords cannot have surrounding whitespace.")
+    path = Path(path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory = _open_secure_directory(path.parent)
+    temporary = f".kist-{secrets.token_hex(16)}"
+    try:
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if overwrite:
+            os.replace(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory)
+        else:
+            try:
+                os.link(temporary, path.name, src_dir_fd=directory, dst_dir_fd=directory,
+                        follow_symlinks=False)
+            except FileExistsError as exc:
+                raise KistError("Credential file already exists.") from exc
+            os.unlink(temporary, dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        try:
+            os.unlink(temporary, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        os.close(directory)
+
+def get_profile_password(profile_name: str, auto_generate: bool = False, *,
+                         allow_env: bool = True, allow_local_file: bool = True) -> Optional[str]:
     profile = _validate_profile_name(profile_name)
-
     if allow_env:
-        profile_environment_key = (
-            "KIST_PASSWORD_DEFAULT"
-            if profile == "default"
-            else f"KIST_PASSWORD_{profile.upper()}"
-        )
-
-        password = (
-            os.getenv(profile_environment_key)
-            or os.getenv("KIST_PASSWORD")
-        )
-
-        if password:
-            return password
-
-    password_path = profile_password_path(profile)
-
-    if allow_local_file and password_path.exists():
-        password = read_secure_local_password(password_path)
-
-        if password:
-            return password
-
+        value = os.getenv(f"KIST_PASSWORD_{profile.upper()}") or os.getenv("KIST_PASSWORD")
+        if value:
+            return value
+    if allow_local_file:
+        try:
+            value = read_secure_local_password(profile_password_path(profile))
+        except FileNotFoundError:
+            value = None
+        if value:
+            return value
     if auto_generate:
-        raise KistError(
-            "Implicit profile-password generation is disabled. "
-            "Use create_profile_key() or `kist profile create <name>`."
-        )
-
+        raise KistError("Implicit generation is disabled; use create_profile_key().")
     return None
 
-
-def create_profile_key(
-    profile_name: str,
-    *,
-    rotate: bool = False,
-) -> str:
-    """Create or intentionally replace one local profile password."""
-    profile = _validate_profile_name(profile_name)
+def create_profile_key(profile_name: str, *, rotate: bool = False) -> str:
+    """Create a local password only. Replacing it is NOT ciphertext rotation."""
+    if rotate:
+        raise KistError("Use rewrap_profile_password(); replacing a password file is not rotation.")
     password = generate_password()
-
-    write_secure_local_password(
-        profile_password_path(profile),
-        password,
-        overwrite=rotate,
-    )
-
+    write_secure_local_password(profile_password_path(profile_name), password)
     return password
 
+def resolve_secret_file_path(path_or_name: Optional[str] = None, profile: Optional[str] = None) -> str:
+    if path_or_name:
+        candidates = [
+            path_or_name,
+            f"{path_or_name}.yaml",
+            f"{path_or_name}.yml",
+            os.path.join("secrets", path_or_name),
+            os.path.join("secrets", f"{path_or_name}.yaml"),
+            os.path.join("secrets", f"{path_or_name}.yml"),
+            f"secrets_{path_or_name}.yaml",
+            f"secrets_{path_or_name}.yml",
+            os.path.join("secrets", f"secrets_{path_or_name}.yaml"),
+            os.path.join("secrets", f"secrets_{path_or_name}.yml"),
+        ]
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        name = path_or_name if path_or_name.endswith((".yaml", ".yml")) else f"{path_or_name}.yaml"
+        return os.path.join("secrets", name) if os.path.isdir("secrets") else name
 
-# ---------------------------------------------------------------------------
-# File, profile, and database URL helpers
-# ---------------------------------------------------------------------------
+    target_profile = _validate_profile_name(profile or os.getenv("KIST_PROFILE", "default"))
+    if target_profile == "default":
+        candidates = [
+            os.path.join("secrets", "default.yaml"),
+            os.path.join("secrets", "default.yml"),
+            os.path.join("secrets", "secrets.yaml"),
+            os.path.join("secrets", "secrets.yml"),
+            "secrets/default.yaml",
+            "secrets/default.yml",
+            "secrets.yaml",
+            "secrets.yml",
+            "secrets_default.yaml",
+            "secrets_default.yml",
+            "default.yaml",
+            "default.yml",
+        ]
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        return os.path.join("secrets", "default.yaml") if os.path.isdir("secrets") else "secrets/default.yaml" if os.path.exists("secrets") else "secrets.yaml"
 
-def resolve_secret_file_path(path_or_name: str) -> str:
-    """Resolve common Kist secret-file naming conventions."""
     candidates = [
-        path_or_name,
-        f"{path_or_name}.yaml",
-        f"{path_or_name}.yml",
-        os.path.join("secrets", path_or_name),
-        os.path.join("secrets", f"{path_or_name}.yaml"),
-        os.path.join("secrets", f"{path_or_name}.yml"),
+        os.path.join("secrets", f"{target_profile}.yaml"),
+        os.path.join("secrets", f"{target_profile}.yml"),
+        os.path.join("secrets", f"secrets_{target_profile}.yaml"),
+        os.path.join("secrets", f"secrets_{target_profile}.yml"),
+        f"secrets_{target_profile}.yaml",
+        f"secrets_{target_profile}.yml",
+        f"{target_profile}.yaml",
+        f"{target_profile}.yml",
     ]
-
     for candidate in candidates:
         if os.path.isfile(candidate):
             return candidate
+    return os.path.join("secrets", f"{target_profile}.yaml") if os.path.isdir("secrets") else f"secrets_{target_profile}.yaml"
 
-    if os.path.isdir("secrets"):
-        if path_or_name.endswith((".yaml", ".yml")):
-            return os.path.join("secrets", path_or_name)
-
-        return os.path.join("secrets", f"{path_or_name}.yaml")
-
-    if path_or_name.endswith((".yaml", ".yml")):
-        return path_or_name
-
-    return f"{path_or_name}.yaml"
-
-
-def get_profile_and_password(
-    filepath: str,
-    auto_generate: bool = False,
-) -> tuple[str, Optional[str]]:
-    """Infer a Kist profile from a conventional secret-file name."""
-    file_name = os.path.basename(filepath)
-
-    if file_name.endswith(".yaml"):
-        base_name = file_name[:-5]
-    elif file_name.endswith(".yml"):
-        base_name = file_name[:-4]
-    else:
-        base_name = file_name
-
-    if base_name == "secrets":
-        profile_name = "default"
-    elif base_name.startswith("secrets_"):
-        profile_name = base_name.removeprefix("secrets_")
-    else:
-        profile_name = base_name
-
-    profile_name = _validate_profile_name(profile_name)
-
-    return (
-        profile_name,
-        get_profile_password(
-            profile_name,
-            auto_generate=auto_generate,
-        ),
-    )
-
+def get_profile_and_password(filepath: str, auto_generate: bool = False) -> tuple[str, Optional[str]]:
+    name = os.path.basename(filepath)
+    base = name[:-5] if name.endswith(".yaml") else name[:-4] if name.endswith(".yml") else name
+    profile = "default" if base == "secrets" else base.removeprefix("secrets_")
+    profile = _validate_profile_name(profile)
+    return profile, get_profile_password(profile, auto_generate)
 
 def mask_db_url(db_url: Optional[str]) -> str:
-    """Return a PostgreSQL URL suitable for error messages and diagnostics."""
+    """Conservative diagnostic: discard userinfo, query, and fragment entirely."""
     if not db_url:
         return ""
-
     try:
-        parsed = urlsplit(db_url)
-
-        host = parsed.hostname or ""
-        user = parsed.username or ""
-        port = f":{parsed.port}" if parsed.port else ""
-
-        if parsed.password:
-            netloc = f"{user}:***@{host}{port}"
-        else:
-            netloc = parsed.netloc
-
-        query = urlencode(
-            [
-                (
-                    key,
-                    "***"
-                    if any(
-                        word in key.lower()
-                        for word in ("password", "token", "secret")
-                    )
-                    else value,
-                )
-                for key, value in parse_qsl(
-                    parsed.query,
-                    keep_blank_values=True,
-                )
-            ]
-        )
-
-        return urlunsplit(
-            (
-                parsed.scheme,
-                netloc,
-                parsed.path,
-                query,
-                parsed.fragment,
-            )
-        )
-    except Exception:
+        p = urlsplit(db_url)
+        host = p.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        port = f":{p.port}" if p.port else ""
+        return urlunsplit((p.scheme, host + port, p.path, "", ""))
+    except (ValueError, TypeError):
         return "<invalid database URL>"
 
-
 def _runtime_is_production(production: Optional[bool]) -> bool:
-    """Return whether Kist should apply production transport restrictions."""
-    if production is not None:
-        return production
+    return production if production is not None else os.getenv("KIST_ENV", "development").strip().lower() == "production"
 
-    return (
-        os.getenv("KIST_ENV", "development").strip().lower()
-        == "production"
-    )
-
-
-def enforce_ssl_url(
-    db_url: Optional[str],
-    default_sslmode: str = "require",
-    *,
-    production: Optional[bool] = None,
-) -> Optional[str]:
-    """Apply explicit Kist TLS policy to a PostgreSQL URL.
-
-    Environment:
-    - ``KIST_TLS_MODE=auto`` preserves URL ``sslmode`` or applies
-      ``default_sslmode`` when none exists.
-    - ``KIST_TLS_MODE=disable`` is allowed only outside production.
-    - ``KIST_TLS_MODE=require`` enables TLS without certificate verification.
-    - ``KIST_TLS_MODE=verify-ca`` and ``verify-full`` require ``sslrootcert``
-      in the URL or ``PGSSLROOTCERT`` in the environment.
-
-    Local development users may set ``KIST_TLS_MODE=disable`` explicitly.
-    """
-    if db_url is None:
-        return None
-
-    if db_url == "":
-        return ""
-
-    parsed = urlsplit(db_url)
-
-    if not parsed.scheme or not parsed.netloc:
-        raise KistError(
-            "KIST_DATABASE_URL must be a valid PostgreSQL URL."
-        )
-
-    requested_mode = os.getenv(
-        "KIST_TLS_MODE",
-        "auto",
-    ).strip().lower()
-
-    valid_modes = {
-        "auto",
-        "disable",
-        "require",
-        "verify-ca",
-        "verify-full",
-    }
-
-    if requested_mode not in valid_modes:
-        raise KistError(
-            "KIST_TLS_MODE must be auto, disable, require, verify-ca, "
-            "or verify-full."
-        )
-
-    query = dict(
-        parse_qsl(
-            parsed.query,
-            keep_blank_values=True,
-        )
-    )
-
-    url_sslmode = query.get("sslmode", "").strip().lower()
-
-    sslmode = (
-        url_sslmode or default_sslmode
-        if requested_mode == "auto"
-        else requested_mode
-    )
-
-    if sslmode not in valid_modes - {"auto"}:
-        raise KistError(
-            f"Unsupported PostgreSQL sslmode: {sslmode!r}."
-        )
-
-    if sslmode == "disable" and _runtime_is_production(production):
-        raise KistError(
-            "sslmode=disable is allowed only outside KIST_ENV=production."
-        )
-
-    if sslmode in {"verify-ca", "verify-full"}:
-        if not query.get("sslrootcert") and not os.getenv("PGSSLROOTCERT"):
-            raise KistError(
-                f"{sslmode} requires sslrootcert in the database URL "
-                "or PGSSLROOTCERT in the environment."
-            )
-
-    query["sslmode"] = sslmode
-
-    return urlunsplit(
-        (
-            parsed.scheme,
-            parsed.netloc,
-            parsed.path,
-            urlencode(query),
-            parsed.fragment,
-        )
-    )
-
+def enforce_ssl_url(db_url: Optional[str], default_sslmode: str = "require", *,
+                    production: Optional[bool] = None) -> Optional[str]:
+    if not db_url:
+        return db_url
+    p = urlsplit(db_url)
+    if p.scheme not in {"postgres", "postgresql"} or not p.netloc or p.fragment:
+        raise KistError("Database configuration must be a PostgreSQL URL without a fragment.")
+    items = parse_qsl(p.query, keep_blank_values=True)
+    if len({k for k, _ in items}) != len(items):
+        raise KistError("Duplicate database URL options are not supported.")
+    query = dict(items)
+    requested = os.getenv("KIST_TLS_MODE", "auto").strip().lower()
+    modes = {"disable", "require", "verify-ca", "verify-full"}
+    if requested not in modes | {"auto"}:
+        raise KistError("Invalid KIST_TLS_MODE.")
+    effective = (query.get("sslmode") or default_sslmode).strip().lower() if requested == "auto" else requested
+    if effective not in modes:
+        raise KistError("Unsupported sslmode.")
+    if effective == "disable" and _runtime_is_production(production):
+        raise KistError("TLS cannot be disabled in production.")
+    if effective in {"verify-ca", "verify-full"} and not (query.get("sslrootcert") or os.getenv("PGSSLROOTCERT")):
+        raise KistError("Certificate verification requires sslrootcert or PGSSLROOTCERT.")
+    query["sslmode"] = effective
+    return urlunsplit((p.scheme, p.netloc, p.path, urlencode(query), ""))
 
 def database_tls_mode(db_url: Optional[str]) -> Optional[str]:
-    """Return the effective PostgreSQL sslmode after Kist policy is applied."""
     normalized = enforce_ssl_url(db_url)
+    return dict(parse_qsl(urlsplit(normalized).query)).get("sslmode") if normalized else None
 
-    if not normalized:
-        return None
+def _connection_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+    # Keep URL policy from being silently overridden by libpq kwargs.
+    if any(k in kwargs for k in ("sslmode", "sslrootcert", "sslcert", "sslkey", "service", "host", "hostaddr")):
+        raise KistError("Specify transport settings in the database URL, not connection kwargs.")
+    return kwargs
 
-    return dict(
-        parse_qsl(
-            urlsplit(normalized).query,
-            keep_blank_values=True,
-        )
-    ).get("sslmode")
-
-
-def safe_db_connect(
-    db_url: str,
-    **kwargs: Any,
-) -> psycopg.Connection[Any]:
-    """Open a PostgreSQL connection without leaking credentials in errors."""
+def safe_db_connect(db_url: str, **kwargs: Any) -> psycopg.Connection[Any]:
     try:
-        return psycopg.connect(
-            enforce_ssl_url(db_url),
-            **kwargs,
-        )
-    except psycopg.OperationalError as exc:
-        raise psycopg.OperationalError(
-            "Database connection failure "
-            f"({mask_db_url(db_url)}): {exc}"
-        ) from None
+        return psycopg.connect(enforce_ssl_url(db_url), **_connection_kwargs(kwargs))
+    except psycopg.OperationalError:
+        raise psycopg.OperationalError(f"Database connection failed ({mask_db_url(db_url)}).") from None
 
-
-async def safe_async_db_connect(
-    db_url: str,
-    **kwargs: Any,
-) -> psycopg.AsyncConnection[Any]:
-    """Open an async PostgreSQL connection without leaking credentials."""
+async def safe_async_db_connect(db_url: str, **kwargs: Any) -> psycopg.AsyncConnection[Any]:
     try:
-        return await psycopg.AsyncConnection.connect(
-            enforce_ssl_url(db_url),
-            **kwargs,
-        )
-    except psycopg.OperationalError as exc:
-        raise psycopg.OperationalError(
-            "Database connection failure "
-            f"({mask_db_url(db_url)}): {exc}"
-        ) from None
-
-
-# ---------------------------------------------------------------------------
-# Envelope cryptography
-# ---------------------------------------------------------------------------
+        return await psycopg.AsyncConnection.connect(enforce_ssl_url(db_url), **_connection_kwargs(kwargs))
+    except psycopg.OperationalError:
+        raise psycopg.OperationalError(f"Database connection failed ({mask_db_url(db_url)}).") from None
 
 def _canonical_aad(context: dict[str, Any]) -> bytes:
-    """Serialize authenticated context deterministically."""
     try:
-        return json.dumps(
-            context,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
-        raise KistError(
-            "Kist encryption context must be JSON-serializable."
-        ) from exc
+        return json.dumps(context, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=True, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise KistError("Context must be valid JSON.") from exc
 
+def _json_bytes(value: Any) -> bytes:
+    # Reject non-string mapping keys, unsupported Python types, and non-finite numbers.
+    def validate(item: Any) -> None:
+        if item is None or type(item) in (str, bool, int, float):
+            return
+        if isinstance(item, list):
+            for v in item:
+                validate(v)
+            return
+        if isinstance(item, dict):
+            if any(not isinstance(k, str) for k in item):
+                raise KistError("JSON mapping keys must be strings.")
+            for v in item.values():
+                validate(v)
+            return
+        raise KistError("Secret values must use JSON types.")
+    try:
+        validate(value)
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False,
+                          allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        raise KistError("Secret value is not valid JSON.") from exc
 
-def _derive_aes_key(
-    password: str,
-    salt: bytes,
-    policy: Argon2Policy,
-) -> bytes:
-    """Derive one AES-256 key from a profile password and envelope salt."""
-    if not isinstance(password, str) or not password:
-        raise MissingKeyError(
-            "A non-empty profile password is required."
-        )
+def _strict_json(raw: bytes) -> Any:
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError("Duplicate JSON key")
+            result[key] = value
+        return result
+    def invalid_constant(value: str) -> None:
+        raise ValueError("Invalid JSON numeric constant")
+    try:
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=pairs,
+                          parse_constant=invalid_constant)
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise DecryptionError("Authenticated plaintext is not valid JSON.") from exc
 
+def _derive_aes_key(password: str, salt: bytes, policy: Argon2Policy) -> bytes:
+    policy.validated()
     if len(salt) != SALT_LENGTH:
-        raise KistError(
-            f"Kist salt must be exactly {SALT_LENGTH} bytes."
-        )
-
-    policy = policy.validated()
-
-    return Argon2id(
-        salt=salt,
-        length=ARGON2_KEY_LENGTH,
-        iterations=policy.iterations,
-        lanes=policy.lanes,
-        memory_cost=policy.memory_cost,
-        ad=None,
-        secret=None,
-    ).derive(password.encode("utf-8"))
-
-
-def _build_envelope(
-    *,
-    salt: bytes,
-    nonce: bytes,
-    aad: bytes,
-    ciphertext: bytes,
-    policy: Argon2Policy,
-) -> bytes:
-    """Build the stable Kist password-v1 binary envelope."""
-    policy = policy.validated()
-
-    if len(salt) != SALT_LENGTH:
-        raise KistError(
-            f"Kist salt must be exactly {SALT_LENGTH} bytes."
-        )
-
-    if len(nonce) != NONCE_LENGTH:
-        raise KistError(
-            f"Kist nonce must be exactly {NONCE_LENGTH} bytes."
-        )
-
-    if len(ciphertext) < AES_GCM_TAG_LENGTH:
-        raise KistError(
-            "AES-GCM ciphertext must include an authentication tag."
-        )
-
-    return b"".join(
-        [
-            MAGIC,
-            bytes(
-                [
-                    ENVELOPE_VERSION,
-                    ALGORITHM_AES_256_GCM,
-                    KDF_ARGON2ID,
-                    ENVELOPE_FLAGS,
-                ]
-            ),
-            struct.pack(">I", policy.memory_cost),
-            struct.pack(">I", policy.iterations),
-            struct.pack(">H", policy.lanes),
-            salt,
-            nonce,
-            hashlib.sha256(aad).digest(),
-            ciphertext,
-        ]
-    )
-
+        raise InvalidEnvelopeError("Invalid salt length.")
+    return Argon2id(salt=salt, length=32, iterations=policy.iterations,
+                    lanes=policy.lanes, memory_cost=policy.memory_cost).derive(_password_bytes(password))
 
 def is_kist_envelope(data: bytes) -> bool:
-    """Return whether bytes have the minimum Kist envelope structure."""
-    return (
-        isinstance(data, bytes)
-        and len(data) >= HEADER_SIZE + AES_GCM_TAG_LENGTH
-        and data.startswith(MAGIC)
-    )
+    """Framing check only; not proof of validity or authentication."""
+    return isinstance(data, bytes) and len(data) >= HEADER_SIZE + WRAPPED_KEY_LENGTH + NONCE_LENGTH + AES_GCM_TAG_LENGTH and data.startswith(MAGIC)
 
-
-def _envelope_policy(envelope: bytes) -> Argon2Policy:
-    """Read validated Argon2id parameters from an envelope."""
-    policy = Argon2Policy(
-        memory_cost=struct.unpack(
-            ">I",
-            envelope[MEMORY_COST_OFFSET:ITERATIONS_OFFSET],
-        )[0],
-        iterations=struct.unpack(
-            ">I",
-            envelope[ITERATIONS_OFFSET:LANES_OFFSET],
-        )[0],
-        lanes=struct.unpack(
-            ">H",
-            envelope[LANES_OFFSET:SALT_OFFSET],
-        )[0],
-    )
-
-    try:
-        return policy.validated()
-    except KistError as exc:
-        raise InvalidEnvelopeError(
-            "Envelope contains unsafe Argon2 parameters."
-        ) from exc
-
-
-def _validate_envelope(
-    envelope: bytes,
-    context: dict[str, Any],
-) -> Argon2Policy:
-    """Validate envelope framing, algorithms, parameters, and context."""
-    if not is_kist_envelope(envelope):
-        raise InvalidEnvelopeError(
-            "Content is not a supported Kist envelope."
-        )
-
-    if envelope[VERSION_OFFSET] != ENVELOPE_VERSION:
-        raise InvalidEnvelopeError(
-            "Unsupported Kist envelope version."
-        )
-
-    if envelope[ALGORITHM_OFFSET] != ALGORITHM_AES_256_GCM:
-        raise InvalidEnvelopeError(
-            "Unsupported Kist envelope encryption algorithm."
-        )
-
-    if envelope[KDF_OFFSET] != KDF_ARGON2ID:
-        raise InvalidEnvelopeError(
-            "Unsupported Kist envelope key-derivation algorithm."
-        )
-
-    if envelope[FLAGS_OFFSET] != ENVELOPE_FLAGS:
-        raise InvalidEnvelopeError(
-            "Unsupported Kist envelope flags."
-        )
-
-    policy = _envelope_policy(envelope)
-    expected_aad_hash = hashlib.sha256(
-        _canonical_aad(context)
-    ).digest()
-
-    actual_aad_hash = envelope[
-        AAD_HASH_OFFSET:CIPHERTEXT_OFFSET
-    ]
-
-    if not secrets.compare_digest(
-        actual_aad_hash,
-        expected_aad_hash,
-    ):
-        raise DecryptionError(
-            "Ciphertext context does not match the requested Kist scope, "
-            "profile, secret key, version, or path."
-        )
-
-    return policy
-
-
-def encrypt_envelope(
-    plaintext: bytes,
-    password: str,
-    context: dict[str, Any],
-    policy: Argon2Policy = Argon2Policy(),
-) -> bytes:
-    """Encrypt plaintext into a password-v1 Kist AES-256-GCM envelope."""
+def encrypt_envelope(plaintext: bytes, password: str, context: dict[str, Any],
+                     policy: Argon2Policy = Argon2Policy()) -> bytes:
+    """Whole-object v1: password wraps random key, random key encrypts content."""
     if not isinstance(plaintext, bytes):
-        raise KistError("Kist plaintext must be bytes.")
-
-    policy = policy.validated()
-    salt = os.urandom(SALT_LENGTH)
-    nonce = os.urandom(NONCE_LENGTH)
+        raise KistError("Plaintext must be bytes.")
+    policy.validated()
+    salt, wrap_nonce, data_key = os.urandom(16), os.urandom(12), os.urandom(32)
     aad = _canonical_aad(context)
+    header = (_PREFIX.pack(MAGIC, ENVELOPE_VERSION, 1, 1, 0, policy.memory_cost, policy.iterations, policy.lanes)
+              + salt + wrap_nonce + hashlib.sha256(aad).digest())
+    wrapping_key = _derive_aes_key(password, salt, policy)
+    wrapped = AESGCM(wrapping_key).encrypt(wrap_nonce, data_key, b"kist-wrap-v1\x00" + header + aad)
+    nonce = os.urandom(12)
+    ciphertext = AESGCM(data_key).encrypt(nonce, plaintext,
+                                         b"kist-content-v1\x00" + header + wrapped + aad)
+    return header + wrapped + nonce + ciphertext
 
-    encryption_key = _derive_aes_key(
-        password,
-        salt,
-        policy,
-    )
-
-    ciphertext = AESGCM(encryption_key).encrypt(
-        nonce,
-        plaintext,
-        aad,
-    )
-
-    return _build_envelope(
-        salt=salt,
-        nonce=nonce,
-        aad=aad,
-        ciphertext=ciphertext,
-        policy=policy,
-    )
-
-
-def decrypt_envelope(
-    envelope: bytes,
-    password: str,
-    context: dict[str, Any],
-) -> bytes:
-    """Authenticate and decrypt a password-v1 Kist envelope."""
-    policy = _validate_envelope(envelope, context)
-
-    salt = envelope[SALT_OFFSET:NONCE_OFFSET]
-    nonce = envelope[NONCE_OFFSET:AAD_HASH_OFFSET]
-    ciphertext = envelope[CIPHERTEXT_OFFSET:]
-
-    decryption_key = _derive_aes_key(
-        password,
-        salt,
-        policy,
-    )
-
+def decrypt_envelope(envelope: bytes, password: str, context: dict[str, Any]) -> bytes:
+    """Authenticate and decrypt the sole supported random-key v1 envelope."""
+    if not is_kist_envelope(envelope):
+        raise InvalidEnvelopeError("Not a Kist envelope.")
+    magic, version, algorithm, kdf, flags, memory, iterations, lanes = _PREFIX.unpack(envelope[:_PREFIX.size])
+    if version != ENVELOPE_VERSION or (algorithm, kdf, flags) != (1, 1, 0):
+        raise InvalidEnvelopeError("Unsupported envelope version or algorithms.")
     try:
-        return AESGCM(decryption_key).decrypt(
-            nonce,
-            ciphertext,
-            _canonical_aad(context),
-        )
+        policy = Argon2Policy(memory, iterations, lanes).validated()
+    except KistError as exc:
+        raise InvalidEnvelopeError("KDF parameters exceed supported reader limits.") from exc
+    salt = envelope[18:34]
+    wrap_nonce = envelope[34:46]
+    aad = _canonical_aad(context)
+    if not hmac.compare_digest(envelope[46:78], hashlib.sha256(aad).digest()):
+        raise DecryptionError("Envelope context mismatch.")
+    if len(envelope) < HEADER_SIZE + WRAPPED_KEY_LENGTH + 12 + 16:
+        raise InvalidEnvelopeError("Truncated v1 envelope.")
+    wrapping_key = _derive_aes_key(password, salt, policy)
+    try:
+        header = envelope[:HEADER_SIZE]
+        wrapped = envelope[HEADER_SIZE:HEADER_SIZE + WRAPPED_KEY_LENGTH]
+        data_key = AESGCM(wrapping_key).decrypt(wrap_nonce, wrapped, b"kist-wrap-v1\x00" + header + aad)
+        start = HEADER_SIZE + WRAPPED_KEY_LENGTH
+        return AESGCM(data_key).decrypt(envelope[start:start + 12], envelope[start + 12:],
+                                         b"kist-content-v1\x00" + header + wrapped + aad)
     except InvalidTag as exc:
-        raise DecryptionError(
-            "Ciphertext authentication failed; the password may be wrong "
-            "or data was modified."
-        ) from exc
+        raise DecryptionError("Wrong password or modified ciphertext.") from exc
 
+def git_context(profile_name: str, filepath: str, scope: Optional[KistScope] = None) -> dict[str, str]:
+    """Build authenticated context for whole-file Git encryption.
 
-# ---------------------------------------------------------------------------
-# Git envelope context
-# ---------------------------------------------------------------------------
+    Callers must pass a canonical repository-relative path on every platform.
+    Renaming paths/scope/repository IDs requires decrypting and re-encrypting.
+    """
+    scope = (scope or KistScope.from_environment()).validated()
+    return {"format": "kist-git-v1", "organization": scope.organization,
+            "project": scope.project, "profile": _validate_profile_name(profile_name),
+            "repository": os.getenv("KIST_REPOSITORY_ID", "local-repository"),
+            "path": os.path.normpath(filepath).replace("\\", "/")}
 
-def git_context(
-    profile_name: str,
-    filepath: str,
-    scope: Optional[KistScope] = None,
-) -> dict[str, str]:
-    """Build authenticated context for a Git clean/smudge secret file."""
-    resolved_scope = (
-        scope or KistScope.from_environment()
-    ).validated()
+@dataclass(frozen=True)
+class _KeyBundle:
+    id: uuid.UUID
+    content_key: bytes
+    index_key: bytes
 
-    return {
-        "format": "kist-git-v1",
-        "organization": resolved_scope.organization,
-        "project": resolved_scope.project,
-        "profile": _validate_profile_name(profile_name),
-        "repository": os.getenv(
-            "KIST_REPOSITORY_ID",
-            "local-repository",
-        ),
-        "path": os.path.normpath(filepath).replace("\\", "/"),
-    }
+# Reject duplicate YAML keys instead of silently keeping the last value.
+class _UniqueSafeLoader(yaml.SafeLoader):
+    pass
 
+def _unique_mapping(loader: _UniqueSafeLoader, node: yaml.MappingNode, deep: bool = False) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if not isinstance(key, str) or key in result:
+            raise KistError("YAML keys must be unique strings; merge keys are not supported.")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
 
-# ---------------------------------------------------------------------------
-# Database-backed Kist store
-# ---------------------------------------------------------------------------
+_UniqueSafeLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, _unique_mapping)
 
 class Kist:
-    """PostgreSQL-backed, password-v1 Kist store.
+    """One scoped password-only store. No decrypted keys are cached between calls.
 
-    A Kist instance is scoped to exactly one organization, project, and
-    profile. The caller must initialize the schema explicitly using
-    :meth:`init_db` before normal read/write operations.
-
-    Kist 0.1.0 assumes a serialized writer per profile. Concurrent writes to
-    the same logical secret key are not supported by the public API.
+    Initialization is explicit. Scope rows may be created on first use; key
+    bundles are created only by writes. Methods open their own READ COMMITTED
+    transactions. Restrict the database role and search_path to trusted schemas.
     """
-
-    def __init__(
-        self,
-        profile_name: str = "default",
-        master_password: Optional[str] = None,
-        db_url: Optional[str] = None,
-        scope: Optional[KistScope] = None,
-    ) -> None:
-        """Create a scoped Kist store without mutating the database schema."""
-        self.profile_name = _validate_profile_name(profile_name)
-        self.scope = (
-            scope or KistScope.from_environment()
-        ).validated()
-
-        self.master_password = (
-            master_password
-            or get_profile_password(self.profile_name)
-        )
-
-        if not self.master_password:
-            raise MissingKeyError(
-                "No encryption key configured for profile "
-                f"{self.profile_name!r}."
-            )
-
-        configured_db_url = (
-            KIST_DATABASE_URL
-            if db_url is None
-            else db_url
-        )
-
-        self.db_url = (
-            enforce_ssl_url(configured_db_url)
-            if configured_db_url
-            else None
-        )
-
+    def __init__(self, profile_name: Optional[str] = None, master_password: Optional[str] = None,
+                 db_url: Optional[str] = None, scope: Optional[KistScope] = None) -> None:
+        resolved_profile = profile_name if profile_name is not None else os.getenv("KIST_PROFILE", "default")
+        self.profile_name = _validate_profile_name(resolved_profile)
+        self.scope = (scope or KistScope.from_environment()).validated()
+        self.master_password = master_password if master_password is not None else get_profile_password(self.profile_name)
+        if self.master_password is not None:
+            _password_bytes(self.master_password)
+        configured = os.getenv("KIST_DATABASE_URL") if db_url is None else db_url
+        self.db_url = enforce_ssl_url(configured) if configured else None
         self.organization_id: Optional[uuid.UUID] = None
         self.project_id: Optional[uuid.UUID] = None
         self.profile_id: Optional[uuid.UUID] = None
 
-    def init_db(self) -> None:
-        """Explicitly create the Kist 0.1.0 schema.
+    def _require_password(self) -> str:
+        if not self.master_password:
+            raise MissingKeyError(f"No encryption key configured for profile {self.profile_name!r}.")
+        return self.master_password
 
-        This method is intended for a setup/migration command or controlled
-        deployment job. Runtime applications should normally receive only DML
-        privileges and should not call it during startup.
-        """
+    def _require_database(self) -> str:
         if not self.db_url:
             raise KistError("KIST_DATABASE_URL is not configured.")
+        return self.db_url
 
-        with safe_db_connect(self.db_url) as connection:
-            connection.execute(SQL_SCHEMA)
-
-    def get_or_create_scope(
-        self,
-    ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
-        """Find or create this instance's organization/project/profile rows."""
-        if not self.db_url:
-            raise KistError("KIST_DATABASE_URL is not configured.")
-
-        with safe_db_connect(self.db_url) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    INSERT INTO kist_organizations (id, slug)
-                    VALUES (%s, %s)
-                    ON CONFLICT (slug)
-                    DO UPDATE SET slug = EXCLUDED.slug
-                    RETURNING id
-                    """,
-                    (
-                        uuid.uuid4(),
-                        self.scope.organization,
-                    ),
-                )
-                organization_id = uuid.UUID(
-                    str(cursor.fetchone()[0])
-                )
-
-                cursor.execute(
-                    """
-                    INSERT INTO kist_projects (
-                        id,
-                        organization_id,
-                        slug
-                    )
-                    VALUES (%s, %s, %s)
-                    ON CONFLICT (organization_id, slug)
-                    DO UPDATE SET slug = EXCLUDED.slug
-                    RETURNING id
-                    """,
-                    (
-                        uuid.uuid4(),
-                        organization_id,
-                        self.scope.project,
-                    ),
-                )
-                project_id = uuid.UUID(
-                    str(cursor.fetchone()[0])
-                )
-
-                cursor.execute(
-                    """
-                    INSERT INTO kist_profiles (
-                        id,
-                        organization_id,
-                        project_id,
-                        profile_name
-                    )
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (project_id, profile_name)
-                    DO UPDATE
-                    SET profile_name = EXCLUDED.profile_name
-                    RETURNING id
-                    """,
-                    (
-                        uuid.uuid4(),
-                        organization_id,
-                        project_id,
-                        self.profile_name,
-                    ),
-                )
-                profile_id = uuid.UUID(
-                    str(cursor.fetchone()[0])
-                )
-
-        self.organization_id = organization_id
-        self.project_id = project_id
-        self.profile_id = profile_id
-
-        return (
-            organization_id,
-            project_id,
-            profile_id,
-        )
-
-    def _ensure_scope(
-        self,
-    ) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
-        """Return initialized scope IDs, creating scope rows when needed."""
-        if (
-            self.organization_id is not None
-            and self.project_id is not None
-            and self.profile_id is not None
-        ):
-            return (
-                self.organization_id,
-                self.project_id,
-                self.profile_id,
-            )
-
-        return self.get_or_create_scope()
-
-    @staticmethod
-    def flatten(
-        data: dict[str, Any],
-        parent_key: str = "",
-        sep: str = ".",
-    ) -> dict[str, Any]:
-        """Flatten nested string-keyed mappings into dot-separated keys."""
-        if not isinstance(data, dict):
-            raise KistError("Secret data must be a mapping.")
-
-        flattened: dict[str, Any] = {}
-
-        for raw_key, value in data.items():
-            if not isinstance(raw_key, str):
-                raise KistError(
-                    "Secret YAML mapping keys must be strings."
-                )
-
-            key = raw_key.strip()
-
-            if not key or sep in key or "\x00" in key:
-                raise KistError(
-                    "Secret YAML mapping keys must be non-empty strings "
-                    f"without {sep!r} or NUL bytes."
-                )
-
-            name = (
-                f"{parent_key}{sep}{key}"
-                if parent_key
-                else key
-            )
-
-            if isinstance(value, dict):
-                flattened.update(
-                    Kist.flatten(
-                        value,
-                        parent_key=name,
-                        sep=sep,
-                    )
-                )
-            else:
-                flattened[_validate_secret_key(name)] = value
-
-        return flattened
-
-    @staticmethod
-    def unflatten(
-        data: dict[str, Any],
-        sep: str = ".",
-    ) -> dict[str, Any]:
-        """Reconstruct nested mappings from dot-separated secret keys."""
-        result: dict[str, Any] = {}
-
-        for raw_key, value in data.items():
-            key = _validate_secret_key(str(raw_key))
-            current = result
-            parts = key.split(sep)
-
-            for part in parts[:-1]:
-                existing = current.get(part)
-
-                if existing is None:
-                    current[part] = {}
-
-                elif not isinstance(existing, dict):
-                    raise KistError(
-                        "Cannot reconstruct nested secret path: "
-                        f"{key!r}."
-                    )
-
-                current = current[part]
-
-            leaf = parts[-1]
-
-            if leaf in current and isinstance(current[leaf], dict):
-                raise KistError(
-                    "Cannot reconstruct nested secret path: "
-                    f"{key!r}."
-                )
-
-            current[leaf] = value
-
-        return result
-
-    def _db_context(
-        self,
-        secret_key: str,
-        secret_version: int,
-    ) -> dict[str, str]:
-        """Build immutable authenticated context for one database value."""
-        organization_id, project_id, profile_id = self._ensure_scope()
-        key = _validate_secret_key(secret_key)
-
-        if secret_version < 1:
-            raise KistError(
-                "Secret versions must be positive integers."
-            )
-
-        return {
-            "format": "kist-db-v1",
-            "organization_id": str(organization_id),
-            "project_id": str(project_id),
-            "profile_id": str(profile_id),
-            "profile": self.profile_name,
-            "secret_key": key,
-            "secret_version": str(secret_version),
-        }
-
-    def _encrypt_value(
-        self,
-        value: Any,
-        *,
-        secret_key: str,
-        secret_version: int,
-    ) -> bytes:
-        """Serialize and encrypt one JSON-compatible secret value."""
-        try:
-            plaintext = json.dumps(
-                value,
-                separators=(",", ":"),
-                ensure_ascii=False,
-            ).encode("utf-8")
-        except (TypeError, ValueError) as exc:
-            raise KistError(
-                f"Secret value for {secret_key!r} is not JSON-serializable."
-            ) from exc
-
-        return encrypt_envelope(
-            plaintext,
-            self.master_password,
-            self._db_context(
-                secret_key,
-                secret_version,
-            ),
-        )
-
-    def _decrypt_value(
-        self,
-        blob: bytes,
-        *,
-        secret_key: str,
-        secret_version: int,
-        crypto_mode: str,
-    ) -> Any:
-        """Decrypt and deserialize one stored password-v1 secret value."""
-        if crypto_mode != KEY_MODE_PASSWORD:
-            raise KistError(
-                "Unsupported secret crypto mode: "
-                f"{crypto_mode!r}."
-            )
-
-        plaintext = decrypt_envelope(
-            blob,
-            self.master_password,
-            self._db_context(
-                secret_key,
-                secret_version,
-            ),
-        )
-
-        try:
-            return json.loads(plaintext.decode("utf-8"))
-        except UnicodeDecodeError as exc:
-            raise DecryptionError(
-                "Stored Kist plaintext is not valid UTF-8 JSON."
-            ) from exc
-        except json.JSONDecodeError as exc:
-            raise DecryptionError(
-                "Stored Kist plaintext is not valid JSON."
-            ) from exc
-
-    def _notification_payload(
-        self,
-        secret_key: str,
-    ) -> str:
-        """Build a non-secret PostgreSQL cache-invalidation notification."""
-        organization_id, project_id, profile_id = self._ensure_scope()
-
-        return json.dumps(
-            {
-                "organization_id": str(organization_id),
-                "project_id": str(project_id),
-                "profile_name": self.profile_name,
-                "profile_id": str(profile_id),
-                "secret_key": _validate_secret_key(secret_key),
-            },
-            separators=(",", ":"),
-        )
-
-    def _next_secret_version(
-        self,
-        cursor: psycopg.Cursor[Any],
-        secret_key: str,
-    ) -> int:
-        """Read and lock an existing secret row before replacing it.
-
-        Kist 0.1.0 expects a serialized writer per profile. ``FOR UPDATE``
-        protects updates to an existing record inside a transaction. A
-        concurrent first insert is surfaced as a database integrity error rather
-        than silently overwriting an unknown value.
-        """
-        _, _, profile_id = self._ensure_scope()
-
-        cursor.execute(
-            """
-            SELECT secret_version
-            FROM kist
-            WHERE profile_id = %s
-              AND secret_key = %s
-            FOR UPDATE
-            """,
-            (
-                profile_id,
-                secret_key,
-            ),
-        )
-
+    @classmethod
+    def _check_schema(cls, cursor: psycopg.Cursor[Any]) -> None:
+        cursor.execute("SELECT to_regclass('kist_schema')")
+        if cursor.fetchone()[0] is None:
+            raise SchemaVersionError("Initialize the v1 schema explicitly with init_db().")
+        cursor.execute("SELECT version FROM kist_schema WHERE singleton = TRUE")
         row = cursor.fetchone()
+        if row is None or row[0] != SCHEMA_VERSION:
+            raise SchemaVersionError("Unsupported Kist schema version.")
 
-        return int(row[0]) + 1 if row else 1
+    def init_db(self) -> None:
+        with safe_db_connect(self._require_database()) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_xact_lock(%s)", (_lock_id("kist-v1-schema"),))
+                cursor.execute(SQL_SCHEMA)
+                self._check_schema(cursor)
 
-    def _store_encrypted_value(
-        self,
-        cursor: psycopg.Cursor[Any],
-        *,
-        secret_key: str,
-        encrypted_blob: bytes,
-        secret_version: int,
-    ) -> None:
-        """Insert or replace one encrypted secret row in the active transaction."""
-        _, _, profile_id = self._ensure_scope()
+    def get_or_create_scope(self) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+        with safe_db_connect(self._require_database()) as connection:
+            with connection.cursor() as cursor:
+                self._check_schema(cursor)
+                cursor.execute("""INSERT INTO kist_organizations (id, slug) VALUES (%s, %s)
+                    ON CONFLICT (slug) DO UPDATE SET slug = EXCLUDED.slug RETURNING id""",
+                    (uuid.uuid4(), self.scope.organization))
+                org = uuid.UUID(str(cursor.fetchone()[0]))
+                cursor.execute("""INSERT INTO kist_projects (id, organization_id, slug) VALUES (%s, %s, %s)
+                    ON CONFLICT (organization_id, slug) DO UPDATE SET slug = EXCLUDED.slug RETURNING id""",
+                    (uuid.uuid4(), org, self.scope.project))
+                project = uuid.UUID(str(cursor.fetchone()[0]))
+                cursor.execute("""INSERT INTO kist_profiles (id, project_id, profile_name) VALUES (%s, %s, %s)
+                    ON CONFLICT (project_id, profile_name) DO UPDATE
+                    SET profile_name = EXCLUDED.profile_name RETURNING id""",
+                    (uuid.uuid4(), project, self.profile_name))
+                profile = uuid.UUID(str(cursor.fetchone()[0]))
+        self.organization_id, self.project_id, self.profile_id = org, project, profile
+        return org, project, profile
 
-        cursor.execute(
-            """
-            INSERT INTO kist (
-                id,
-                profile_id,
-                secret_key,
-                encrypted_blob,
-                crypto_mode,
-                crypto_version,
-                secret_version,
-                updated_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
-            ON CONFLICT (profile_id, secret_key)
-            DO UPDATE
-            SET encrypted_blob = EXCLUDED.encrypted_blob,
-                crypto_mode = EXCLUDED.crypto_mode,
-                crypto_version = EXCLUDED.crypto_version,
-                secret_version = EXCLUDED.secret_version,
-                updated_at = NOW()
-            """,
-            (
-                uuid.uuid4(),
-                profile_id,
-                secret_key,
-                encrypted_blob,
-                KEY_MODE_PASSWORD,
-                ENVELOPE_VERSION,
-                secret_version,
-            ),
-        )
+    def _ensure_scope(self) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
+        if self.organization_id is None or self.project_id is None or self.profile_id is None:
+            return self.get_or_create_scope()
+        return self.organization_id, self.project_id, self.profile_id
 
-        cursor.execute(
-            "SELECT pg_notify(%s, %s)",
-            (
-                "kist_secret_updated",
-                self._notification_payload(secret_key),
-            ),
-        )
+    def _scope_context(self) -> dict[str, str]:
+        org, project, profile = self._ensure_scope()
+        return {"organization_id": str(org), "project_id": str(project), "profile_id": str(profile)}
 
-    def set(
-        self,
-        key: str,
-        value: Any,
-        max_retries: int = 3,
-    ) -> int:
-        """Store one JSON-serializable secret and return its new version.
+    def _bundle_context(self, bundle_id: uuid.UUID) -> dict[str, str]:
+        return {"format": "kist-db-key-bundle-v1", **self._scope_context(),
+                "bundle_id": str(bundle_id), "bundle_version": "1", "access_mode": KEY_MODE_PASSWORD}
 
-        Uses row-level locking (``FOR UPDATE``) and an automatic retry loop to
-        safely serialize concurrent updates and prevent stale version writes.
-        """
-        if not self.db_url:
-            raise KistError("KIST_DATABASE_URL is not configured.")
+    def _load_bundle(self, cursor: psycopg.Cursor[Any], *, create: bool = False) -> Optional[_KeyBundle]:
+        _, _, profile = self._ensure_scope()
+        cursor.execute("""SELECT id, access_mode, bundle_version, wrapped_bundle
+                          FROM kist_key_bundles WHERE profile_id = %s""", (profile,))
+        row = cursor.fetchone()
+        if row is None:
+            if not create:
+                return None
+            bundle = _KeyBundle(uuid.uuid4(), os.urandom(32), os.urandom(32))
+            # Binary payload contains two separately generated keys.
+            wrapped = encrypt_envelope(b"KKB1" + bundle.content_key + bundle.index_key,
+                                       self._require_password(), self._bundle_context(bundle.id))
+            cursor.execute("""INSERT INTO kist_key_bundles
+                (id, profile_id, access_mode, bundle_version, wrapped_bundle)
+                VALUES (%s, %s, %s, 1, %s)""", (bundle.id, profile, KEY_MODE_PASSWORD, wrapped))
+            return bundle
+        bundle_id, mode, version, blob = row
+        if mode != KEY_MODE_PASSWORD or version != 1:
+            raise InvalidEnvelopeError("Unsupported key access mode or bundle version; no fallback permitted.")
+        raw_blob = bytes(blob)
+        if len(raw_blob) < 5 or raw_blob[4] != ENVELOPE_VERSION:
+            raise InvalidEnvelopeError("Database key bundles require envelope v1.")
+        raw = decrypt_envelope(raw_blob, self._require_password(), self._bundle_context(uuid.UUID(str(bundle_id))))
+        if len(raw) != 68 or not raw.startswith(b"KKB1"):
+            raise DecryptionError("Invalid key bundle payload.")
+        return _KeyBundle(uuid.UUID(str(bundle_id)), raw[4:36], raw[36:68])
 
-        secret_key = _validate_secret_key(key)
+    def _lookup_token(self, bundle: _KeyBundle, key: str) -> bytes:
+        context = {"format": "kist-name-index-v1", **self._scope_context(),
+                   "secret_key": _validate_secret_key(key)}
+        return hmac.new(bundle.index_key, _canonical_aad(context), hashlib.sha256).digest()
+
+    def _row_context(self, bundle: _KeyBundle, row_id: uuid.UUID, token: bytes, version: int) -> bytes:
+        if type(version) is not int or version < 1:
+            raise InvalidEnvelopeError("Invalid secret version.")
+        return _canonical_aad({"format": "kist-db-record-v1", **self._scope_context(),
+                               "row_id": str(row_id), "bundle_id": str(bundle.id),
+                               "lookup_token": token.hex(), "secret_version": str(version),
+                               "crypto_version": "1"})
+
+    def _decode_row(self, bundle: _KeyBundle, row: Any, expected_key: Optional[str] = None) -> tuple[str, Any]:
+        row_id, token, bundle_id, crypto_version, version, blob = row
+        token, blob = bytes(token), bytes(blob)
+        if uuid.UUID(str(bundle_id)) != bundle.id or crypto_version != 1:
+            raise InvalidEnvelopeError("Unsupported record key reference or format.")
+        if len(token) != 32 or len(blob) < len(_ROW_MAGIC) + 12 + 16 or not blob.startswith(_ROW_MAGIC):
+            raise InvalidEnvelopeError("Malformed encrypted database record.")
+        start = len(_ROW_MAGIC)
+        aad = self._row_context(bundle, uuid.UUID(str(row_id)), token, int(version))
+        try:
+            raw = AESGCM(bundle.content_key).decrypt(blob[start:start + 12], blob[start + 12:], _ROW_MAGIC + aad)
+        except InvalidTag as exc:
+            raise DecryptionError("Database record authentication failed.") from exc
+        record = _strict_json(raw)
+        if not isinstance(record, dict) or set(record) != {"key", "value"}:
+            raise DecryptionError("Invalid encrypted record payload.")
+        try:
+            key = _validate_secret_key(record["key"])
+        except KistError as exc:
+            raise DecryptionError("Invalid encrypted secret name.") from exc
+        if key != record["key"] or not hmac.compare_digest(token, self._lookup_token(bundle, key)):
+            raise DecryptionError("Encrypted name does not match lookup token.")
+        if expected_key is not None and key != expected_key:
+            raise DecryptionError("Encrypted name does not match requested name.")
+        return key, record["value"]
+
+    def _lock_profile(self, cursor: psycopg.Cursor[Any]) -> None:
+        _, _, profile = self._ensure_scope()
+        cursor.execute("SELECT pg_advisory_xact_lock(%s)", (_lock_id(f"kist-v1-profile:{profile}"),))
+
+    def _notify(self, cursor: psycopg.Cursor[Any], row_id: uuid.UUID, event: str) -> None:
+        cursor.execute("SELECT pg_notify(%s, %s)", ("kist_secret_updated", json.dumps(
+            {"format": "kist-invalidation-v1", "profile_id": str(self.profile_id),
+             "secret_id": str(row_id), "event": event}, separators=(",", ":"))))
+
+    def _write(self, operation: Callable[[psycopg.Cursor[Any]], Any], max_retries: int = 3) -> Any:
+        if type(max_retries) is not int or not 1 <= max_retries <= 20:
+            raise KistError("max_retries must be 1..20.")
         self._ensure_scope()
-
         for attempt in range(max_retries):
             try:
-                with safe_db_connect(self.db_url) as connection:
+                with safe_db_connect(self._require_database()) as connection:
                     with connection.cursor() as cursor:
-                        secret_version = self._next_secret_version(
-                            cursor,
-                            secret_key,
-                        )
+                        cursor.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                        self._check_schema(cursor)
+                        self._lock_profile(cursor)
+                        result = operation(cursor)
+                return result
+            except (psycopg.errors.SerializationFailure, psycopg.errors.DeadlockDetected) as exc:
+                if attempt + 1 == max_retries:
+                    raise ConcurrentWriteError("Mutation exhausted transaction retries.") from exc
+                time.sleep(min(0.02 * 2 ** attempt, 0.5) + secrets.randbelow(20) / 1000)
+        raise AssertionError("Unreachable retry exit")
 
-                        encrypted_blob = self._encrypt_value(
-                            value,
-                            secret_key=secret_key,
-                            secret_version=secret_version,
-                        )
+    def _store(self, cursor: psycopg.Cursor[Any], bundle: _KeyBundle, key: str, value: Any) -> int:
+        token = self._lookup_token(bundle, key)
+        cursor.execute("""SELECT id, lookup_token, key_bundle_id, crypto_version, secret_version, encrypted_blob
+            FROM kist_secrets WHERE profile_id = %s AND lookup_token = %s""", (self.profile_id, token))
+        old = cursor.fetchone()
+        if old:
+            self._decode_row(bundle, old, key)
+        row_id = uuid.UUID(str(old[0])) if old else uuid.uuid4()
+        version = int(old[4]) + 1 if old else 1
+        if version > 2 ** 63 - 1:
+            raise KistError("Secret version exhausted.")
+        nonce = os.urandom(12)
+        aad = self._row_context(bundle, row_id, token, version)
+        blob = _ROW_MAGIC + nonce + AESGCM(bundle.content_key).encrypt(
+            nonce, _json_bytes({"key": key, "value": value}), _ROW_MAGIC + aad)
+        if old:
+            cursor.execute("""UPDATE kist_secrets SET encrypted_blob = %s,
+                secret_version = %s, updated_at = NOW() WHERE id = %s AND profile_id = %s""",
+                (blob, version, row_id, self.profile_id))
+        else:
+            cursor.execute("""INSERT INTO kist_secrets
+                (id, profile_id, lookup_token, key_bundle_id, crypto_version, secret_version, encrypted_blob)
+                VALUES (%s, %s, %s, %s, 1, %s, %s)""",
+                (row_id, self.profile_id, token, bundle.id, version, blob))
+        self._notify(cursor, row_id, "updated")
+        return version
 
-                        self._store_encrypted_value(
-                            cursor,
-                            secret_key=secret_key,
-                            encrypted_blob=encrypted_blob,
-                            secret_version=secret_version,
-                        )
-
-                return secret_version
-
-            except (
-                psycopg.errors.UniqueViolation,
-                psycopg.errors.SerializationFailure,
-                psycopg.errors.DeadlockDetected,
-            ) as exc:
-                if attempt == max_retries - 1:
-                    raise ConcurrentWriteError(
-                        "Concurrent write conflict for secret "
-                        f"{secret_key!r}. Retry through the serialized writer."
-                    ) from exc
-                continue
+    def set(self, key: str, value: Any, max_retries: int = 3) -> int:
+        key = _validate_secret_key(key)
+        _json_bytes(value)
+        def operation(cursor: psycopg.Cursor[Any]) -> int:
+            bundle = self._load_bundle(cursor, create=True)
+            assert bundle is not None
+            return self._store(cursor, bundle, key, value)
+        return self._write(operation, max_retries)
 
     def get(self, key: str) -> Any:
-        """Return one decrypted secret value."""
-        if not self.db_url:
-            raise KistError("KIST_DATABASE_URL is not configured.")
-
-        secret_key = _validate_secret_key(key)
-        _, _, profile_id = self._ensure_scope()
-
-        with safe_db_connect(self.db_url) as connection:
+        key = _validate_secret_key(key)
+        self._ensure_scope()
+        with safe_db_connect(self._require_database()) as connection:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT
-                        encrypted_blob,
-                        secret_version,
-                        crypto_mode
-                    FROM kist
-                    WHERE profile_id = %s
-                      AND secret_key = %s
-                    """,
-                    (
-                        profile_id,
-                        secret_key,
-                    ),
-                )
+                cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                self._check_schema(cursor)
+                bundle = self._load_bundle(cursor)
+                if bundle is None:
+                    raise KeyError(key)
+                cursor.execute("""SELECT id, lookup_token, key_bundle_id, crypto_version, secret_version, encrypted_blob
+                    FROM kist_secrets WHERE profile_id = %s AND lookup_token = %s""",
+                    (self.profile_id, self._lookup_token(bundle, key)))
                 row = cursor.fetchone()
-
-        if row is None:
-            raise KeyError(
-                f"Secret key {secret_key!r} was not found for profile "
-                f"{self.profile_name!r}."
-            )
-
-        return self._decrypt_value(
-            bytes(row[0]),
-            secret_key=secret_key,
-            secret_version=int(row[1]),
-            crypto_mode=str(row[2]),
-        )
+                if row is None:
+                    raise KeyError(key)
+                return self._decode_row(bundle, row, key)[1]
 
     def delete(self, key: str) -> bool:
-        """Delete one secret and notify listeners when a row existed."""
-        if not self.db_url:
-            raise KistError("KIST_DATABASE_URL is not configured.")
+        key = _validate_secret_key(key)
+        def operation(cursor: psycopg.Cursor[Any]) -> bool:
+            bundle = self._load_bundle(cursor)
+            if bundle is None:
+                return False
+            cursor.execute("""SELECT id, lookup_token, key_bundle_id, crypto_version, secret_version, encrypted_blob
+                FROM kist_secrets WHERE profile_id = %s AND lookup_token = %s""",
+                (self.profile_id, self._lookup_token(bundle, key)))
+            row = cursor.fetchone()
+            if row is None:
+                return False
+            self._decode_row(bundle, row, key)
+            row_id = uuid.UUID(str(row[0]))
+            cursor.execute("DELETE FROM kist_secrets WHERE id = %s AND profile_id = %s", (row_id, self.profile_id))
+            self._notify(cursor, row_id, "deleted")
+            return True
+        return self._write(operation)
 
-        secret_key = _validate_secret_key(key)
-        _, _, profile_id = self._ensure_scope()
+    @staticmethod
+    def flatten(data: dict[str, Any], parent_key: str = "", sep: str = ".") -> dict[str, Any]:
+        if sep != ".":
+            raise KistError("Only the dot path separator is supported.")
+        if not isinstance(data, dict):
+            raise KistError("Secret data must be a mapping.")
+        result: dict[str, Any] = {}
+        active: set[int] = set()
+        def walk(mapping: dict[str, Any], parent: str) -> None:
+            if id(mapping) in active:
+                raise KistError("Recursive YAML mappings are unsupported.")
+            active.add(id(mapping))
+            normalized: set[str] = set()
+            try:
+                for raw_key, value in mapping.items():
+                    if not isinstance(raw_key, str):
+                        raise KistError("YAML mapping keys must be strings.")
+                    segment = raw_key.strip()
+                    if not segment or "." in segment or "\x00" in segment or segment in normalized:
+                        raise KistError("Invalid or normalization-colliding YAML key.")
+                    normalized.add(segment)
+                    name = _validate_secret_key(f"{parent}.{segment}" if parent else segment)
+                    if isinstance(value, dict) and value:
+                        walk(value, name)
+                    else:
+                        _json_bytes(value)
+                        result[name] = value
+            finally:
+                active.remove(id(mapping))
+        walk(data, parent_key)
+        return result
 
-        with safe_db_connect(self.db_url) as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    DELETE FROM kist
-                    WHERE profile_id = %s
-                      AND secret_key = %s
-                    RETURNING id
-                    """,
-                    (
-                        profile_id,
-                        secret_key,
-                    ),
-                )
-                deleted = cursor.fetchone() is not None
+    @staticmethod
+    def unflatten(data: dict[str, Any], sep: str = ".") -> dict[str, Any]:
+        if sep != ".":
+            raise KistError("Only the dot separator is supported.")
+        root: dict[str, Any] = {}
+        leaves: set[tuple[str, ...]] = set()
+        normalized: set[str] = set()
+        for raw_key, value in data.items():
+            key = _validate_secret_key(raw_key)
+            if key in normalized:
+                raise KistError("Normalization-colliding secret paths.")
+            normalized.add(key)
+            parts = key.split(".")
+            current = root
+            for index, part in enumerate(parts[:-1], 1):
+                if tuple(parts[:index]) in leaves:
+                    raise KistError("Conflicting leaf and nested secret paths.")
+                current = current.setdefault(part, {})
+            if parts[-1] in current:
+                raise KistError("Conflicting leaf and nested secret paths.")
+            current[parts[-1]] = value
+            leaves.add(tuple(parts))
+        return root
 
-                if deleted:
-                    cursor.execute(
-                        "SELECT pg_notify(%s, %s)",
-                        (
-                            "kist_secret_updated",
-                            self._notification_payload(secret_key),
-                        ),
-                    )
-
-        return deleted
-
-    def lock_yaml(
-        self,
-        yaml_string: str,
-        prune: bool = False,
-    ) -> tuple[int, int]:
-        """Encrypt a YAML mapping into the scoped PostgreSQL secret store.
-
-        Args:
-            yaml_string:
-                YAML document with a mapping at its root.
-
-            prune:
-                When true, delete secrets currently stored in this profile but
-                absent from the supplied YAML mapping.
-
-        Returns:
-            A pair of ``(stored_or_updated_count, pruned_count)``.
-
-        The write path is protected by a PostgreSQL transaction-scoped advisory
-        lock (``pg_advisory_xact_lock``) on the active profile, serializing
-        concurrent CI/deployment runs safely.
-        """
-        if not self.db_url:
-            raise KistError("KIST_DATABASE_URL is not configured.")
-
+    def lock_yaml(self, yaml_string: str, prune: bool = False) -> tuple[int, int]:
         try:
-            loaded = yaml.safe_load(yaml_string)
-        except yaml.YAMLError as exc:
-            raise KistError("Secret YAML could not be parsed safely.") from exc
-
-        if loaded is None:
-            loaded = {}
-
-        if not isinstance(loaded, dict):
-            raise KistError("Secret YAML root must be a mapping.")
-
-        flattened = self.flatten(loaded)
-        self._ensure_scope()
-
-        pruned_count = 0
-
-        try:
-            with safe_db_connect(self.db_url) as connection:
-                with connection.cursor() as cursor:
-                    _, _, profile_id = self._ensure_scope()
-
-                    # Acquire transaction-scoped advisory lock on the profile to serialize concurrent lock runs
-                    cursor.execute(
-                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                        (f"kist_profile:{profile_id}",),
-                    )
-
-                    if prune:
-                        cursor.execute(
-                            """
-                            SELECT secret_key
-                            FROM kist
-                            WHERE profile_id = %s
-                            FOR UPDATE
-                            """,
-                            (profile_id,),
-                        )
-
-                        existing_keys = {
-                            str(row[0])
-                            for row in cursor.fetchall()
-                        }
-                        keys_to_delete = sorted(
-                            existing_keys - set(flattened)
-                        )
-
-                        if keys_to_delete:
-                            cursor.execute(
-                                """
-                                DELETE FROM kist
-                                WHERE profile_id = %s
-                                  AND secret_key = ANY(%s)
-                                """,
-                                (
-                                    profile_id,
-                                    keys_to_delete,
-                                ),
-                            )
-                            pruned_count = len(keys_to_delete)
-
-                            for secret_key in keys_to_delete:
-                                cursor.execute(
-                                    "SELECT pg_notify(%s, %s)",
-                                    (
-                                        "kist_secret_updated",
-                                        self._notification_payload(
-                                            secret_key
-                                        ),
-                                    ),
-                                )
-
-                    for secret_key, value in flattened.items():
-                        secret_version = self._next_secret_version(
-                            cursor,
-                            secret_key,
-                        )
-
-                        encrypted_blob = self._encrypt_value(
-                            value,
-                            secret_key=secret_key,
-                            secret_version=secret_version,
-                        )
-
-                        self._store_encrypted_value(
-                            cursor,
-                            secret_key=secret_key,
-                            encrypted_blob=encrypted_blob,
-                            secret_version=secret_version,
-                        )
-
-            return len(flattened), pruned_count
-
-        except psycopg.errors.UniqueViolation as exc:
-            raise ConcurrentWriteError(
-                "Concurrent first-write conflict while locking YAML. "
-                "Retry through the serialized profile writer."
-            ) from exc
+            loaded = yaml.load(yaml_string, Loader=_UniqueSafeLoader)
+        except (yaml.YAMLError, RecursionError) as exc:
+            raise KistError("Invalid secret YAML.") from exc
+        flattened = self.flatten({} if loaded is None else loaded)
+        def operation(cursor: psycopg.Cursor[Any]) -> tuple[int, int]:
+            bundle = self._load_bundle(cursor, create=True)
+            assert bundle is not None
+            removed = 0
+            if prune:
+                wanted = {self._lookup_token(bundle, k) for k in flattened}
+                cursor.execute("""SELECT id, lookup_token, key_bundle_id, crypto_version, secret_version, encrypted_blob
+                    FROM kist_secrets WHERE profile_id = %s""", (self.profile_id,))
+                for row in cursor.fetchall():
+                    self._decode_row(bundle, row)
+                    if bytes(row[1]) not in wanted:
+                        row_id = uuid.UUID(str(row[0]))
+                        cursor.execute("DELETE FROM kist_secrets WHERE id = %s AND profile_id = %s", (row_id, self.profile_id))
+                        self._notify(cursor, row_id, "deleted")
+                        removed += 1
+            for key in sorted(flattened):
+                self._store(cursor, bundle, key, flattened[key])
+            return len(flattened), removed
+        return self._write(operation)
 
     def unlock_yaml(self) -> str:
-        """Return the scoped PostgreSQL secret store as safe YAML."""
-        if not self.db_url:
-            raise KistError("KIST_DATABASE_URL is not configured.")
-
-        _, _, profile_id = self._ensure_scope()
-
-        with safe_db_connect(self.db_url) as connection:
+        self._ensure_scope()
+        with safe_db_connect(self._require_database()) as connection:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT
-                        secret_key,
-                        encrypted_blob,
-                        secret_version,
-                        crypto_mode
-                    FROM kist
-                    WHERE profile_id = %s
-                    ORDER BY secret_key
-                    """,
-                    (profile_id,),
-                )
-                rows = cursor.fetchall()
+                cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                self._check_schema(cursor)
+                bundle = self._load_bundle(cursor)
+                if bundle is None:
+                    return "{}\n"
+                cursor.execute("""SELECT id, lookup_token, key_bundle_id, crypto_version, secret_version, encrypted_blob
+                    FROM kist_secrets WHERE profile_id = %s""", (self.profile_id,))
+                values: dict[str, Any] = {}
+                for row in cursor.fetchall():
+                    key, value = self._decode_row(bundle, row)
+                    if key in values:
+                        raise DecryptionError("Duplicate decrypted secret names.")
+                    values[key] = value
+        nested = self.unflatten(dict(sorted(values.items())))
+        return yaml.safe_dump(nested, default_flow_style=False, sort_keys=False, allow_unicode=True)
 
-        flat_values: dict[str, Any] = {}
+    def rewrap_profile_password(self, new_password: str, *, policy: Argon2Policy = Argon2Policy()) -> None:
+        """Rewrap DB keys only; does NOT rotate data/index keys or change Git/files/env.
 
-        for secret_key, encrypted_blob, secret_version, crypto_mode in rows:
-            key = _validate_secret_key(str(secret_key))
-
-            flat_values[key] = self._decrypt_value(
-                bytes(encrypted_blob),
-                secret_key=key,
-                secret_version=int(secret_version),
-                crypto_mode=str(crypto_mode),
-            )
-
-        nested_values = self.unflatten(flat_values)
-
-        return yaml.safe_dump(
-            nested_values,
-            default_flow_style=False,
-            sort_keys=False,
-            allow_unicode=True,
-        )
+        Old snapshots and previously obtained keys remain usable. Update password
+        provisioning separately; this is not an atomic cross-platform operation.
+        Do not concurrently share this instance while changing its password.
+        """
+        _password_bytes(new_password)
+        policy.validated()
+        def operation(cursor: psycopg.Cursor[Any]) -> None:
+            bundle = self._load_bundle(cursor)
+            if bundle is None:
+                raise KistError("No profile key bundle exists to rewrap.")
+            wrapped = encrypt_envelope(b"KKB1" + bundle.content_key + bundle.index_key,
+                                       new_password, self._bundle_context(bundle.id), policy)
+            cursor.execute("""UPDATE kist_key_bundles SET wrapped_bundle = %s,
+                wrapper_revision = wrapper_revision + 1, updated_at = NOW()
+                WHERE id = %s AND profile_id = %s""", (wrapped, bundle.id, self.profile_id))
+            self._notify(cursor, bundle.id, "key_bundle_rewrapped")
+        self._write(operation)
+        self.master_password = new_password
 
     def git_clean(self) -> None:
-        """Run the Kist Git clean filter for this profile."""
         from kist.git import git_clean_stream
-
-        git_clean_stream(
-            self.profile_name,
-            self.master_password,
-        )
+        git_clean_stream(self.profile_name, self.master_password)
 
     def git_smudge(self) -> None:
-        """Run the Kist Git smudge filter for this profile."""
         from kist.git import git_smudge_stream
+        git_smudge_stream(self.profile_name, self.master_password)
 
-        git_smudge_stream(
-            self.profile_name,
-            self.master_password,
-        )
+
+def _lock_id(name: str) -> int:
+    """Stable signed 64-bit advisory ID; collisions serialize, not bypass locks."""
+    return int.from_bytes(hashlib.sha256(name.encode("utf-8")).digest()[:8], "big", signed=True)
