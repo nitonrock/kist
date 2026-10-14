@@ -19,7 +19,7 @@
   <a href="#license">License</a>
 </p>
 
-> **Alpha software — Kist 0.1.0.** Kist is suitable for evaluation and controlled self-hosted deployments. Its API, database schema, and encrypted-envelope format may evolve before a stable release. Review the code, test recovery procedures, and do not treat a local Git hook as an organisational security control.
+> **Alpha software — Kist 0.1.1.** Kist is suitable for evaluation and controlled self-hosted deployments. Its API, database schema, and encrypted-envelope format may evolve before a stable release. Review the code, test recovery procedures, and do not treat a local Git hook as an organisational security control.
 
 Kist is a Python library and CLI for teams that want secret changes reviewed in Git, stored encrypted in PostgreSQL, and retrieved by Python applications—without operating a separate Vault cluster.
 
@@ -60,15 +60,15 @@ Kist is currently an **alpha** project.
 The 0.1.0 release supports only the `password-v1` encryption mode:
 
 ```text
-profile password
-    + random salt
+profile password + random salt
     ↓ Argon2id
-AES-256 key
-    + random nonce + authenticated context
-    ↓ AES-256-GCM
-encrypted Kist envelope
+Key Encryption Key (KEK)
+    ↓ wraps (AES-256-GCM)
+Random Data Key (DEK) / Key Bundle
+    ↓ encrypts (AES-256-GCM)
+Encrypted Kist Envelope
     ↓
-PostgreSQL or Git
+PostgreSQL (`kist_secrets`) or Git (`secrets/*.yaml`)
 ```
 
 Planned but **not included** in 0.1.0:
@@ -133,21 +133,64 @@ export KIST_PASSWORD='provided-by-your-runtime-secret-injection-mechanism'
 
 `sslmode=require` encrypts transport but does not verify the database server identity. Prefer `verify-full` for remote production databases.
 
+#### Understanding `KIST_ENV` vs `KIST_PROFILE`
+
+To maintain clarity and prevent misconfiguration, Kist separates runtime operational policy from secret partitioning:
+
+| Variable | Dimension | Purpose & Behavior | Typical Values |
+|---|---|---|---|
+| `KIST_ENV` | **Operational Mode** | Controls transport security and connection safeguards (e.g. enforcing strict TLS and certificate validation on PostgreSQL connections in `production`). Does not change keys or secret partitions. | `development`, `staging`, `production` (default: `development`) |
+| `KIST_PROFILE` | **Cryptographic Partition** | Defines the active secret scope, key bundle, and database partition in `kist_profiles`. Determines default password lookup (`KIST_PASSWORD_<PROFILE>`), default file paths (`secrets/<profile>.yaml`), and zero-knowledge blind indexing. | `default`, `team_a`, `billing`, `production` (default: `default`) |
+
+**Common Combinations:**
+- **Local development on a team profile:** `KIST_ENV=development KIST_PROFILE=team_a` (permits local non-TLS Postgres while scoping secrets to `team_a`).
+- **Production service deployment:** `KIST_ENV=production KIST_PROFILE=team_a` (strictly enforces database TLS while decrypting `team_a` secrets).
+
 ### 2. Initialise the database schema
 
-Schema setup is explicit. Run it using a controlled deployment/setup identity:
+Schema setup is explicit. Run it using the CLI:
 
 ```bash
 kist init-db
 ```
 
-A normal runtime application should ideally have only the database permissions required to read and write Kist data; it should not need permission to create tables.
+Or programmatically in Python:
 
-### 3. Store and retrieve a value
+```python
+from kist import Kist
+
+# Initialize the v1 schema
+store = Kist()
+store.init_db()
+```
+
+A normal runtime application should ideally have only the database permissions required to read and write Kist data; it should not need DDL permissions to create or alter tables.
+
+### 3. Lock secrets into PostgreSQL
+
+Lock your default profile's YAML secrets into PostgreSQL using the CLI:
 
 ```bash
-kist set example.api_key 'example-value'
-kist get example.api_key
+kist lock
+```
+
+Or specify an explicit file path:
+
+```bash
+kist lock secrets/default.yaml
+```
+
+### 4. Retrieve secrets in Python
+
+```python
+from kist import Kist
+
+# Automatically resolves credentials, active profile, and database URL from environment variables
+store = Kist()
+
+# Retrieve a value
+api_key = store.get("example.api_key")
+print(api_key)
 ```
 
 Output:
@@ -156,27 +199,17 @@ Output:
 example-value
 ```
 
-Avoid placing real production secrets directly on a shell command line: terminal history, process inspection, and CI logs can all turn a convenient command into an inconvenient incident report.
-
-### 4. Use Kist from Python
+You can also set values programmatically:
 
 ```python
-import os
+store.set("example.api_key", "example-value")
+```
 
-from kist import Kist, KistScope
+Or target another profile explicitly (e.g. in multi-profile services or administrative scripts):
 
-# Automatic resolution: checks KIST_PASSWORD_<PROFILE> -> KIST_PASSWORD -> ~/.kist/pwd_<profile>
-store = Kist(
-    profile_name=os.getenv("KIST_PROFILE", "default"),
-    db_url=os.environ.get("KIST_DATABASE_URL"),
-    scope=KistScope.from_environment(),
-)
-
-# Alternatively, pass master_password explicitly:
-# store = Kist(profile_name="production", master_password=os.environ["KIST_PASSWORD_PRODUCTION"])
-
-api_key = store.get("example.api_key")
-print(api_key)
+```python
+billing_store = Kist(profile_name="billing")
+stripe_key = billing_store.get("stripe.api_key")
 ```
 
 The public 0.1.0 API is intentionally small:
@@ -199,15 +232,13 @@ from kist import (
 Kist stores an encrypted binary envelope, not a plaintext secret value.
 
 ```text
-plaintext value
-    ↓
-JSON serialisation
-    ↓
-AES-256-GCM encryption
-    ↑
-Argon2id(profile password, random salt)
-    ↑
-profile password
+profile password + random salt
+    ↓ Argon2id
+Key Encryption Key (KEK)
+    ↓ wraps (AES-256-GCM)
+Random Data Key (DEK) / Key Bundle
+    ↓ encrypts (AES-256-GCM)
+Encrypted payload (JSON serialised value + context)
 ```
 
 Each envelope contains, conceptually:
@@ -215,11 +246,14 @@ Each envelope contains, conceptually:
 | Component | Purpose | Secret? |
 |---|---|---:|
 | Magic/version fields | Identifies the Kist format and supported algorithms | No |
-| Argon2id parameters | Allows the same password-derived key to be recreated | No |
+| Argon2id parameters | Allows the same password-derived KEK to be recreated | No |
 | Salt | Makes each password-key derivation distinct | No |
 | Nonce | Makes every AES-GCM encryption distinct | No |
-| Ciphertext and authentication tag | Stores the protected secret value | Protected, but safe to store |
+| Wrapped Key Bundle | Stores the encrypted DEK and index key (KEK-wrapped) | Protected |
+| Ciphertext and authentication tag | Stores the protected secret value (DEK-encrypted) | Protected, but safe to store |
 | Context commitment | Binds the envelope to its intended scope and identity | No |
+
+For a comprehensive beginner-friendly explanation of Kist's cryptographic architecture, envelope model, and threat defenses, see [KIST_ENCRYPTION_101.md](KIST_ENCRYPTION_101.md).
 
 The **salt** is used before encryption to derive a key from a password. The **nonce** is used for every AES-GCM encryption. Both are stored with the ciphertext; neither is a secret. The important rule is that Kist uses a fresh nonce for every encryption under a key.
 
@@ -257,7 +291,7 @@ and accepted by Kist. The authentication check fails closed.
 Kist accepts nested YAML mappings and flattens them into dot-separated keys.
 
 ```yaml
-# secrets_production.yaml
+# secrets/production.yaml
 sql:
   pg:
     host: db.internal
@@ -279,7 +313,13 @@ third_party.stripe.api_key     → "sk_example_value"
 
 JSON-compatible types are preserved. Kist uses `yaml.safe_load`; YAML roots must be mappings and mapping keys must be non-empty strings without dots.
 
-Lock a YAML file into PostgreSQL:
+Lock YAML secrets into PostgreSQL (defaults to the active profile's secret file, such as `secrets/default.yaml` or `secrets/<profile>.yaml` when `KIST_PROFILE` is set):
+
+```bash
+kist lock
+```
+
+Or lock an explicit file:
 
 ```bash
 kist lock secrets/production.yaml
@@ -288,7 +328,7 @@ kist lock secrets/production.yaml
 Explicitly specify or override a profile:
 
 ```bash
-kist --profile production lock secrets/production.yaml
+kist --profile production lock
 ```
 
 > **Defense-in-Depth Safety:** By default, `kist lock` verifies that the active profile matches the target file basename (e.g. `--profile production` expects `production.yaml` or `secrets/production.yaml`). Accidental mismatches are blocked to prevent cross-profile data corruption.
@@ -365,6 +405,32 @@ secrets/*.yml filter=kist
 ```
 
 Kist will not silently overwrite an unrelated pre-commit hook. Review the hook first, then use the explicit force option only when appropriate.
+
+### Multi-team repositories and per-developer defaults
+
+In shared repositories where multiple teams or services maintain separate secret files (for example, `secrets/team_a.yaml` and `secrets/team_b.yaml`), Kist allows each developer to set their own active default profile without hardcoding team settings into Git:
+
+#### 1. Automatic Git Filter Routing
+Git clean/smudge filters automatically infer the target profile from the file path (e.g., `secrets/team_a.yaml` → `team_a`). Developers only need the cryptographic credentials for their own team; other teams' secret files safely remain as encrypted ciphertext blobs in the local working tree without blocking commits or checkouts.
+
+#### 2. Configure Per-Developer Defaults
+Each developer sets their active default profile locally (e.g., via directory-level `.envrc` / `direnv`, an untracked `.env.local`, or shell profile):
+
+```bash
+# For Team A members:
+export KIST_PROFILE=team_a
+export KIST_PASSWORD_TEAM_A='team-a-master-password'  # or run: kist profile create team_a
+
+# For Team B members:
+export KIST_PROFILE=team_b
+export KIST_PASSWORD_TEAM_B='team-b-master-password'  # or run: kist profile create team_b
+```
+
+#### 3. Seamless Daily Workflow
+With `KIST_PROFILE` configured:
+- **CLI Commands:** Running `kist lock` or `kist unlock` without file arguments automatically targets `secrets/<profile>.yaml` (e.g., `secrets/team_a.yaml`).
+- **Safety Checks:** `kist lock` detects and blocks accidental cross-team operations if run against another team's file without explicit `--profile` or `--allow-mismatch` flags, preventing cross-profile corruption.
+- **Python Runtime:** Calling `store = Kist()` with zero arguments automatically resolves the developer's default team partition and credentials.
 
 ### Check and repair local setup
 
@@ -446,10 +512,10 @@ When a reviewed PR merges to `main`, CI securely synchronizes the updated secret
 
 ```bash
 # In CI with KIST_DATABASE_URL and KIST_PASSWORD_PRODUCTION configured:
-kist --profile production lock secrets_production.yaml
+kist --profile production lock secrets/production.yaml
 ```
 
-When secrets are locked into PostgreSQL, Kist emits a `NOTIFY kist_updates` event. Applications running `DynamicSecretStore` or `AsyncDynamicSecretStore` receive the signal in real time and automatically refresh cached values without container restarts or downtime.
+When secrets are locked into PostgreSQL, Kist emits a `NOTIFY kist_secret_updated` event. Applications running `DynamicSecretStore` or `AsyncDynamicSecretStore` receive the signal in real time and automatically refresh cached values without container restarts or downtime.
 
 ### 3. Production-ready CI templates
 
@@ -482,7 +548,7 @@ When running CLI commands with the `--profile` flag, Kist automatically resolves
 export KIST_PASSWORD_PRODUCTION='super-secret-random-production-key'
 export KIST_PASSWORD_STAGING='staging-specific-random-key'
 
-kist --profile production lock secrets_production.yaml
+kist --profile production lock secrets/production.yaml
 kist --profile staging status
 
 # 2. Using local key files (recommended for local development)
@@ -592,28 +658,24 @@ screenshots
 
 ## Database model
 
-Kist 0.1.0 uses PostgreSQL tables conceptually organised as:
+Kist organizes PostgreSQL storage into an isolated, zero-knowledge relational hierarchy:
 
 ```text
 kist_organizations
     └── kist_projects
             └── kist_profiles
-                    └── kist
+                    ├── kist_key_bundles (wrapped content & index keys)
+                    └── kist_secrets     (HMAC lookup tokens & encrypted payloads)
 ```
 
-The `kist` table stores:
+- **`kist_key_bundles`**: Stores the randomly generated 256-bit `content_key` and `index_key`, wrapped with the Argon2id-derived profile password (KEK).
+- **`kist_secrets`**:
+  - `lookup_token`: 32-byte HMAC-SHA256 hash of the secret name (zero plaintext secret names in the database).
+  - `encrypted_blob`: AES-256-GCM encrypted payload containing `{"key": ..., "value": ...}` bound to scope, bundle ID, and version via authenticated additional data (AAD).
+  - `secret_version`: Monotonically incremented version number preventing rollback and transplantation attacks.
+  - `updated_at`: Timestamp of the latest mutation.
 
-```text
-profile ID
-logical secret key
-encrypted binary envelope
-crypto mode: password-v1
-crypto version
-logical secret version
-update timestamp
-```
-
-The database stores encrypted values, not profile passwords or plaintext values. The profile password remains external to PostgreSQL.
+The database stores encrypted values and wrapped keys, never profile passwords or plaintext secret names. The profile password remains external to PostgreSQL.
 
 For production, use separate roles:
 

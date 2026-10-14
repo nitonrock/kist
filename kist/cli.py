@@ -43,6 +43,7 @@ def main() -> None:
     init_parser.add_argument("--force-hook", action="store_true")
     init_parser.add_argument("--no-hook", action="store_true")
     init_parser.add_argument("--print-hook", action="store_true")
+    subparsers.add_parser("init-db", help="Initialize the Kist PostgreSQL database schema")
     subparsers.add_parser("status", help="Inspect Kist configuration without modifying it")
     subparsers.add_parser("diagnose", help="Read-only diagnostics and repair recommendations")
     fix_parser = subparsers.add_parser("fix", help="Apply explicit, non-credential repair actions")
@@ -57,7 +58,7 @@ def main() -> None:
     create_parser.add_argument("--rotate", action="store_true")
 
     lock_parser = subparsers.add_parser("lock", help="Flatten and encrypt a YAML file into PostgreSQL")
-    lock_parser.add_argument("file", type=str)
+    lock_parser.add_argument("file", nargs="?", default=None, help="YAML secret file (defaults to active profile secrets file)")
     lock_parser.add_argument("--profile", default=argparse.SUPPRESS, help="Explicit profile name override")
     lock_parser.add_argument("--prune", "-p", action="store_true", help="Delete database secrets absent from YAML")
     lock_parser.add_argument("--allow-mismatch", action="store_true", help="Allow profile name to mismatch target file name")
@@ -65,7 +66,7 @@ def main() -> None:
     lock_parser.add_argument("--yes", "-y", action="store_true", help="Automatically confirm prompts")
 
     unlock_parser = subparsers.add_parser("unlock", help="Reconstruct YAML from encrypted PostgreSQL values")
-    unlock_parser.add_argument("file", type=str)
+    unlock_parser.add_argument("file", nargs="?", default=None, help="YAML secret file or destination (defaults to active profile secrets file)")
     unlock_parser.add_argument("--profile", default=argparse.SUPPRESS, help="Explicit profile name override")
     unlock_parser.add_argument("--allow-mismatch", action="store_true", help="Allow profile name to mismatch target file name")
     unlock_parser.add_argument("--force", "-f", action="store_true", help="Force execution and bypass mismatch checks")
@@ -86,6 +87,11 @@ def main() -> None:
             else:
                 run_git_setup(force_hook=args.force_hook, install_hook=not args.no_hook)
             return
+        if args.command == "init-db":
+            kist = Kist(profile_name=args.profile or "default", scope=_scope_from_args(args))
+            kist.init_db()
+            print("Kist database schema initialized successfully.")
+            return
         if args.command == "status":
             sys.exit(run_status())
         if args.command == "diagnose":
@@ -101,9 +107,15 @@ def main() -> None:
             print(password)
             return
         if args.command in {"lock", "unlock"}:
-            target_file = resolve_secret_file_path(args.file)
-            inferred_profile, inferred_password = get_profile_and_password(target_file)
             explicit_profile = getattr(args, "profile", None)
+            active_profile = explicit_profile or os.getenv("KIST_PROFILE", "default")
+
+            if getattr(args, "file", None):
+                target_file = resolve_secret_file_path(args.file)
+                inferred_profile, inferred_password = get_profile_and_password(target_file)
+            else:
+                target_file = resolve_secret_file_path(None, profile=active_profile)
+                inferred_profile, inferred_password = get_profile_and_password(target_file)
 
             if explicit_profile:
                 profile_name = explicit_profile
@@ -112,11 +124,12 @@ def main() -> None:
                 if profile_name != inferred_profile and not allow_mismatch:
                     raise KistError(
                         f"Error: Profile/file mismatch detected.\n"
-                        f"Profile '{profile_name}' does not match target file '{args.file}'.\n"
+                        f"Profile '{profile_name}' does not match target file '{args.file or target_file}'.\n"
                         f"To prevent accidental data corruption or pruning, this operation is blocked."
                     )
             else:
-                profile_name, password = inferred_profile, inferred_password
+                profile_name = inferred_profile
+                password = inferred_password or get_profile_password(profile_name)
 
             kist = Kist(profile_name=profile_name, master_password=password, scope=_scope_from_args(args))
             if args.command == "lock":
