@@ -8,6 +8,7 @@ These guidelines provide high-signal architectural invariants, development workf
 
 - **Environment & Package Manager:** Always use `uv`. Never invoke bare `pip` or system `python`.
   - Install dependencies: `uv sync`
+  - Install CLI tool globally: `uv tool install kist`
   - Run full test suite: `uv run pytest`
   - Run targeted test: `uv run pytest tests/test_kist.py -k <test_name>`
   - Run package build: `uv build`

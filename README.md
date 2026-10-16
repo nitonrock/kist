@@ -83,22 +83,20 @@ Key rotation and migration tooling
 
 ## Installation
 
-Install from PyPI with `uv` or `pip`:
+### 1. Add to your project
+
+Install from PyPI with `uv`:
 
 ```bash
 uv add kist
 ```
 
-```bash
-pip install kist
-```
+### 2. Install globally on your workstation (recommended for Git integration)
 
-Check that the package and CLI are available:
+To ensure Git clean/smudge filters and pre-commit hooks execute reliably across all IDEs (PyCharm, VS Code, Git GUI clients) and shells without requiring an active virtualenv:
 
 ```bash
-python -c "import kist; print(kist.__version__)"
-python -m kist --help
-kist --help
+uv tool install kist
 ```
 
 ## Quick start
