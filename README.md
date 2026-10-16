@@ -19,7 +19,7 @@
   <a href="#license">License</a>
 </p>
 
-> **Alpha software — Kist 0.1.1.** Kist is suitable for evaluation and controlled self-hosted deployments. Its API, database schema, and encrypted-envelope format may evolve before a stable release. Review the code, test recovery procedures, and do not treat a local Git hook as an organisational security control.
+> **Alpha software.** Kist is suitable for evaluation and controlled self-hosted deployments. Its API, database schema, and encrypted-envelope format may evolve before a stable release. Review the code, test recovery procedures, and do not treat a local Git hook as an organisational security control.
 
 Kist is a Python library and CLI for teams that want secret changes reviewed in Git, stored encrypted in PostgreSQL, and retrieved by Python applications—without operating a separate Vault cluster.
 
@@ -43,7 +43,7 @@ encryption, PostgreSQL, and clear operational boundaries.
 
 ## What Kist does not do
 
-Kist 0.1.1 deliberately stays small:
+Kist deliberately stays small:
 
 - It does **not** provide the sharks surrounding the island in the image above (you will have to supply your own biological perimeter defense).
 - It is **not** a replacement for HashiCorp Vault, a cloud secret manager, or a full identity and governance platform.
@@ -57,7 +57,7 @@ Kist reduces moving parts in a secret workflow; it does not replace operational 
 
 Kist is currently an **alpha** project.
 
-The 0.1.1 release supports only the `password-v1` encryption mode:
+The current release supports the `password-v1` encryption mode:
 
 ```text
 profile password + random salt
@@ -71,7 +71,7 @@ Encrypted Kist Envelope
 PostgreSQL (`kist_secrets`) or Git (`secrets/*.yaml`)
 ```
 
-Planned but **not included** in 0.1.1:
+Planned for future releases:
 
 ```text
 KMS data-encryption keys
@@ -106,6 +106,26 @@ kist --help
 ### 1. Configure Kist
 
 For local development, configure PostgreSQL and a profile password. Never commit these values to Git.
+
+#### Setting up profile passwords
+
+You can either generate local password files or inject passwords via environment variables:
+
+**Option A: Generate a secure local profile key (recommended for local development)**
+
+Generate a cryptographically secure random password and store it securely in `~/.kist/` with owner-only permissions (`0600`):
+
+```bash
+# Generate password for the default profile (~/.kist/pwd_default)
+kist profile create default
+
+# Generate password for a specific profile (~/.kist/pwd_team_a)
+kist profile create team_a
+```
+
+When a local key file exists in `~/.kist/`, Kist resolves it automatically—no password environment variables required.
+
+**Option B: Set environment variables (recommended for CI/CD and containers)**
 
 ```bash
 export KIST_ENV=development
@@ -212,7 +232,7 @@ billing_store = Kist(profile_name="billing")
 stripe_key = billing_store.get("stripe.api_key")
 ```
 
-The public 0.1.1 API is intentionally small:
+The public API is intentionally small:
 
 ```python
 from kist import (
@@ -744,7 +764,7 @@ If a real credential was staged in plaintext, remove it, rotate it if needed, an
 
 ## Development and release notes
 
-Kist 0.1.1 is designed to be understandable before it is expansive. If you find a security issue, report it privately through the repository’s security-advisory process rather than opening a public issue with exploit details.
+Kist is designed to be understandable before it is expansive. If you find a security issue, report it privately through the repository’s security-advisory process rather than opening a public issue with exploit details.
 
 Before using Kist for sensitive production workloads, review:
 

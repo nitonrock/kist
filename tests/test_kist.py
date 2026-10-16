@@ -1123,8 +1123,14 @@ def test_cli_unlock_defaults_to_active_profile(tmp_path, monkeypatch, capsys):
 
 
 def test_kist_version():
+    from pathlib import Path
+    import tomllib
     import kist
-    assert kist.__version__ == "0.1.1"
+
+    pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"
+    with pyproject_path.open("rb") as f:
+        expected_version = tomllib.load(f)["project"]["version"]
+    assert kist.__version__ == expected_version
 
 
 def test_kist_class_defaults_to_kist_profile_env(monkeypatch):
