@@ -28,6 +28,7 @@ from kist import (
     is_kist_envelope,
     main,
     mask_db_url,
+    remove_profile_key,
     resolve_secret_file_path,
     run_fix,
     run_git_setup,
@@ -174,6 +175,34 @@ class MockDB:
         elif "pg_notify" in q:
             self.notifications.append((params[0], params[1]) if params else ())
             self.last_result = [(None,)]
+        elif "SELECT id FROM kist_organizations WHERE slug" in q:
+            slug = params[0]
+            if slug in self.orgs:
+                self.last_result = [(self.orgs[slug],)]
+            else:
+                self.last_result = []
+        elif "SELECT id FROM kist_projects WHERE organization_id" in q:
+            org_id, slug = params[0], params[1]
+            key = (org_id, slug)
+            if key in self.projects:
+                self.last_result = [(self.projects[key],)]
+            else:
+                self.last_result = []
+        elif "SELECT id FROM kist_profiles WHERE project_id" in q:
+            proj_id, name = params[0], params[1]
+            key = (proj_id, name)
+            if key in self.profiles:
+                self.last_result = [(self.profiles[key],)]
+            else:
+                self.last_result = []
+        elif "DELETE FROM kist_profiles" in q:
+            prof_id = params[0]
+            for k in list(self.profiles.keys()):
+                if str(self.profiles[k]) == str(prof_id):
+                    del self.profiles[k]
+            self.bundles = {p: b for p, b in self.bundles.items() if str(p) != str(prof_id)}
+            self.secrets = {k: s for k, s in self.secrets.items() if str(k[0]) != str(prof_id)}
+            self.last_result = []
         elif "DELETE FROM kist_organizations" in q:
             org_id = params[0]
             self.orgs = {k: v for k, v in self.orgs.items() if v != org_id}
@@ -634,6 +663,40 @@ def test_leak_guard_detects_plaintext_and_permits_encrypted():
         mock_run.side_effect = [mock_diff, mock_show_encrypted]
         code2 = run_leak_guard()
         assert code2 == 0
+
+        # Staged Python package file inside secrets/ directory (e.g. secrets/__init__.py)
+        mock_diff_py = MagicMock()
+        mock_diff_py.stdout = "secrets/__init__.py\n"
+        mock_diff_py.returncode = 0
+
+        mock_show_py = MagicMock()
+        mock_show_py.stdout = b"# package initialization\n__all__ = []\n"
+        mock_show_py.returncode = 0
+
+        mock_run.side_effect = [mock_diff_py, mock_show_py]
+        code3 = run_leak_guard()
+        assert code3 == 0
+
+
+def test_is_targeted_secret():
+    from kist.git import _is_targeted_secret
+
+    # Must match secret YAML/YML files
+    assert _is_targeted_secret("secrets.yaml") is True
+    assert _is_targeted_secret("secrets.yml") is True
+    assert _is_targeted_secret("secrets_production.yaml") is True
+    assert _is_targeted_secret("secrets_team_a.yml") is True
+    assert _is_targeted_secret("secrets/default.yaml") is True
+    assert _is_targeted_secret("secrets/team_a.yml") is True
+    assert _is_targeted_secret("secrets/subdir/prod.yaml") is True
+    assert _is_targeted_secret("path/to/secrets/team_b.yaml") is True
+
+    # Must NOT match non-YAML files even inside secrets/ folder
+    assert _is_targeted_secret("secrets/__init__.py") is False
+    assert _is_targeted_secret("secrets/config.py") is False
+    assert _is_targeted_secret("secrets/README.md") is False
+    assert _is_targeted_secret("secrets/keys.json") is False
+    assert _is_targeted_secret("secrets/schema.sql") is False
 
 
 def test_leak_guard_ignores_code_calls_and_placeholders_and_detects_secrets():
@@ -1233,3 +1296,86 @@ def test_kist_class_defaults_to_kist_profile_env(monkeypatch):
     monkeypatch.setenv("KIST_PROFILE", "team_a")
     k = Kist()
     assert k.profile_name == "team_a"
+
+
+def test_remove_profile_key(tmp_path, monkeypatch):
+    kist_dir = tmp_path / ".kist"
+    monkeypatch.setenv("KIST_DIR", str(kist_dir))
+    with patch("sys.stdout.isatty", return_value=True):
+        create_profile_key("test_del_prof")
+    key_path = kist_dir / "pwd_test_del_prof"
+    assert key_path.exists()
+
+    assert remove_profile_key("test_del_prof") is True
+    assert not key_path.exists()
+    assert remove_profile_key("test_del_prof") is False
+
+
+def test_kist_delete_profile_in_db(mock_db):
+    with patch("psycopg.connect", side_effect=lambda *a, **kw: MockConnection(mock_db)):
+        kist_inst = Kist(profile_name="team_x", master_password="pwd", db_url="postgresql://mock")
+        kist_inst.set("db.password", "secret")
+        assert kist_inst.get("db.password") == "secret"
+
+        assert kist_inst.delete_profile("team_x") is True
+        assert kist_inst.delete_profile("team_x") is False
+
+        with pytest.raises(KeyError):
+            kist_inst.get("db.password")
+
+
+def test_cli_delete_secret(mock_db, monkeypatch, capsys):
+    with patch("psycopg.connect", side_effect=lambda *a, **kw: MockConnection(mock_db)):
+        kist_inst = Kist(profile_name="default", master_password="pwd", db_url="postgresql://mock")
+        kist_inst.set("stripe.api_key", "sk_live_123")
+        monkeypatch.setenv("KIST_PASSWORD", "pwd")
+
+        monkeypatch.setattr(sys, "argv", ["kist", "delete", "stripe.api_key", "--force"])
+        main()
+        captured = capsys.readouterr()
+        assert "Deleted secret 'stripe.api_key' for local/default/default." in captured.out
+
+        with pytest.raises(SystemExit) as exc_info:
+            monkeypatch.setattr(sys, "argv", ["kist", "delete", "stripe.api_key", "--force"])
+            main()
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "Secret 'stripe.api_key' not found" in captured.err
+
+
+def test_cli_profile_delete(mock_db, tmp_path, monkeypatch, capsys):
+    kist_dir = tmp_path / ".kist"
+    monkeypatch.setenv("KIST_DIR", str(kist_dir))
+    with patch("sys.stdout.isatty", return_value=True):
+        create_profile_key("team_y")
+
+    with patch("psycopg.connect", side_effect=lambda *a, **kw: MockConnection(mock_db)):
+        kist_inst = Kist(profile_name="team_y", master_password="pwd", db_url="postgresql://mock")
+        kist_inst.set("k", "v")
+
+        monkeypatch.setattr(sys, "argv", ["kist", "profile", "delete", "team_y", "--delete-key", "--force"])
+        main()
+        captured = capsys.readouterr()
+        assert "Deleted profile 'team_y' for local/default from database." in captured.out
+        assert "Removed local key file." in captured.out
+        assert not (kist_dir / "pwd_team_y").exists()
+
+
+def test_cli_profile_remove_key(tmp_path, monkeypatch, capsys):
+    kist_dir = tmp_path / ".kist"
+    monkeypatch.setenv("KIST_DIR", str(kist_dir))
+    with patch("sys.stdout.isatty", return_value=True):
+        create_profile_key("key_only")
+
+    monkeypatch.setattr(sys, "argv", ["kist", "profile", "remove-key", "key_only", "--force"])
+    main()
+    captured = capsys.readouterr()
+    assert "Removed local key file for profile 'key_only'." in captured.out
+    assert not (kist_dir / "pwd_key_only").exists()
+
+    with pytest.raises(SystemExit) as exc_info:
+        monkeypatch.setattr(sys, "argv", ["kist", "profile", "remove-key", "key_only", "--force"])
+        main()
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert "Local key file for profile 'key_only' not found." in captured.err

@@ -297,6 +297,18 @@ def create_profile_key(profile_name: str, *, rotate: bool = False) -> str:
     write_secure_local_password(profile_password_path(profile_name), password)
     return password
 
+def remove_profile_key(profile_name: str) -> bool:
+    """Remove a local profile password file if it exists."""
+    profile = _validate_profile_name(profile_name)
+    path = profile_password_path(profile)
+    try:
+        os.remove(path)
+        return True
+    except FileNotFoundError:
+        return False
+
+delete_profile_key = remove_profile_key
+
 def resolve_secret_file_path(path_or_name: Optional[str] = None, profile: Optional[str] = None) -> str:
     if path_or_name:
         candidates = [
@@ -818,6 +830,32 @@ class Kist:
             self._notify(cursor, row_id, "deleted")
             return True
         return self._write(operation)
+
+    def delete_profile(self, profile_name: Optional[str] = None) -> bool:
+        target_profile = _validate_profile_name(profile_name or self.profile_name)
+        with safe_db_connect(self._require_database()) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+                self._check_schema(cursor)
+                cursor.execute("SELECT id FROM kist_organizations WHERE slug = %s", (self.scope.organization,))
+                org_row = cursor.fetchone()
+                if org_row is None:
+                    return False
+                org_id = uuid.UUID(str(org_row[0]))
+                cursor.execute("SELECT id FROM kist_projects WHERE organization_id = %s AND slug = %s", (org_id, self.scope.project))
+                proj_row = cursor.fetchone()
+                if proj_row is None:
+                    return False
+                project_id = uuid.UUID(str(proj_row[0]))
+                cursor.execute("SELECT id FROM kist_profiles WHERE project_id = %s AND profile_name = %s", (project_id, target_profile))
+                profile_row = cursor.fetchone()
+                if profile_row is None:
+                    return False
+                profile_id = uuid.UUID(str(profile_row[0]))
+                cursor.execute("DELETE FROM kist_profiles WHERE id = %s", (profile_id,))
+                if self.profile_id == profile_id:
+                    self.profile_id = None
+                return True
 
     @staticmethod
     def flatten(data: dict[str, Any], parent_key: str = "", sep: str = ".") -> dict[str, Any]:

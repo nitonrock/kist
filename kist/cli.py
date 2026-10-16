@@ -13,6 +13,7 @@ from kist.core import (
     create_profile_key,
     get_profile_and_password,
     get_profile_password,
+    remove_profile_key,
     resolve_secret_file_path,
 )
 from kist.fix import run_diagnose, run_fix
@@ -54,8 +55,25 @@ def main() -> None:
     profile_parser = subparsers.add_parser("profile", help="Explicit profile-key lifecycle operations")
     profile_subparsers = profile_parser.add_subparsers(dest="profile_command")
     create_parser = profile_subparsers.add_parser("create", help="Create a local profile key")
-    create_parser.add_argument("name", type=str)
+    create_parser.add_argument("name", type=str, help="Profile name")
     create_parser.add_argument("--rotate", action="store_true")
+
+    delete_prof_parser = profile_subparsers.add_parser("delete", aliases=["rm"], help="Delete a profile and all its secrets from PostgreSQL")
+    delete_prof_parser.add_argument("name", type=str, help="Profile name")
+    delete_prof_parser.add_argument("--delete-key", "-k", action="store_true", help="Also delete local key file")
+    delete_prof_parser.add_argument("--force", "-f", action="store_true", help="Bypass confirmation prompt")
+    delete_prof_parser.add_argument("--yes", "-y", action="store_true", help="Automatically confirm prompts")
+
+    rm_key_parser = profile_subparsers.add_parser("remove-key", aliases=["delete-key"], help="Remove local key file (~/.kist/pwd_<name>)")
+    rm_key_parser.add_argument("name", type=str, help="Profile name")
+    rm_key_parser.add_argument("--force", "-f", action="store_true", help="Bypass confirmation prompt")
+    rm_key_parser.add_argument("--yes", "-y", action="store_true", help="Automatically confirm prompts")
+
+    delete_parser = subparsers.add_parser("delete", aliases=["rm"], help="Delete a secret key from PostgreSQL")
+    delete_parser.add_argument("key", type=str, help="Secret key to delete")
+    delete_parser.add_argument("--profile", default=argparse.SUPPRESS, help="Explicit profile name override")
+    delete_parser.add_argument("--force", "-f", action="store_true", help="Bypass confirmation prompt")
+    delete_parser.add_argument("--yes", "-y", action="store_true", help="Automatically confirm prompts")
 
     lock_parser = subparsers.add_parser("lock", help="Flatten and encrypt a YAML file into PostgreSQL")
     lock_parser.add_argument("file", nargs="?", default=None, help="YAML secret file (defaults to active profile secrets file)")
@@ -105,6 +123,75 @@ def main() -> None:
             password = create_profile_key(args.name, rotate=args.rotate)
             print("A new profile key was created. Store it in an approved key manager now; it will not be displayed again.")
             print(password)
+            return
+        if args.command == "profile" and args.profile_command in {"delete", "rm"}:
+            bypass_prompt = getattr(args, "force", False) or getattr(args, "yes", False)
+            if not bypass_prompt and sys.stdin.isatty():
+                try:
+                    prompt = (
+                        f"Warning: Permanently delete profile '{args.name}' and all its secrets in database?\n"
+                        f"Continue? [y/N]: "
+                    )
+                    response = input(prompt).strip().lower()
+                    if response not in ("y", "yes"):
+                        print("kist: profile deletion cancelled.", file=sys.stderr)
+                        sys.exit(1)
+                except (EOFError, KeyboardInterrupt):
+                    print("\nkist: profile deletion cancelled.", file=sys.stderr)
+                    sys.exit(130)
+
+            kist = Kist(profile_name=args.name, scope=_scope_from_args(args))
+            deleted = kist.delete_profile(args.name)
+            msg = f"Deleted profile '{args.name}' for {kist.scope.organization}/{kist.scope.project} from database." if deleted else f"Profile '{args.name}' not found in database."
+            if getattr(args, "delete_key", False):
+                key_removed = remove_profile_key(args.name)
+                msg += " Removed local key file." if key_removed else " Local key file not found."
+            print(msg)
+            return
+        if args.command == "profile" and args.profile_command in {"remove-key", "delete-key"}:
+            bypass_prompt = getattr(args, "force", False) or getattr(args, "yes", False)
+            if not bypass_prompt and sys.stdin.isatty():
+                try:
+                    prompt = f"Warning: Remove local key file for profile '{args.name}'? [y/N]: "
+                    response = input(prompt).strip().lower()
+                    if response not in ("y", "yes"):
+                        print("kist: key removal cancelled.", file=sys.stderr)
+                        sys.exit(1)
+                except (EOFError, KeyboardInterrupt):
+                    print("\nkist: key removal cancelled.", file=sys.stderr)
+                    sys.exit(130)
+
+            if remove_profile_key(args.name):
+                print(f"Removed local key file for profile '{args.name}'.")
+            else:
+                print(f"Local key file for profile '{args.name}' not found.", file=sys.stderr)
+                sys.exit(1)
+            return
+        if args.command in {"delete", "rm"}:
+            explicit_profile = getattr(args, "profile", None)
+            profile_name = explicit_profile or os.getenv("KIST_PROFILE", "default")
+            password = get_profile_password(profile_name)
+            bypass_prompt = getattr(args, "force", False) or getattr(args, "yes", False)
+            if not bypass_prompt and sys.stdin.isatty():
+                try:
+                    prompt = (
+                        f"Warning: Deleting '{args.key}' from database may cause drift from Git secret files.\n"
+                        f"Continue? [y/N]: "
+                    )
+                    response = input(prompt).strip().lower()
+                    if response not in ("y", "yes"):
+                        print("kist: delete operation cancelled.", file=sys.stderr)
+                        sys.exit(1)
+                except (EOFError, KeyboardInterrupt):
+                    print("\nkist: delete operation cancelled.", file=sys.stderr)
+                    sys.exit(130)
+
+            kist = Kist(profile_name=profile_name, master_password=password, scope=_scope_from_args(args))
+            if kist.delete(args.key):
+                print(f"Deleted secret '{args.key}' for {kist.scope.organization}/{kist.scope.project}/{profile_name}.")
+            else:
+                print(f"Secret '{args.key}' not found for {kist.scope.organization}/{kist.scope.project}/{profile_name}.", file=sys.stderr)
+                sys.exit(1)
             return
         if args.command in {"lock", "unlock"}:
             explicit_profile = getattr(args, "profile", None)

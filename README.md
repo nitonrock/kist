@@ -217,10 +217,14 @@ Output:
 example-value
 ```
 
-You can also set values programmatically:
+You can also set or delete values programmatically:
 
 ```python
+# Set a secret value
 store.set("example.api_key", "example-value")
+
+# Delete a secret value (returns True if deleted, False if not found)
+store.delete("example.api_key")
 ```
 
 Or target another profile explicitly (e.g. in multi-profile services or administrative scripts):
@@ -362,6 +366,29 @@ kist lock secrets/production.yaml --prune
 ```
 
 > **Destructive Flag Protection:** In interactive terminals, `--prune` prompts for explicit user confirmation before permanently deleting obsolete database rows. In automated pipelines or scripted workflows, supply `--force` or `--yes` to proceed without interactive confirmation.
+
+Delete an individual secret key from PostgreSQL:
+
+```bash
+# Delete a secret (prompts for confirmation in interactive terminals):
+kist delete stripe.api_key
+
+# Bypass confirmation prompts in scripts or automated pipelines:
+kist delete stripe.api_key --force
+```
+
+Delete an entire profile partition or manage local key files:
+
+```bash
+# Permanently delete a profile partition and all its encrypted secrets in PostgreSQL:
+kist profile delete preview_env
+
+# Delete database partition and also remove local key file (~/.kist/pwd_preview_env):
+kist profile delete preview_env --delete-key --force
+
+# Remove local key file without modifying the database:
+kist profile remove-key preview_env
+```
 
 Reconstruct a profile as YAML:
 
