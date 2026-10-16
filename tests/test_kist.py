@@ -304,8 +304,60 @@ def test_path_conflicts(value):
 
 
 def test_duplicate_yaml():
-    with pytest.raises(KistError):
+    with pytest.raises(KistError, match="Duplicate YAML key"):
         yaml.load("a: 1\na: 2\n", Loader=_UniqueSafeLoader)
+
+
+def test_yaml_merge_keys():
+    yaml_text = """
+credentials: &credentials
+  username: admin
+  password: secret_password
+
+database:
+  <<: *credentials
+  host: db.internal
+  port: 5432
+
+analytics:
+  <<: *credentials
+  username: custom_analyst
+  host: analytics.internal
+"""
+    data = yaml.load(yaml_text, Loader=_UniqueSafeLoader)
+    assert data["database"] == {
+        "username": "admin",
+        "password": "secret_password",
+        "host": "db.internal",
+        "port": 5432,
+    }
+    assert data["analytics"] == {
+        "username": "custom_analyst",
+        "password": "secret_password",
+        "host": "analytics.internal",
+    }
+    flattened = Kist.flatten(data)
+    assert flattened["database.username"] == "admin"
+    assert flattened["database.password"] == "secret_password"
+    assert flattened["database.host"] == "db.internal"
+    assert flattened["database.port"] == 5432
+    assert flattened["analytics.username"] == "custom_analyst"
+    assert flattened["analytics.password"] == "secret_password"
+    assert flattened["analytics.host"] == "analytics.internal"
+
+
+def test_yaml_merge_keys_with_explicit_duplicate_rejected():
+    yaml_text = """
+base: &base
+  username: admin
+
+service:
+  <<: *base
+  host: a
+  host: b
+"""
+    with pytest.raises(KistError, match="Duplicate YAML key"):
+        yaml.load(yaml_text, Loader=_UniqueSafeLoader)
 
 
 def test_normalized_collision():

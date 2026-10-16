@@ -545,16 +545,27 @@ class _KeyBundle:
     content_key: bytes
     index_key: bytes
 
-# Reject duplicate YAML keys instead of silently keeping the last value.
+# Reject duplicate YAML keys instead of silently keeping the last value, while supporting YAML merge keys (<<).
 class _UniqueSafeLoader(yaml.SafeLoader):
     pass
 
 def _unique_mapping(loader: _UniqueSafeLoader, node: yaml.MappingNode, deep: bool = False) -> dict[str, Any]:
+    seen_explicit_keys: set[str] = set()
+    for key_node, _ in node.value:
+        if key_node.tag != "tag:yaml.org,2002:merge":
+            key = loader.construct_object(key_node, deep=deep)
+            if not isinstance(key, str):
+                raise KistError("YAML keys must be strings.")
+            if key in seen_explicit_keys:
+                raise KistError(f"Duplicate YAML key: {key!r}")
+            seen_explicit_keys.add(key)
+
+    loader.flatten_mapping(node)
     result: dict[str, Any] = {}
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=deep)
-        if not isinstance(key, str) or key in result:
-            raise KistError("YAML keys must be unique strings; merge keys are not supported.")
+        if not isinstance(key, str):
+            raise KistError("YAML keys must be strings.")
         result[key] = loader.construct_object(value_node, deep=deep)
     return result
 
