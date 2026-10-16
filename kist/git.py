@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -26,12 +27,31 @@ from kist.core import (
     is_kist_envelope,
 )
 
-SENSITIVE_KEY_PATTERNS = [
-    re.compile(r"(?i)\b(api[_-]?key|secret[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|db[_-]?password|aws_secret_access_key)\s*[:=]\s*['\"]?[^\s'\"]{8,}"),
+HIGH_CONFIDENCE_PATTERNS = [
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"),
 ]
+
+SENSITIVE_KEY_ASSIGNMENT = re.compile(
+    r"""(?i)\b\w*(?:api[_-]?key|secret[_-]?key|private[_-]?key|client[_-]?secret|auth[_-]?token|access[_-]?token|db[_-]?password|aws_secret_access_key)\b\s*[:=]\s*([\x27"]?)([^\s\x27"]{8,})\1"""
+)
+
+SENSITIVE_KEY_PATTERNS = [
+    SENSITIVE_KEY_ASSIGNMENT,
+    *HIGH_CONFIDENCE_PATTERNS,
+]
+
+PLACEHOLDER_SUBSTRINGS = (
+    "example", "placeholder", "dummy", "sample", "test", "mock",
+    "changeme", "change_me", "replace_me", "your_", "fake",
+    "sk_test", "sk_example", "xxx", "todo",
+)
+
+IGNORED_KEYWORDS = {
+    "none", "null", "nil", "undefined", "true", "false",
+    "str", "int", "string", "bytes", "optional", "any",
+}
 
 SUSPICIOUS_EXTENSIONS = {
     ".yaml", ".yml", ".json", ".toml", ".env", ".ini", ".conf", ".cfg",
@@ -45,6 +65,32 @@ KIST_ATTRIBUTE_RULES = (
     "secrets/*.yml filter=kist",
 )
 KIST_HOOK_MARKER = "# kist-managed-hook-v1"
+
+KIST_HOOK_SCRIPT = (
+    "#!/usr/bin/env sh\n"
+    f"{KIST_HOOK_MARKER}\n\n"
+    "# 1. Check if kist is already in PATH\n"
+    "if command -v kist >/dev/null 2>&1; then\n"
+    '    exec kist pre-commit-guard "$@"\n'
+    "# 2. Check local virtual environments\n"
+    'elif [ -x ".venv/bin/kist" ]; then\n'
+    '    exec .venv/bin/kist pre-commit-guard "$@"\n'
+    'elif [ -x "venv/bin/kist" ]; then\n'
+    '    exec venv/bin/kist pre-commit-guard "$@"\n'
+    'elif [ -x ".venv/Scripts/kist.exe" ]; then\n'
+    '    exec .venv/Scripts/kist.exe pre-commit-guard "$@"\n'
+    'elif [ -x "venv/Scripts/kist.exe" ]; then\n'
+    '    exec venv/Scripts/kist.exe pre-commit-guard "$@"\n'
+    "# 3. Fallback to package manager runners\n"
+    "elif command -v uv >/dev/null 2>&1; then\n"
+    '    exec uv run kist pre-commit-guard "$@"\n'
+    "elif command -v poetry >/dev/null 2>&1; then\n"
+    '    exec poetry run kist pre-commit-guard "$@"\n'
+    "else\n"
+    '    echo "kist: command not found. Activate your virtualenv or install kist globally (uv tool install kist)." >&2\n'
+    "    exit 1\n"
+    "fi\n"
+)
 
 
 def _stream_filepath() -> str:
@@ -136,8 +182,12 @@ def _append_missing_lines(path: Path, lines: tuple[str, ...], heading: str) -> b
 def _install_hook(hook_path: Path, *, force: bool = False) -> bool:
     if hook_path.exists():
         content = hook_path.read_text(encoding="utf-8")
-        if KIST_HOOK_MARKER in content:
+        if content == KIST_HOOK_SCRIPT:
             return False
+        if KIST_HOOK_MARKER in content:
+            hook_path.write_text(KIST_HOOK_SCRIPT, encoding="utf-8")
+            os.chmod(hook_path, 0o755)
+            return True
         if not force:
             raise KistError(
                 f"Refusing to overwrite existing hook {hook_path}. Use `kist init --print-hook` "
@@ -148,12 +198,7 @@ def _install_hook(hook_path: Path, *, force: bool = False) -> bool:
             raise KistError(f"Refusing to overwrite hook because backup already exists: {backup}")
         hook_path.replace(backup)
 
-    hook_path.write_text(
-        "#!/usr/bin/env sh\n"
-        f"{KIST_HOOK_MARKER}\n"
-        "exec kist pre-commit-guard\n",
-        encoding="utf-8",
-    )
+    hook_path.write_text(KIST_HOOK_SCRIPT, encoding="utf-8")
     os.chmod(hook_path, 0o755)
     return True
 
@@ -183,12 +228,12 @@ def run_git_setup(*, force_hook: bool = False, install_hook: bool = True) -> Non
         changes.append("pre-commit hook")
     print("Kist Git filters configured." + (f" Updated: {', '.join(changes)}." if changes else ""))
     print("Next step: Run 'kist init-db' to initialize your database schema if not already configured.")
+    if shutil.which("kist") is None:
+        print("Tip: Install kist globally ('uv tool install kist') for seamless Git commits in IDEs and non-activated shells.")
 
 
 def print_hook() -> None:
-    print("#!/usr/bin/env sh")
-    print(KIST_HOOK_MARKER)
-    print("exec kist pre-commit-guard")
+    print(KIST_HOOK_SCRIPT, end="")
 
 
 def _is_targeted_secret(path: str) -> bool:
@@ -202,6 +247,37 @@ def _should_scan_plaintext(path: str, blob: bytes) -> bool:
     if suffix in SUSPICIOUS_EXTENSIONS:
         return True
     return b"-----BEGIN " in blob or b"api_key" in blob.lower() or b"secret" in blob.lower()
+
+
+def _has_likely_credential(text: str, file_path: str = "") -> bool:
+    norm_path = file_path.replace("\\", "/").lower()
+    is_test_file = (
+        norm_path.startswith("tests/")
+        or "/tests/" in norm_path
+        or norm_path.startswith("test/")
+        or "/test/" in norm_path
+    )
+
+    for pattern in HIGH_CONFIDENCE_PATTERNS:
+        if pattern.search(text):
+            if not is_test_file:
+                return True
+
+    if is_test_file:
+        return False
+
+    for match in SENSITIVE_KEY_ASSIGNMENT.finditer(text):
+        val = match.group(2)
+        if any(c in val for c in "()[]{}<>"):
+            continue
+        val_lower = val.lower()
+        if any(sub in val_lower for sub in PLACEHOLDER_SUBSTRINGS):
+            continue
+        if val_lower in IGNORED_KEYWORDS:
+            continue
+        return True
+
+    return False
 
 
 def run_leak_guard() -> int:
@@ -237,9 +313,8 @@ def run_leak_guard() -> int:
             continue
 
         text = blob.decode("utf-8", errors="ignore")
-        for pattern in SENSITIVE_KEY_PATTERNS:
-            if pattern.search(text):
-                print(f"kist: blocked likely plaintext credential in staged file: {file_path}", file=sys.stderr)
-                print("kist: rotate exposed credentials if this value is real, then use an approved secret workflow.", file=sys.stderr)
-                return 1
+        if _has_likely_credential(text, file_path):
+            print(f"kist: blocked likely plaintext credential in staged file: {file_path}", file=sys.stderr)
+            print("kist: rotate exposed credentials if this value is real, then use an approved secret workflow.", file=sys.stderr)
+            return 1
     return 0

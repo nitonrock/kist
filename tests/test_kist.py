@@ -584,6 +584,26 @@ def test_leak_guard_detects_plaintext_and_permits_encrypted():
         assert code2 == 0
 
 
+def test_leak_guard_ignores_code_calls_and_placeholders_and_detects_secrets():
+    from kist.git import _has_likely_credential
+
+    # False positives that must NOT trigger
+    assert not _has_likely_credential('api_key = store.get("example.api_key")', "README.md")
+    assert not _has_likely_credential("api_key: sk_example_value", "README.md")
+    assert not _has_likely_credential('api_key = os.getenv("API_KEY")', "app.py")
+    assert not _has_likely_credential('api_key = os.environ["API_KEY"]', "app.py")
+    assert not _has_likely_credential('api_key: str = ""', "types.py")
+    assert not _has_likely_credential("api_key: <your_key_here>", "docs.md")
+    assert not _has_likely_credential("db_password: dummy_password_value", "config.yaml")
+
+    # True positives that MUST trigger
+    assert _has_likely_credential('stripe_api_key = "sk_live_98234729384729384"', "app.py")
+    assert _has_likely_credential("API_KEY=98234729384729384", ".env")
+    assert _has_likely_credential('db_password: "real_production_secret_pass"', "config.yaml")
+    assert _has_likely_credential("AKIAIOSFODNN7EXAMPLE", "deploy.tf")
+    assert _has_likely_credential("-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA...", "server.key")
+
+
 def test_flatten_and_unflatten_nested_and_types():
     kist_inst = Kist(profile_name="types_test", master_password="pwd", db_url="")
     data = {
@@ -793,6 +813,8 @@ def test_print_hook(capsys):
     out = capsys.readouterr().out
     assert "#!/usr/bin/env sh" in out
     assert "kist pre-commit-guard" in out
+    assert ".venv/bin/kist" in out
+    assert "uv run kist" in out
 
 
 def test_run_git_setup_installs_filters_attributes_and_hooks(tmp_path, monkeypatch, capsys):
@@ -808,9 +830,31 @@ def test_run_git_setup_installs_filters_attributes_and_hooks(tmp_path, monkeypat
     assert (tmp_path / ".gitignore").exists()
     hook_file = git_dir / "hooks" / "pre-commit"
     assert hook_file.exists()
-    assert hook_file.read_text().startswith("#!/usr/bin/env sh")
+    content = hook_file.read_text()
+    assert content.startswith("#!/usr/bin/env sh")
+    assert ".venv/bin/kist" in content
+    assert "uv run kist" in content
     captured = capsys.readouterr()
     assert "Run 'kist init-db'" in captured.out
+
+
+def test_run_git_setup_updates_older_kist_hook(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    git_dir = tmp_path / ".git"
+    hooks_dir = git_dir / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    old_hook = hooks_dir / "pre-commit"
+    old_hook.write_text("#!/usr/bin/env sh\n# kist-managed-hook-v1\nexec kist pre-commit-guard\n")
+
+    with patch("subprocess.run") as mock_run:
+        mock_run.return_value.returncode = 0
+        run_git_setup(install_hook=True)
+
+    content = old_hook.read_text()
+    assert ".venv/bin/kist" in content
+    assert "uv run kist" in content
+    captured = capsys.readouterr()
+    assert "pre-commit hook" in captured.out
 
 
 def test_enforce_ssl_url():
