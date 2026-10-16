@@ -1,5 +1,7 @@
 """Public API for Kist."""
 
+from importlib.metadata import PackageNotFoundError, version
+
 from kist.cli import main
 from kist.core import (
     ALGORITHM_AES_256_GCM,
@@ -67,7 +69,10 @@ from kist.stores import (
     TTLStore,
 )
 
-__version__ = "0.1.1"
+try:
+    __version__ = version("kist")
+except PackageNotFoundError:
+    __version__ = "0.0.0.dev0"
 
 __all__ = [
     "__version__",

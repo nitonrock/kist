@@ -1,6 +1,6 @@
 [project]
 name = "kist"
-version = "0.1.1"
+version = "0.1.2"
 description = "A Self-Sufficient Multi-Profile Secrets Manager and Git Leak Guard"
 readme = "README.md"
 requires-python = ">=3.13"
