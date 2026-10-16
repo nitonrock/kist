@@ -329,7 +329,7 @@ sql.pg.ssl_enabled             → true
 third_party.stripe.api_key     → "sk_example_value"
 ```
 
-JSON-compatible types are preserved. Kist uses `yaml.safe_load`; YAML roots must be mappings and mapping keys must be non-empty strings without dots.
+JSON-compatible types are preserved. Kist supports standard YAML anchors and merge keys (`<<: *anchor`) to eliminate boilerplate across configurations, while actively validating against duplicate keys within the same block. YAML roots must be mappings and mapping keys must be non-empty strings without dots.
 
 Lock YAML secrets into PostgreSQL (defaults to the active profile's secret file, such as `secrets/default.yaml` or `secrets/<profile>.yaml` when `KIST_PROFILE` is set):
 
