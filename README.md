@@ -253,7 +253,7 @@ Each envelope contains, conceptually:
 | Ciphertext and authentication tag | Stores the protected secret value (DEK-encrypted) | Protected, but safe to store |
 | Context commitment | Binds the envelope to its intended scope and identity | No |
 
-For a comprehensive beginner-friendly explanation of Kist's cryptographic architecture, envelope model, and threat defenses, see [KIST_ENCRYPTION_101.md](KIST_ENCRYPTION_101.md).
+For a comprehensive beginner-friendly explanation of Kist's cryptographic architecture, envelope model, and threat defenses, see [KIST_ENCRYPTION_101.md](https://github.com/nitonrock/kist/blob/main/KIST_ENCRYPTION_101.md).
 
 The **salt** is used before encryption to derive a key from a password. The **nonce** is used for every AES-GCM encryption. Both are stored with the ciphertext; neither is a secret. The important rule is that Kist uses a fresh nonce for every encryption under a key.
 
@@ -519,17 +519,17 @@ When secrets are locked into PostgreSQL, Kist emits a `NOTIFY kist_secret_update
 
 ### 3. Production-ready CI templates
 
-Standalone, copy-paste templates are available in the [`ressources/`](ressources/) directory:
+Standalone, copy-paste templates are available in the [`ressources/`](https://github.com/nitonrock/kist/tree/main/ressources) directory:
 
-- **GitHub Actions** ([`ressources/github/`](ressources/github/)):
-  - [`leak-guard.yml`](ressources/github/leak-guard.yml): PR scan and leak prevention.
-  - [`deploy.yml`](ressources/github/deploy.yml): PostgreSQL secret sync on merge to `main`.
-- **GitLab CI/CD** ([`ressources/gitlab/`](ressources/gitlab/)):
-  - [`.gitlab-ci.yml`](ressources/gitlab/.gitlab-ci.yml): Multi-stage pipeline with security scanning, secret sync, and deployment.
-- **Bitbucket Pipelines** ([`ressources/bitbucket/`](ressources/bitbucket/)):
-  - [`bitbucket-pipelines.yml`](ressources/bitbucket/bitbucket-pipelines.yml): Step definitions for PR leak guard and automated deployment.
+- **GitHub Actions** ([`ressources/github/`](https://github.com/nitonrock/kist/tree/main/ressources/github)):
+  - [`leak-guard.yml`](https://github.com/nitonrock/kist/blob/main/ressources/github/leak-guard.yml): PR scan and leak prevention.
+  - [`deploy.yml`](https://github.com/nitonrock/kist/blob/main/ressources/github/deploy.yml): PostgreSQL secret sync on merge to `main`.
+- **GitLab CI/CD** ([`ressources/gitlab/`](https://github.com/nitonrock/kist/tree/main/ressources/gitlab)):
+  - [`.gitlab-ci.yml`](https://github.com/nitonrock/kist/blob/main/ressources/gitlab/.gitlab-ci.yml): Multi-stage pipeline with security scanning, secret sync, and deployment.
+- **Bitbucket Pipelines** ([`ressources/bitbucket/`](https://github.com/nitonrock/kist/tree/main/ressources/bitbucket)):
+  - [`bitbucket-pipelines.yml`](https://github.com/nitonrock/kist/blob/main/ressources/bitbucket/bitbucket-pipelines.yml): Step definitions for PR leak guard and automated deployment.
 
-For detailed setup instructions and variable configuration, see the [CI/CD Resources Guide](ressources/README.md).
+For detailed setup instructions and variable configuration, see the [CI/CD Resources Guide](https://github.com/nitonrock/kist/blob/main/ressources/README.md).
 
 ## Password resolution and local profile keys
 
@@ -757,13 +757,13 @@ Before using Kist for sensitive production workloads, review:
 
 ## License
 
-Kist is licensed under the [Apache License, Version 2.0](LICENCE).
+Kist is licensed under the [Apache License, Version 2.0](https://github.com/nitonrock/kist/blob/main/LICENCE).
 
 Apache-2.0 is a permissive license: you may use, modify, redistribute, and use Kist commercially, subject to the license terms and preservation of applicable notices. It includes an explicit patent grant from contributors.
 
 Cryptographic primitives (AES-256-GCM AEAD and Argon2id KDF) are powered by the standard Python Cryptographic Authority ([`cryptography`](https://github.com/pyca/cryptography)) library.
 
-See [LICENCE](LICENCE) and [NOTICE](NOTICE).
+See [LICENCE](https://github.com/nitonrock/kist/blob/main/LICENCE) and [NOTICE](https://github.com/nitonrock/kist/blob/main/NOTICE).
 
 ---
 
