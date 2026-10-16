@@ -239,7 +239,9 @@ def print_hook() -> None:
 def _is_targeted_secret(path: str) -> bool:
     normalized = path.replace("\\", "/")
     name = os.path.basename(normalized)
-    return (name.startswith("secrets") and name.endswith((".yaml", ".yml"))) or normalized.startswith("secrets/")
+    if not name.endswith((".yaml", ".yml")):
+        return False
+    return name.startswith("secrets") or normalized.startswith("secrets/") or "/secrets/" in normalized
 
 
 def _should_scan_plaintext(path: str, blob: bytes) -> bool:
