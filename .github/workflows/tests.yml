@@ -1,0 +1,35 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.13"]
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: kist
+          POSTGRES_PASSWORD: kist
+          POSTGRES_DB: kist_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U kist"
+          --health-interval 2s --health-retries 15
+    env:
+      KIST_TEST_DATABASE_URL: postgresql://kist:kist@127.0.0.1:5432/kist_test
+      KIST_ENV: development
+      KIST_TLS_MODE: disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --group dev
+      - run: uv run pytest -q --ignore=tests/test_ci_projects_e2e.py  # e2e suite needs local sibling projects

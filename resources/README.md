@@ -24,7 +24,7 @@ Integrating Kist into your CI/CD pipelines delivers two core capabilities:
 ## 📁 Directory Structure
 
 ```text
-ressources/
+resources/
 ├── github/
 │   ├── deploy.yml         # Deploy & sync secrets to PostgreSQL on main branch push
 │   └── leak-guard.yml     # PR scanning to prevent plaintext secrets from merging
@@ -38,13 +38,13 @@ ressources/
 
 ## 🚀 Setup by Provider
 
-### 1. GitHub Actions (`ressources/github/`)
+### 1. GitHub Actions (`resources/github/`)
 
 - Copy the workflow templates into your repository:
   ```bash
   mkdir -p .github/workflows
-  cp ressources/github/leak-guard.yml .github/workflows/
-  cp ressources/github/deploy.yml .github/workflows/
+  cp resources/github/leak-guard.yml .github/workflows/
+  cp resources/github/deploy.yml .github/workflows/
   ```
 - **Configure GitHub Repository Secrets** (`Settings -> Secrets and variables -> Actions`):
   - `KIST_DATABASE_URL`: PostgreSQL connection string (e.g. `postgresql://user:pass@db.example.com:5432/kist?sslmode=require`).
@@ -52,11 +52,11 @@ ressources/
 
 ---
 
-### 2. GitLab CI/CD (`ressources/gitlab/`)
+### 2. GitLab CI/CD (`resources/gitlab/`)
 
 - Copy `.gitlab-ci.yml` to the root of your GitLab repository:
   ```bash
-  cp ressources/gitlab/.gitlab-ci.yml .gitlab-ci.yml
+  cp resources/gitlab/.gitlab-ci.yml .gitlab-ci.yml
   ```
 - **Configure GitLab CI/CD Variables** (`Settings -> CI/CD -> Variables`):
   - Set `KIST_DATABASE_URL` and `KIST_PASSWORD_PRODUCTION`.
@@ -64,11 +64,11 @@ ressources/
 
 ---
 
-### 3. Bitbucket Pipelines (`ressources/bitbucket/`)
+### 3. Bitbucket Pipelines (`resources/bitbucket/`)
 
 - Copy `bitbucket-pipelines.yml` to the root of your Bitbucket repository:
   ```bash
-  cp ressources/bitbucket/bitbucket-pipelines.yml bitbucket-pipelines.yml
+  cp resources/bitbucket/bitbucket-pipelines.yml bitbucket-pipelines.yml
   ```
 - **Configure Bitbucket Repository Variables** (`Repository settings -> Repository variables`):
   - Add `KIST_DATABASE_URL` and `KIST_PASSWORD_PRODUCTION`.

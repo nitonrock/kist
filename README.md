@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/nitonrock/kist/main/ressources/kist.png" alt="Kist" width="500" />
+  <img src="https://raw.githubusercontent.com/nitonrock/kist/main/resources/kist.png" alt="Kist" width="500" />
 </p>
 
 <h1 align="center">Kist</h1>
@@ -10,7 +10,16 @@
 </p>
 
 <p align="center">
+  <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/pypi/v/kist" alt="PyPI" /></a>
+  <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/pypi/pyversions/kist" alt="Python versions" /></a>
+  <a href="https://github.com/nitonrock/kist/actions/workflows/tests.yml"><img src="https://github.com/nitonrock/kist/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
+  <a href="https://github.com/nitonrock/kist/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License" /></a>
+</p>
+
+<p align="center">
   <a href="#status">Status</a> ·
+  <a href="#example-value-in-60-seconds">60-second demo</a> ·
+  <a href="#how-kist-compares">Comparison</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#git-workflow">Git workflow</a> ·
@@ -29,6 +38,32 @@ It is built for teams that want encrypted secrets and a reviewable Git workflow
 without turning secret storage into a second full-time infrastructure project.
 The model stays deliberately small: a profile password, authenticated
 encryption, PostgreSQL, and clear operational boundaries.
+
+## Hello Kist in 60 seconds
+
+```bash
+# 1. Start a throwaway PostgreSQL (docker-compose.yml is in this repo)
+docker compose up -d
+
+# 2. Install Kist and point it at the database
+uv tool install kist
+export KIST_ENV=development KIST_TLS_MODE=disable
+export KIST_DATABASE_URL='postgresql://kist:kist@127.0.0.1:5432/kist'
+
+# 3. Create a profile key, the schema, and lock a secret
+kist profile create default
+kist init-db
+mkdir -p secrets && printf 'example:\n  api_key: example-value\n' > secrets/default.yaml
+kist lock
+```
+
+```python
+from kist import Kist
+
+print(Kist().get("example.api_key"))  # example-value
+```
+
+The full setup, including production TLS and Git filters, is in [Quick start](#quick-start).
 
 ## What Kist does
 
@@ -79,19 +114,7 @@ access policies and audit logs.
 
 Kist is currently an **alpha** project.
 
-The current release supports the `password-v1` encryption mode:
-
-```text
-profile password + random salt
-    ↓ Argon2id
-Key Encryption Key (KEK)
-    ↓ wraps (AES-256-GCM)
-Random Data Key (DEK) / Key Bundle
-    ↓ encrypts (AES-256-GCM)
-Encrypted Kist Envelope
-    ↓
-PostgreSQL (`kist_secrets`) or Git (`secrets/*.yaml`)
-```
+The current release supports the `password-v1` encryption mode (see [How it works](#how-it-works) for the envelope model).
 
 Planned for future releases:
 
@@ -586,17 +609,17 @@ When secrets are locked into PostgreSQL, Kist emits a `NOTIFY kist_secret_update
 
 ### 3. Production-ready CI templates
 
-Standalone, copy-paste templates are available in the [`ressources/`](https://github.com/nitonrock/kist/tree/main/ressources) directory:
+Standalone, copy-paste templates are available in the [`resources/`](https://github.com/nitonrock/kist/tree/main/resources) directory:
 
-- **GitHub Actions** ([`ressources/github/`](https://github.com/nitonrock/kist/tree/main/ressources/github)):
-  - [`leak-guard.yml`](https://github.com/nitonrock/kist/blob/main/ressources/github/leak-guard.yml): PR scan and leak prevention.
-  - [`deploy.yml`](https://github.com/nitonrock/kist/blob/main/ressources/github/deploy.yml): PostgreSQL secret sync on merge to `main`.
-- **GitLab CI/CD** ([`ressources/gitlab/`](https://github.com/nitonrock/kist/tree/main/ressources/gitlab)):
-  - [`.gitlab-ci.yml`](https://github.com/nitonrock/kist/blob/main/ressources/gitlab/.gitlab-ci.yml): Multi-stage pipeline with security scanning, secret sync, and deployment.
-- **Bitbucket Pipelines** ([`ressources/bitbucket/`](https://github.com/nitonrock/kist/tree/main/ressources/bitbucket)):
-  - [`bitbucket-pipelines.yml`](https://github.com/nitonrock/kist/blob/main/ressources/bitbucket/bitbucket-pipelines.yml): Step definitions for PR leak guard and automated deployment.
+- **GitHub Actions** ([`resources/github/`](https://github.com/nitonrock/kist/tree/main/resources/github)):
+  - [`leak-guard.yml`](https://github.com/nitonrock/kist/blob/main/resources/github/leak-guard.yml): PR scan and leak prevention.
+  - [`deploy.yml`](https://github.com/nitonrock/kist/blob/main/resources/github/deploy.yml): PostgreSQL secret sync on merge to `main`.
+- **GitLab CI/CD** ([`resources/gitlab/`](https://github.com/nitonrock/kist/tree/main/resources/gitlab)):
+  - [`.gitlab-ci.yml`](https://github.com/nitonrock/kist/blob/main/resources/gitlab/.gitlab-ci.yml): Multi-stage pipeline with security scanning, secret sync, and deployment.
+- **Bitbucket Pipelines** ([`resources/bitbucket/`](https://github.com/nitonrock/kist/tree/main/resources/bitbucket)):
+  - [`bitbucket-pipelines.yml`](https://github.com/nitonrock/kist/blob/main/resources/bitbucket/bitbucket-pipelines.yml): Step definitions for PR leak guard and automated deployment.
 
-For detailed setup instructions and variable configuration, see the [CI/CD Resources Guide](https://github.com/nitonrock/kist/blob/main/ressources/README.md).
+For detailed setup instructions and variable configuration, see the [CI/CD Resources Guide](https://github.com/nitonrock/kist/blob/main/resources/README.md).
 
 ## Password resolution and local profile keys
 
@@ -824,13 +847,13 @@ Before using Kist for sensitive production workloads, review:
 
 ## License
 
-Kist is licensed under the [Apache License, Version 2.0](https://github.com/nitonrock/kist/blob/main/LICENCE).
+Kist is licensed under the [Apache License, Version 2.0](https://github.com/nitonrock/kist/blob/main/LICENSE).
 
 Apache-2.0 is a permissive license: you may use, modify, redistribute, and use Kist commercially, subject to the license terms and preservation of applicable notices. It includes an explicit patent grant from contributors.
 
 Cryptographic primitives (AES-256-GCM AEAD and Argon2id KDF) are powered by the standard Python Cryptographic Authority ([`cryptography`](https://github.com/pyca/cryptography)) library.
 
-See [LICENCE](https://github.com/nitonrock/kist/blob/main/LICENCE) and [NOTICE](https://github.com/nitonrock/kist/blob/main/NOTICE).
+See [LICENSE](https://github.com/nitonrock/kist/blob/main/LICENSE) and [NOTICE](https://github.com/nitonrock/kist/blob/main/NOTICE).
 
 ---
 
