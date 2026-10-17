@@ -5,7 +5,7 @@ description = "A Self-Sufficient Multi-Profile Secrets Manager and Git Leak Guar
 readme = "README.md"
 requires-python = ">=3.13"
 license = "Apache-2.0"
-license-files = ["LICENCE", "NOTICE"]
+license-files = ["LICENSE", "NOTICE"]
 authors = [
     { name = "nitonrock", email = "info@nitonrock.com"}
 ]
