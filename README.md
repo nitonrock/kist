@@ -733,6 +733,43 @@ async def use_secrets() -> None:
 
 Caching makes reads faster by retaining **plaintext** in process memory for a bounded period. Use it only when that trade-off is acceptable for your application. Set an explicit cache policy or disable caching if you need every read to go back through Kist.
 
+## Offline and embedded systems
+
+Devices, air-gapped hosts and CI jobs that cannot reach PostgreSQL can read secrets straight from the encrypted envelope that Git stores, with no database involved.
+
+Export the committed blob at build time. It is ciphertext, so it is safe to ship in an image:
+
+```bash
+kist export secrets/device.yaml -o dist/device.kist --verify --strict
+```
+
+| Option | Effect |
+|--|--|
+| `-o FILE` / `-o -` | Destination (default `<profile>.kist`), or stdout for pipelines |
+| `--rev REV` | Export from a tag or commit, e.g. `--rev v1.4.0` (default `HEAD`) |
+| `--staged` | Export the staged version instead of a commit |
+| `--verify` | Decrypt in memory with the profile key to prove the export works; needs the key on the build host |
+| `--strict` | Fail if the working copy has uncommitted changes (recommended in CI) |
+
+`kist export` reads the blob with `git cat-file`, so plaintext is never written. It refuses files that are not committed or not Kist-encrypted. Without Kist installed, `git show HEAD:secrets/device.yaml > dist/device.kist` produces the same file.
+
+Read it on the device:
+
+```python
+from kist import Kist
+
+with Kist.from_file("/etc/app/device.kist", git_path="secrets/device.yaml") as store:
+    api_key = store.get("cloud.api_key")
+    port = store.get("mqtt.port", 8883)
+```
+
+- `git_path` is the repository-relative path at commit time. It is authenticated, together with the profile, `KIST_ORGANIZATION`, `KIST_PROJECT` and `KIST_REPOSITORY_ID`. An envelope moved to another path, profile or scope fails to decrypt.
+- The profile defaults to the one Git used (`secrets/device.yaml` → `device`). The password comes from the usual lookup: `KIST_PASSWORD_DEVICE`, `KIST_PASSWORD`, or `~/.kist`.
+- Argon2id runs once per load, not per `get()`. Values stay in memory only. Call `reload()` after an update; `close()` (or leaving the `with` block) drops them.
+- The store is read-only and has no live reload. Plaintext working copies are refused.
+
+Hardware-backed keys (TPM 2.0, secure elements) are planned through `kist/kms`. Until then, protect the device's profile password as you would any root credential.
+
 ## Security boundaries
 
 Kist is deliberately explicit about what it protects and what it does not.
