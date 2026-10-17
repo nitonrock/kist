@@ -50,11 +50,18 @@ uv tool install kist
 export KIST_ENV=development KIST_TLS_MODE=disable
 export KIST_DATABASE_URL='postgresql://kist:kist@127.0.0.1:5432/kist'
 
-# 3. Create a profile key, the schema, and lock a secret
+# 3. Create a profile key and the schema
 kist profile create default
 kist init-db
+
+# 4. Enable Git encryption in your repo (run before staging any secret file)
+kist init
+
+# 5. Write a secret, lock it into PostgreSQL, and commit it encrypted
 mkdir -p secrets && printf 'example:\n  api_key: example-value\n' > secrets/default.yaml
 kist lock
+git add secrets/default.yaml   # the clean filter stores an encrypted Kist envelope
+git commit -m "Add encrypted secrets"
 ```
 
 ```python
@@ -63,7 +70,9 @@ from kist import Kist
 print(Kist().get("example.api_key"))  # example-value
 ```
 
-The full setup, including production TLS and Git filters, is in [Quick start](#quick-start).
+Your working copy of `secrets/default.yaml` stays readable; Git only stores ciphertext. Check with `git show :secrets/default.yaml | head -c 4`, which prints `KIST`.
+
+The full setup, including production TLS, is in [Quick start](#quick-start).
 
 ## What Kist does
 
@@ -229,7 +238,19 @@ store.init_db()
 
 A normal runtime application should ideally have only the database permissions required to read and write Kist data; it should not need DDL permissions to create or alter tables.
 
-### 3. Lock secrets into PostgreSQL
+### 3. Enable Git encryption with `kist init`
+
+Run this once per repository, **before** you `git add` any secret file:
+
+```bash
+kist init
+```
+
+`kist init` registers the Kist clean/smudge filters, adds the `secrets*.yaml` rules to `.gitattributes`, ignores `.kist/`, and installs the pre-commit leak guard. From then on, `git add secrets/<profile>.yaml` stores an encrypted envelope while your working copy stays plaintext. Without it, Git commits secret files in plaintext.
+
+Each developer must run `kist init` after cloning, because Git filter configuration lives in the local `.git/config` and is never shared through the repository. See [Git workflow](#git-workflow) for details, and `kist diagnose` if a file is not being encrypted.
+
+### 4. Lock secrets into PostgreSQL
 
 Lock your default profile's YAML secrets into PostgreSQL using the CLI:
 
@@ -243,7 +264,7 @@ Or specify an explicit file path:
 kist lock secrets/default.yaml
 ```
 
-### 4. Retrieve secrets in Python
+### 5. Retrieve secrets in Python
 
 ```python
 from kist import Kist
@@ -477,7 +498,7 @@ plaintext secrets.yaml
 
 ### Initialise a repository
 
-Inside a Git work tree:
+Inside a Git work tree, and again after every fresh clone:
 
 ```bash
 kist init
