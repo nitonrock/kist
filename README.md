@@ -53,6 +53,7 @@ Kist deliberately stays small:
 - It does **not** replace key backup, password-sharing procedures, CI access policy, incident response, or the people responsible for operating them.
 
 Kist reduces moving parts in a secret workflow; it does not replace operational judgement, incident response, or the uncomfortable meeting after a leaked credential.
+
 ## How Kist compares
 
 | | **Kist** | **sops** | **git-crypt** | **python-dotenv** | **HashiCorp Vault** | **Infisical / Doppler** |
