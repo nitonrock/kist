@@ -737,11 +737,21 @@ Caching makes reads faster by retaining **plaintext** in process memory for a bo
 
 Devices, air-gapped hosts and CI jobs that cannot reach PostgreSQL can read secrets straight from the encrypted envelope that Git stores, with no database involved.
 
-Export the committed blob at build time (this is ciphertext, so it is safe to ship in an image):
+Export the committed blob at build time. It is ciphertext, so it is safe to ship in an image:
 
 ```bash
-git show HEAD:secrets/device.yaml > dist/device.kist
+kist export secrets/device.yaml -o dist/device.kist --verify --strict
 ```
+
+| Option | Effect |
+|--|--|
+| `-o FILE` / `-o -` | Destination (default `<profile>.kist`), or stdout for pipelines |
+| `--rev REV` | Export from a tag or commit, e.g. `--rev v1.4.0` (default `HEAD`) |
+| `--staged` | Export the staged version instead of a commit |
+| `--verify` | Decrypt in memory with the profile key to prove the export works; needs the key on the build host |
+| `--strict` | Fail if the working copy has uncommitted changes (recommended in CI) |
+
+`kist export` reads the blob with `git cat-file`, so plaintext is never written. It refuses files that are not committed or not Kist-encrypted. Without Kist installed, `git show HEAD:secrets/device.yaml > dist/device.kist` produces the same file.
 
 Read it on the device:
 
