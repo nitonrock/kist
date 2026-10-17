@@ -1,0 +1,40 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.13"]
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: kist
+          POSTGRES_PASSWORD: kist
+          POSTGRES_DB: kist_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U kist"
+          --health-interval 2s --health-retries 15
+    env:
+      KIST_TEST_DATABASE_URL: postgresql://kist:kist@127.0.0.1:5432/kist_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --group dev
+      - name: Unit tests
+        run: uv run pytest -q --ignore=tests/test_ci_projects_e2e.py -k "not database and not cli_delete_secret and not cli_profile_delete"
+      - name: PostgreSQL tests
+        env:
+          KIST_ENV: development
+          KIST_TLS_MODE: disable
+          KIST_DATABASE_URL: postgresql://kist:kist@127.0.0.1:5432/kist_test
+        run: uv run pytest -q --ignore=tests/test_ci_projects_e2e.py -k "database or cli_delete_secret or cli_profile_delete"
