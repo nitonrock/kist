@@ -30,4 +30,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --group dev
-      - run: uv run pytest -q --ignore=tests/test_ci_projects_e2e.py  # e2e suite needs local sibling projects
+      - name: Unit tests
+        run: uv run pytest -q --ignore=tests/test_ci_projects_e2e.py -k "not database and not cli_delete_secret and not cli_profile_delete"
+      - name: PostgreSQL tests
+        env:
+          KIST_ENV: development
+          KIST_TLS_MODE: disable
+          KIST_DATABASE_URL: postgresql://kist:kist@127.0.0.1:5432/kist_test
+        run: uv run pytest -q --ignore=tests/test_ci_projects_e2e.py -k "database or cli_delete_secret or cli_profile_delete"
