@@ -53,6 +53,27 @@ Kist deliberately stays small:
 - It does **not** replace key backup, password-sharing procedures, CI access policy, incident response, or the people responsible for operating them.
 
 Kist reduces moving parts in a secret workflow; it does not replace operational judgement, incident response, or the uncomfortable meeting after a leaked credential.
+## How Kist compares
+
+| | **Kist** | **sops** | **git-crypt** | **python-dotenv** | **HashiCorp Vault** | **Infisical / Doppler** |
+|--|--|--|--|--|--|--|
+| Secrets reviewable in Git PRs | ✅ encrypted envelopes + CI leak guard | ✅ values encrypted, keys readable | ⚠️ opaque binary diffs | ❌ plaintext `.env`, usually gitignored | ❌ | ⚠️ via integrations |
+| Transparent Git workflow | ✅ clean/smudge filters | ⚠️ explicit `sops edit` | ✅ clean/smudge filters | ❌ | ❌ | ❌ |
+| Runtime retrieval API (Python) | ✅ `Kist().get()` | ⚠️ decrypt file at startup | ❌ file only | ✅ plaintext env | ✅ client libs | ✅ SDKs |
+| Live reload without restart | ✅ PostgreSQL `LISTEN/NOTIFY` | ❌ | ❌ | ❌ | ⚠️ leases / agent | ✅ |
+| Extra infrastructure | PostgreSQL (you likely have it) | None (+ KMS optional) | None | None | Vault cluster | SaaS or self-hosted server |
+| Encryption | Argon2id → AES-256-GCM, scope-bound AAD | AES-256-GCM, age / PGP / cloud KMS | AES-256-CTR, GPG | None | AES-256-GCM | AES-256-GCM |
+| Multi-team / multi-profile isolation | ✅ per-profile keys, path-based routing | ⚠️ via `.sops.yaml` rules | ⚠️ multiple keys | ❌ | ✅ policies | ✅ projects/envs |
+| Anti-transplant / rollback protection | ✅ context + version bound | ⚠️ MAC per file | ❌ | ❌ | n/a | n/a |
+| Cloud KMS / HSM | 🔜 planned | ✅ | ❌ | ❌ | ✅ | ✅ |
+| Fine-grained access policies & audit | ❌ (use Git + DB roles) | ❌ | ❌ | ❌ | ✅ | ✅ |
+| Best fit | Python teams wanting GitOps secrets + runtime store, no Vault | Polyglot config files, KMS-backed | Small repos, few trusted devs | Local dev only | Enterprise, dynamic secrets | Teams wanting a managed UI |
+
+**Choose Kist when** you want secret changes reviewed in Git, served at runtime from the
+PostgreSQL you already run, and refreshed live—without operating a Vault cluster.
+**Choose something else when** you need cloud KMS today, dynamic credentials, or central
+access policies and audit logs.
+
 ## Status
 
 Kist is currently an **alpha** project.
