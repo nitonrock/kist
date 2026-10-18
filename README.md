@@ -84,10 +84,13 @@ The full setup, including production TLS, is in [Quick start](#quick-start).
 
 | | **Kist** | **sops** | **git-crypt** | **python-dotenv** | **HashiCorp Vault** | **Infisical / Doppler** |
 |--|--|--|--|--|--|--|
-| Secrets reviewable in Git PRs | ✅ encrypted envelopes + CI leak guard | ✅ values encrypted, keys readable | ⚠️ opaque binary diffs | ❌ plaintext `.env`, usually gitignored | ❌ | ⚠️ via integrations |
+| Changes go through Git review & history | ✅ encrypted in commits + CI leak guard | ✅ | ✅ | ❌ plaintext `.env`, usually gitignored | ❌ | ⚠️ via integrations |
+| Readable diffs | ❌ binary (local plaintext diffs planned) | ✅ key names visible, values encrypted | ⚠️ plaintext locally when unlocked, binary on GitHub | n/a | n/a | n/a |
 | Transparent Git workflow | ✅ clean/smudge filters | ⚠️ explicit `sops edit` | ✅ clean/smudge filters | ❌ | ❌ | ❌ |
 | Runtime retrieval API (Python) | ✅ `Kist().get()` | ⚠️ decrypt file at startup | ❌ file only | ✅ plaintext env | ✅ client libs | ✅ SDKs |
 | Live reload without restart | ✅ PostgreSQL `LISTEN/NOTIFY` | ❌ | ❌ | ❌ | ⚠️ leases / agent | ✅ |
+| Offline / embedded devices | ✅ `kist export` file + `Kist.from_file()`; password from TPM via `systemd-creds` | ✅ decrypt with an age/PGP key; ⚠️ cloud KMS needs network | ⚠️ whole repo + shared key on the device | ❌ plaintext file on the device | ❌ needs the Vault server | ⚠️ encrypted fallback snapshot (Doppler) |
+| Password / key rotation | ✅ one command across PostgreSQL + Git; old commits open via retired passwords | ✅ `sops rotate` per file | ❌ not supported | n/a | ✅ | ✅ managed |
 | Where your secrets live | Your Git + your PostgreSQL | Your Git (+ cloud KMS if used) | Your Git | Your disk | Your Vault cluster | Vendor cloud (or self-hosted server) |
 | Extra infrastructure | PostgreSQL (you likely have it) | None (+ KMS optional) | None | None | Vault cluster | SaaS or self-hosted server |
 | Encryption | Argon2id → AES-256-GCM, scope-bound AAD | AES-256-GCM, age / PGP / cloud KMS | AES-256-CTR, GPG | None | AES-256-GCM | AES-256-GCM |
@@ -98,7 +101,8 @@ The full setup, including production TLS, is in [Quick start](#quick-start).
 | Best fit | Python teams wanting GitOps secrets + runtime store, no Vault | Polyglot config files, KMS-backed | Small repos, few trusted devs | Local dev only | Enterprise, dynamic secrets | Teams wanting a managed UI |
 
 **Choose Kist when** you want secret changes reviewed in Git, served at runtime from the
-PostgreSQL you already run, and refreshed live—without operating a Vault cluster.
+PostgreSQL you already run, refreshed live, and shipped as an encrypted file to
+offline or embedded devices—without operating a Vault cluster.
 **Choose something else when** you need cloud KMS today, dynamic credentials, or central
 access policies and audit logs.
 
