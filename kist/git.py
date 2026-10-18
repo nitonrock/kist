@@ -21,12 +21,12 @@ from kist.core import (
     KistError,
     MissingKeyError,
     decrypt_envelope,
-    decrypt_with_key_history,
+    decrypt_with_password_history,
     encrypt_envelope,
     get_profile_password,
     git_context,
     is_kist_envelope,
-    retired_profile_keys,
+    retired_profile_passwords,
 )
 
 HIGH_CONFIDENCE_PATTERNS = [
@@ -107,7 +107,7 @@ def _stream_filepath() -> str:
 
 def git_clean_stream(
     profile_name: str,
-    master_password: Optional[str] = None,
+    password: Optional[str] = None,
     in_stream: Optional[TextIO] = None,
     out_stream: Optional[BinaryIO] = None,
     filepath: Optional[str] = None,
@@ -115,10 +115,10 @@ def git_clean_stream(
     """Encrypt a Kist-managed working-tree file and write a v1 envelope to Git."""
     in_stream = in_stream or sys.stdin
     out_stream = out_stream or sys.stdout.buffer
-    password = master_password or get_profile_password(profile_name)
+    password = password or get_profile_password(profile_name)
     if not password:
         raise MissingKeyError(
-            f"No encryption key configured for profile {profile_name!r}; refusing to stage plaintext."
+            f"No password configured for profile {profile_name!r}; refusing to stage plaintext."
         )
 
     plaintext = in_stream.read()
@@ -130,7 +130,7 @@ def git_clean_stream(
 
 def git_smudge_stream(
     profile_name: str,
-    master_password: Optional[str] = None,
+    password: Optional[str] = None,
     in_stream: Optional[BinaryIO] = None,
     out_stream: Optional[TextIO] = None,
     filepath: Optional[str] = None,
@@ -142,18 +142,18 @@ def git_smudge_stream(
     if not envelope:
         return
 
-    password = master_password or get_profile_password(profile_name)
-    if not password and not retired_profile_keys(profile_name):
+    password = password or get_profile_password(profile_name)
+    if not password and not retired_profile_passwords(profile_name):
         raise MissingKeyError(
-            f"No decryption key configured for profile {profile_name!r}; refusing checkout of protected content."
+            f"No password configured for profile {profile_name!r}; refusing checkout of protected content."
         )
     if not is_kist_envelope(envelope):
         raise InvalidEnvelopeError("Protected Git file is not a valid Kist v1 envelope.")
 
     target_path = filepath or _stream_filepath()
-    plaintext, retired = decrypt_with_key_history(envelope, profile_name, git_context(profile_name, target_path), password)
+    plaintext, retired = decrypt_with_password_history(envelope, profile_name, git_context(profile_name, target_path), password)
     if retired:
-        print(f"kist: {target_path}: opened with retired key {retired} (older content).", file=sys.stderr)
+        print(f"kist: {target_path}: opened with retired password {retired} (older content).", file=sys.stderr)
     try:
         out_stream.write(plaintext.decode("utf-8"))
     except UnicodeDecodeError as exc:
@@ -217,7 +217,7 @@ def run_git_setup(*, force_hook: bool = False, install_hook: bool = True) -> Non
     subprocess.run(["git", "config", "filter.kist.required", "true"], check=True)
 
     attributes_changed = _append_missing_lines(Path(".gitattributes"), KIST_ATTRIBUTE_RULES, "Kist encrypted-secret filters")
-    ignore_changed = _append_missing_lines(Path(".gitignore"), (".kist/",), "Kist local profile keys")
+    ignore_changed = _append_missing_lines(Path(".gitignore"), (".kist/",), "Kist local profile passwords")
 
     hook_changed = False
     if install_hook:

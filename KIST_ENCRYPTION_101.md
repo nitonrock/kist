@@ -49,7 +49,7 @@ To understand Kist's security, think of it as a multi-tier vault requiring sever
 | **Profile Password** | Master Secret | The master combination in your head | The root credential used to generate Key Encryption Keys (KEK). |
 | **Salt** (16 bytes) | Cryptographic Salt | A unique grain pattern for each lock | Ensures two profiles with identical passwords produce completely different encryption keys. Defeats precomputed rainbow tables. |
 | **Key Derivation** | Argon2id | The heavy mechanical gear that takes effort to turn | Intentionally consumes CPU time and memory (64 MB RAM) so attackers cannot brute-force passwords using high-speed GPUs or ASICs. |
-| **Key Encryption Key (KEK)** | 256-bit AES Key | The master vault key | Derived via Argon2id from the password; wraps and protects the random profile Key Bundle. |
+| **Key Encryption Key (KEK)** | 256-bit AES Key | The master vault key | Derived via Argon2id from the password; wraps and protects the random profile password Bundle. |
 | **Key Bundle** | `_KeyBundle` (Content + Index Keys) | The inner safety-deposit key ring | Contains two randomly generated 256-bit keys: a **Data Encryption Key (DEK / `content_key`)** and a **Blind Index Key (`index_key`)**. |
 | **Data Encryption Key (DEK)** | 256-bit AES Key | The swift everyday safety deposit key | Directly encrypts individual secret payloads in PostgreSQL with AES-256-GCM in microseconds without repeating expensive Argon2id derivations on every read. |
 | **Index Key** | 256-bit HMAC Key | The blind catalogue encoder | Derives 32-byte deterministic HMAC-SHA256 lookup tokens so database queries find secrets without leaking plaintext secret names. |
@@ -225,7 +225,7 @@ When an authorized application retrieves a secret (`store.get("stripe.api_key")`
 ```
 1. UNWRAP KEY BUNDLE (Session Initialization)
    Fetch wrapped_bundle from `kist_key_bundles`
-   Derive KEK via Argon2id(master_password, bundle_salt)
+   Derive KEK via Argon2id(password, bundle_salt)
    AES-256-GCM Decrypt wrapped_bundle -> (content_key, index_key)
 
 2. COMPUTE ZERO-KNOWLEDGE LOOKUP TOKEN
@@ -271,8 +271,8 @@ kist_organizations
 
 Kist avoids storing passwords or plaintext keys in unsecured locations:
 
-* **Local Key Files (`~/.kist/pwd_<profile>`):**
-  - Enforces strict POSIX permissions (`0600` on key files, `0700` on directory).
+* **Local password Files (`~/.kist/pwd_<profile>`):**
+  - Enforces strict POSIX permissions (`0600` on password files, `0700` on directory).
   - Prohibits symlinks to prevent symlink traversal attacks.
   - Generates 32-byte high-entropy URL-safe passwords via `kist profile create <name>`.
 * **Environment Variables:**

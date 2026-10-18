@@ -84,7 +84,7 @@ def run_diagnose() -> int:
 
 
 def run_fix(*, apply: bool = False, force_hook: bool = False) -> int:
-    """Show or apply a limited repair plan; never generates profile keys or restages files."""
+    """Show or apply a limited repair plan; never generates profile passwords or restages files."""
     if not _inside_git_repo():
         print("kist: not inside a Git repository; refusing to initialize one automatically.")
         return 1
@@ -112,5 +112,5 @@ def run_fix(*, apply: bool = False, force_hook: bool = False) -> int:
         print(f"kist: repair not applied: {exc}")
         return 1
 
-    print("Kist repair completed. No profile keys were generated and no files were restaged.")
+    print("Kist repair completed. No profile passwords were generated and no files were restaged.")
     return 0

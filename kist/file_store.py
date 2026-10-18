@@ -34,7 +34,9 @@ from kist.core import (
     _UniqueSafeLoader,
     _validate_profile_name,
     _validate_secret_key,
-    decrypt_envelope,
+    decrypt_with_password_history,
+    profile_from_path,
+    retired_profile_passwords,
     get_profile_password,
     git_context,
     is_kist_envelope,
@@ -47,10 +49,8 @@ PathLike = Union[str, os.PathLike]
 
 
 def _profile_from_git_path(git_path: str) -> str:
-    """Derive the profile the Git filter used, without touching key files."""
-    name = os.path.basename(git_path)
-    base = name[:-5] if name.endswith(".yaml") else name[:-4] if name.endswith(".yml") else name
-    return _validate_profile_name("default" if base == "secrets" else base.removeprefix("secrets_"))
+    """Profile the Git filter used for this path (secrets/device.yaml -> device)."""
+    return profile_from_path(git_path)
 
 
 class FileKist:
@@ -61,10 +61,10 @@ class FileKist:
         git_path: Repository-relative path the file had when it was committed
             (for example ``"secrets/device.yaml"``). It is part of the
             authenticated context. Defaults to ``path``.
-        profile_name: Profile key to use. Defaults to the profile the Git
+        profile_name: Profile password to use. Defaults to the profile the Git
             filter derives from ``git_path`` (``secrets/device.yaml`` -> ``device``).
-        master_password: Profile password. Defaults to the normal Kist lookup
-            (``KIST_PASSWORD_<PROFILE>``, ``KIST_PASSWORD``, ``~/.kist`` key file).
+        password: Profile password. Defaults to the normal Kist lookup
+            (``KIST_PASSWORD_<PROFILE>``, ``KIST_PASSWORD``, ``~/.kist`` password file).
         scope: Organization/project scope. Defaults to ``KIST_ORGANIZATION`` /
             ``KIST_PROJECT`` like the Git filter.
         repository_id: Overrides ``KIST_REPOSITORY_ID`` used at commit time.
@@ -77,7 +77,7 @@ class FileKist:
         *,
         git_path: Optional[str] = None,
         profile_name: Optional[str] = None,
-        master_password: Optional[str] = None,
+        password: Optional[str] = None,
         scope: Optional[KistScope] = None,
         repository_id: Optional[str] = None,
         lazy: bool = True,
@@ -88,8 +88,9 @@ class FileKist:
                              else _profile_from_git_path(self.git_path))
         self.scope = (scope or KistScope.from_environment()).validated()
         self.repository_id = repository_id
-        self._password = master_password
+        self._password = password
         self._values: Optional[dict[str, Any]] = None
+        self.retired_password_used: Optional[str] = None
         self._lock = threading.Lock()
         if not lazy:
             self.reload()
@@ -102,10 +103,10 @@ class FileKist:
             context["repository"] = self.repository_id
         return context
 
-    def _require_password(self) -> str:
+    def _current_password(self) -> Optional[str]:
         password = self._password if self._password is not None else get_profile_password(self.profile_name)
-        if not password:
-            raise MissingKeyError(f"No decryption key configured for profile {self.profile_name!r}.")
+        if not password and not retired_profile_passwords(self.profile_name):
+            raise MissingKeyError(f"No password configured for profile {self.profile_name!r}.")
         return password
 
     def reload(self) -> None:
@@ -119,7 +120,8 @@ class FileKist:
                 f"{self.path} is not a Kist v1 envelope. Export the committed blob "
                 "(git show HEAD:<path>), not the plaintext working copy."
             )
-        plaintext = decrypt_envelope(envelope, self._require_password(), self._context())
+        plaintext, self.retired_password_used = decrypt_with_password_history(
+            envelope, self.profile_name, self._context(), self._current_password())
         try:
             text = plaintext.decode("utf-8")
             loaded = yaml.load(text, Loader=_UniqueSafeLoader)

@@ -140,7 +140,7 @@ def test_database_rotation_is_atomic(db_url, scope):
     after = rows(db_url, store)
     assert [r[2] for r in after] == [r[2] for r in before]                # nothing re-encrypted
     assert bytes(after[0][3]) == bytes(before[0][3])
-    assert Kist("device", OLD, db_url, scope).secret_count() == 2  # old key still opens the profile
+    assert Kist("device", OLD, db_url, scope).secret_count() == 2  # old password still opens the profile
 
 
 def test_database_old_records_cannot_be_replayed(db_url, scope):
@@ -157,7 +157,7 @@ def test_database_old_records_cannot_be_replayed(db_url, scope):
 
 def test_database_rotate_rejects_same_password_and_missing_bundle(db_url, scope):
     store = Kist("device", OLD, db_url, scope)
-    with pytest.raises(KistError, match="No profile key bundle"):
+    with pytest.raises(KistError, match="No profile password bundle"):
         store.rotate_profile_keys(NEW)
     store.set("a", 1)
     with pytest.raises(KistError, match="must differ"):
@@ -195,13 +195,13 @@ def test_git_only_rotation(repo, home):
     # other profile untouched, working copy unchanged
     assert "secrets/other.yaml" not in git("diff", "--cached", "--name-only").stdout.decode()
     assert (repo / "secrets" / "device.yaml").read_text() == YAML
-    # key file replaced, old one kept, both owner-only
+    # password file replaced, old one kept, both owner-only
     assert key_file(home).read_text() == NEW
     assert result.old_key_backup.read_text() == OLD
     for path in (key_file(home), result.old_key_backup):
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert not (home / ".kist" / "pwd_device.new").exists()
-    # history still needs the old key
+    # history still needs the old password
     old_blob = git("cat-file", "blob", "HEAD:secrets/device.yaml").stdout
     assert decrypt_envelope(old_blob, OLD, git_context("device", "secrets/device.yaml")).decode() == YAML
     assert any("OLD password" in item for item in result.checklist)
@@ -218,7 +218,7 @@ def test_generated_password_is_strong_and_new(repo, home):
 @needs_git
 @needs_git
 def test_cli_git_only_recovery(repo, home, monkeypatch, capsys):
-    key_file(home).write_text(NEW)  # as if DB + key file rotated but Git failed
+    key_file(home).write_text(NEW)  # as if DB + password file rotated but Git failed
     monkeypatch.setattr(sys, "argv", ["kist", "profile", "rotate", "device", "--git-only"])
     main()
     assert "Re-encrypted and staged 1 file(s)" in capsys.readouterr().out
@@ -299,7 +299,7 @@ def test_database_full_rotation_db_git_and_key(repo, home, db_url, scope):
     result = rotate_profile("device", new_password=NEW, scope=scope)
     assert result.database_rotated and result.database_secrets == 2
     assert result.git_restaged == ["secrets/device.yaml"]
-    assert Kist("device", None, db_url, scope).get("cloud.api_key") == "example-value"  # reads new key file
+    assert Kist("device", None, db_url, scope).get("cloud.api_key") == "example-value"  # reads new password file
     assert index_plaintext("secrets/device.yaml", NEW).decode() == YAML
 
 
@@ -360,12 +360,12 @@ def test_cli_rotate_new_password_stdin(repo, home):
 
 
 def test_profile_create_rotate_points_to_new_command(home, monkeypatch):
-    from kist.core import create_profile_key
+    from kist.core import create_profile_password
     with pytest.raises(KistError, match="kist profile rotate"):
-        create_profile_key("device", rotate=True)
+        create_profile_password("device", rotate=True)
 
 
-# --------------------------------------------------------------------------- key history (retired keys)
+# --------------------------------------------------------------------------- Password history (retired passwords)
 
 THIRD = "third-rotation-password-0123456789abcd"
 
@@ -379,10 +379,10 @@ def test_old_commit_opens_with_retired_key(repo, home):
     rotate_profile("device", use_database=False, new_password=NEW)
     git("commit", "-q", "-m", "rotate")
     (repo / "secrets" / "device.yaml").unlink()
-    proc = checkout("HEAD~1")                     # encrypted with OLD, current key is NEW
+    proc = checkout("HEAD~1")                     # encrypted with OLD, current password is NEW
     assert proc.returncode == 0, proc.stderr
     assert (repo / "secrets" / "device.yaml").read_text() == YAML
-    assert "retired key pwd_device.old-" in proc.stderr
+    assert "retired password pwd_device.old-" in proc.stderr
 
 
 @needs_git
@@ -408,7 +408,7 @@ def test_key_history_can_be_disabled(repo, home, monkeypatch):
     rotate_profile("device", use_database=False, new_password=NEW)
     git("commit", "-q", "-m", "rotate")
     (repo / "secrets" / "device.yaml").unlink()
-    monkeypatch.setenv("KIST_KEY_HISTORY", "off")
+    monkeypatch.setenv("KIST_USE_RETIRED_PASSWORDS", "off")
     proc = checkout("HEAD~1")
     assert proc.returncode != 0
     assert not (repo / "secrets" / "device.yaml").exists() or \
@@ -442,14 +442,14 @@ def test_key_history_never_used_for_encryption(home):
         decrypt_envelope(out.getvalue(), NEW, ctx)
 
 
-def test_decrypt_with_key_history_reports_original_error(home):
+def test_decrypt_with_password_history_reports_original_error(home):
     import io
     from kist import git_clean_stream
-    from kist.core import decrypt_with_key_history
+    from kist.core import decrypt_with_password_history
     out = io.BytesIO()
     git_clean_stream("device", THIRD, io.StringIO(YAML), out, "secrets/device.yaml")
     with pytest.raises(DecryptionError):
-        decrypt_with_key_history(out.getvalue(), "device", git_context("device", "secrets/device.yaml"), OLD)
+        decrypt_with_password_history(out.getvalue(), "device", git_context("device", "secrets/device.yaml"), OLD)
 
 
 @needs_git
@@ -466,24 +466,54 @@ def test_cli_retired_keys_list_and_delete(repo, home, monkeypatch, capsys):
     git("commit", "-q", "-m", "r1")
     import time; time.sleep(1.1)
     rotate_profile("device", use_database=False, new_password=THIRD)
-    monkeypatch.setattr(sys, "argv", ["kist", "profile", "retired-keys", "device"])
+    monkeypatch.setattr(sys, "argv", ["kist", "profile", "retired-passwords", "device"])
     main()
     assert capsys.readouterr().out.count("pwd_device.old-") == 2
-    proc = subprocess.run([sys.executable, "-m", "kist", "profile", "retired-keys", "device", "--delete"],
+    proc = subprocess.run([sys.executable, "-m", "kist", "profile", "retired-passwords", "device", "--delete"],
                           stdin=subprocess.DEVNULL, capture_output=True, text=True)
     assert proc.returncode == 1 and "--yes" in proc.stderr
-    monkeypatch.setattr(sys, "argv", ["kist", "profile", "retired-keys", "device", "--delete", "--keep", "1", "--yes"])
+    monkeypatch.setattr(sys, "argv", ["kist", "profile", "retired-passwords", "device", "--delete", "--keep", "1", "--yes"])
     main()
     remaining = list((home / ".kist").glob("pwd_device.old-*"))
-    assert len(remaining) == 1 and remaining[0].read_text() == NEW   # newest retired key kept
+    assert len(remaining) == 1 and remaining[0].read_text() == NEW   # newest retired password kept
 
 
 @needs_git
 def test_rotation_after_skip_git_rotation(repo, home):
-    """Files still under a retired key (earlier --skip-git) can be rotated forward."""
+    """Files still under a retired password (earlier --skip-git) can be rotated forward."""
     from kist.rotate import _install_new_password, _stage_new_password
     staged = _stage_new_password("device", NEW)
     _install_new_password("device", staged, OLD)       # key changed, Git untouched
     result = rotate_profile("device", use_database=False, new_password=THIRD)
     assert result.git_restaged == ["secrets/device.yaml"]
     assert index_plaintext("secrets/device.yaml", THIRD).decode() == YAML
+
+
+@needs_git
+def test_export_and_file_backend_use_retired_passwords(repo, home, tmp_path):
+    from kist import FileKist
+    from kist.export import export_envelope
+    git("tag", "v1")                                       # encrypted with OLD
+    rotate_profile("device", use_database=False, new_password=NEW)
+    git("commit", "-q", "-m", "rotate")
+    old = export_envelope("secrets/device.yaml", str(tmp_path / "v1.kist"), revision="v1", verify=True)
+    assert old.verified_keys == 2
+    store = FileKist(old.output, git_path="secrets/device.yaml")
+    assert store.get("cloud.api_key") == "example-value"
+    assert store.retired_password_used.startswith("pwd_device.old-")
+    current = FileKist(export_envelope("secrets/device.yaml", str(tmp_path / "now.kist")).output,
+                       git_path="secrets/device.yaml")
+    assert current.get("mqtt.port") == 8883 and current.retired_password_used is None
+
+
+@needs_git
+def test_retired_passwords_switch_off_also_applies_to_file_backend(repo, home, tmp_path, monkeypatch):
+    from kist import FileKist
+    from kist.export import export_envelope
+    git("tag", "v1")
+    rotate_profile("device", use_database=False, new_password=NEW)
+    git("commit", "-q", "-m", "rotate")
+    out = export_envelope("secrets/device.yaml", str(tmp_path / "v1.kist"), revision="v1").output
+    monkeypatch.setenv("KIST_USE_RETIRED_PASSWORDS", "off")
+    with pytest.raises(DecryptionError):
+        FileKist(out, git_path="secrets/device.yaml").get("cloud.api_key")
