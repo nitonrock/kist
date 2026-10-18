@@ -21,10 +21,12 @@ from kist.core import (
     KistError,
     MissingKeyError,
     decrypt_envelope,
+    decrypt_with_key_history,
     encrypt_envelope,
     get_profile_password,
     git_context,
     is_kist_envelope,
+    retired_profile_keys,
 )
 
 HIGH_CONFIDENCE_PATTERNS = [
@@ -141,7 +143,7 @@ def git_smudge_stream(
         return
 
     password = master_password or get_profile_password(profile_name)
-    if not password:
+    if not password and not retired_profile_keys(profile_name):
         raise MissingKeyError(
             f"No decryption key configured for profile {profile_name!r}; refusing checkout of protected content."
         )
@@ -149,7 +151,9 @@ def git_smudge_stream(
         raise InvalidEnvelopeError("Protected Git file is not a valid Kist v1 envelope.")
 
     target_path = filepath or _stream_filepath()
-    plaintext = decrypt_envelope(envelope, password, git_context(profile_name, target_path))
+    plaintext, retired = decrypt_with_key_history(envelope, profile_name, git_context(profile_name, target_path), password)
+    if retired:
+        print(f"kist: {target_path}: opened with retired key {retired} (older content).", file=sys.stderr)
     try:
         out_stream.write(plaintext.decode("utf-8"))
     except UnicodeDecodeError as exc:
