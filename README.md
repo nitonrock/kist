@@ -24,6 +24,7 @@
   <a href="#how-it-works">How it works</a> ·
   <a href="#git-workflow">Git workflow</a> ·
   <a href="#cicd-integration--gitops">CI/CD & GitOps</a> ·
+  <a href="#rotating-a-profile-password">Key rotation</a> ·
   <a href="#security-boundaries">Security boundaries</a> ·
   <a href="#license">License</a>
 </p>
@@ -132,7 +133,7 @@ KMS data-encryption keys
 Kist Guard integration
 Cloud KMS providers
 Managed hosting
-Key rotation and migration tooling
+Migration tooling between key modes (password → KMS/TPM)
 ```
 
 ## Installation
@@ -685,6 +686,53 @@ On POSIX systems, Kist uses owner-only protections for local key material:
 ```
 
 Keep local profile keys out of Git, backups with broad access, screenshots, and chat messages. Prefer runtime-injected environment variables or a purpose-built secret delivery mechanism for deployed applications.
+
+## Rotating a profile password
+
+Rotate when someone with access leaves, on a schedule, or after a suspected leak:
+
+```bash
+kist profile rotate production --dry-run   # validate the current key and show the plan
+kist profile rotate production             # asks for confirmation; --yes in scripts
+git commit -m "rotate production profile key"
+```
+
+One command updates everything Kist controls, in an order that never leaves you without a working key:
+
+| Step | What happens |
+|--|--|
+| 1. Check | The current password must open the profile in PostgreSQL and in Git. Secret files must have no uncommitted changes, so the rotation commit contains only re-encryption. |
+| 2. Stage the new key | A new random password is written to `~/.kist/pwd_<profile>.new` (0600) before anything else changes. |
+| 3. PostgreSQL | In **one transaction**, Kist generates new content and index keys, re-encrypts every secret, increments every record version and wraps the new keys with the new password. Either everything is rotated or nothing is. Listeners receive a `key_bundle_rotated` notification. |
+| 4. Local key | The new key replaces `~/.kist/pwd_<profile>`. The old one is kept as `pwd_<profile>.old-<timestamp>`. |
+| 5. Git | `git add --renormalize` re-encrypts the profile's secret files with the new password and stages them for review. Nothing is committed for you. |
+
+The command then prints a checklist of what Kist cannot reach: CI/CD secrets, environment variables, other developers, running services, exported device bundles and TPM-sealed credentials.
+
+| Option | Use |
+|--|--|
+| `--dry-run` | Show the plan and verify the current key; change nothing |
+| `--yes` | Skip the prompt (required when not interactive) |
+| `--new-password-stdin` | Use your own password instead of a generated one, e.g. `pass show kist/prod \| kist profile rotate prod --yes --new-password-stdin` |
+| `--rewrap-only` | Only re-protect the existing keys with the new password. Faster, but anyone who already obtained the keys keeps access. Prefer a full rotation. |
+| `--skip-db` / `--skip-git` | Limit the rotation to one side |
+| `--git-only` | Recovery: if the database and key file were rotated but Git failed, re-encrypt the Git files with the current key |
+| `--show-password` | Print the new password once (interactive terminals only) |
+
+What rotation does **not** do:
+
+- **It does not rewrite history.** Old Git commits and old database backups still open with the old password. After a leak, also change the secret values themselves (new API keys and so on), and treat the old key as compromised.
+- **It does not reach other machines.** Running services fail closed on their next database read until they receive the new password. Plan a short rollout: rotate, update CI and deployment secrets, restart services.
+
+From Python:
+
+```python
+from kist import Kist
+
+store = Kist("production")                 # current key
+store.rotate_profile_keys(new_password)    # new keys, every secret re-encrypted
+store.rewrap_profile_password(new_password)  # or: rewrap only
+```
 
 ## Python runtime stores
 

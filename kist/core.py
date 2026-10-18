@@ -292,7 +292,7 @@ def get_profile_password(profile_name: str, auto_generate: bool = False, *,
 def create_profile_key(profile_name: str, *, rotate: bool = False) -> str:
     """Create a local password only. Replacing it is NOT ciphertext rotation."""
     if rotate:
-        raise KistError("Use rewrap_profile_password(); replacing a password file is not rotation.")
+        raise KistError("Use 'kist profile rotate'; replacing a password file is not rotation.")
     password = generate_password()
     write_secure_local_password(profile_password_path(profile_name), password)
     return password
@@ -365,12 +365,23 @@ def resolve_secret_file_path(path_or_name: Optional[str] = None, profile: Option
             return candidate
     return os.path.join("secrets", f"{target_profile}.yaml") if os.path.isdir("secrets") else f"secrets_{target_profile}.yaml"
 
-def get_profile_and_password(filepath: str, auto_generate: bool = False) -> tuple[str, Optional[str]]:
+def profile_from_path(filepath: str) -> str:
+    """Profile the Git filter derives from a secret file name (secrets/x.yaml -> x)."""
     name = os.path.basename(filepath)
     base = name[:-5] if name.endswith(".yaml") else name[:-4] if name.endswith(".yml") else name
-    profile = "default" if base == "secrets" else base.removeprefix("secrets_")
-    profile = _validate_profile_name(profile)
+    return _validate_profile_name("default" if base == "secrets" else base.removeprefix("secrets_"))
+
+def get_profile_and_password(filepath: str, auto_generate: bool = False) -> tuple[str, Optional[str]]:
+    profile = profile_from_path(filepath)
     return profile, get_profile_password(profile, auto_generate)
+
+def profile_password_source(profile_name: str) -> Optional[str]:
+    """Where get_profile_password() would read from: env var name, 'file', or None."""
+    profile = _validate_profile_name(profile_name)
+    for name in (f"KIST_PASSWORD_{profile.upper()}", "KIST_PASSWORD"):
+        if os.getenv(name):
+            return name
+    return "file" if profile_password_path(profile).exists() else None
 
 def mask_db_url(db_url: Optional[str]) -> str:
     """Conservative diagnostic: discard userinfo, query, and fragment entirely."""
@@ -980,6 +991,69 @@ class Kist:
             self._notify(cursor, bundle.id, "key_bundle_rewrapped")
         self._write(operation)
         self.master_password = new_password
+
+    def secret_count(self) -> Optional[int]:
+        """Number of secrets in this profile, or None if it has no key bundle yet.
+
+        Opening the bundle also proves the current password is correct.
+        """
+        self._ensure_scope()
+        with safe_db_connect(self._require_database()) as connection:
+            with connection.cursor() as cursor:
+                self._check_schema(cursor)
+                if self._load_bundle(cursor) is None:
+                    return None
+                cursor.execute("SELECT count(*) FROM kist_secrets WHERE profile_id = %s", (self.profile_id,))
+                return int(cursor.fetchone()[0])
+
+    def rotate_profile_keys(self, new_password: str, *, policy: Argon2Policy = Argon2Policy()) -> int:
+        """Replace the profile's content and index keys and re-encrypt every secret.
+
+        Runs in one transaction under the profile lock: either every record is
+        re-encrypted under fresh random keys wrapped by ``new_password``, or
+        nothing changes. Each record's ``secret_version`` is incremented, so
+        records from older backups cannot be replayed into the rotated profile,
+        and old backups stay readable only with the old password and old keys.
+        Returns the number of re-encrypted secrets.
+        """
+        _password_bytes(new_password)
+        policy.validated()
+        if new_password == self._require_password():
+            raise KistError("The new password must differ from the current one.")
+
+        def operation(cursor: psycopg.Cursor[Any]) -> int:
+            old = self._load_bundle(cursor)
+            if old is None:
+                raise KistError("No profile key bundle exists to rotate.")
+            cursor.execute("""SELECT id, lookup_token, key_bundle_id, crypto_version, secret_version, encrypted_blob
+                FROM kist_secrets WHERE profile_id = %s ORDER BY id FOR UPDATE""", (self.profile_id,))
+            records = []
+            for row in cursor.fetchall():
+                key, value = self._decode_row(old, row)
+                records.append((uuid.UUID(str(row[0])), key, value, int(row[4])))
+            new = _KeyBundle(old.id, os.urandom(32), os.urandom(32))
+            wrapped = encrypt_envelope(b"KKB1" + new.content_key + new.index_key,
+                                       new_password, self._bundle_context(new.id), policy)
+            cursor.execute("""UPDATE kist_key_bundles SET wrapped_bundle = %s,
+                wrapper_revision = wrapper_revision + 1, updated_at = NOW()
+                WHERE id = %s AND profile_id = %s""", (wrapped, new.id, self.profile_id))
+            for row_id, key, value, version in records:
+                if version >= 2 ** 63 - 1:
+                    raise KistError("Secret version exhausted.")
+                token = self._lookup_token(new, key)
+                nonce = os.urandom(12)
+                aad = self._row_context(new, row_id, token, version + 1)
+                blob = _ROW_MAGIC + nonce + AESGCM(new.content_key).encrypt(
+                    nonce, _json_bytes({"key": key, "value": value}), _ROW_MAGIC + aad)
+                cursor.execute("""UPDATE kist_secrets SET lookup_token = %s, secret_version = %s,
+                    encrypted_blob = %s, updated_at = NOW() WHERE id = %s AND profile_id = %s""",
+                    (token, version + 1, blob, row_id, self.profile_id))
+            self._notify(cursor, new.id, "key_bundle_rotated")
+            return len(records)
+
+        count = self._write(operation)
+        self.master_password = new_password
+        return count
 
     def git_clean(self) -> None:
         from kist.git import git_clean_stream

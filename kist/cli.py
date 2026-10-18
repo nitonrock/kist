@@ -31,6 +31,67 @@ def _scope_from_args(args: argparse.Namespace) -> KistScope:
     return KistScope(organization=args.org or base.organization, project=args.project or base.project).validated()
 
 
+def _run_rotate(args: argparse.Namespace) -> None:
+    from kist.rotate import plan_rotation, restage_git_with_current_key, rotate_profile
+
+    if args.git_only:
+        files = restage_git_with_current_key(args.name)
+        print(f"Re-encrypted and staged {len(files)} file(s) with the current key for profile '{args.name}'.")
+        for path in files:
+            print(f"  {path}")
+        return
+
+    scope = _scope_from_args(args)
+    use_db = False if args.skip_db else None
+    plan, _ = plan_rotation(args.name, scope=scope, use_database=use_db, use_git=not args.skip_git,
+                            rewrap_only=args.rewrap_only)
+    mode = "rewrap key bundle only" if args.rewrap_only else "generate new keys and re-encrypt every secret"
+    print(f"Rotation plan for profile '{plan.profile}' ({scope.organization}/{scope.project}):")
+    print(f"  Current key:  from {'~/.kist/pwd_' + plan.profile if plan.password_source == 'file' else plan.password_source} (verified)")
+    if plan.database:
+        print(f"  PostgreSQL:   {plan.database_secrets} secrets, {mode}")
+    else:
+        print("  PostgreSQL:   skipped" if args.skip_db else "  PostgreSQL:   no data for this profile")
+    if plan.git_files:
+        print(f"  Git:          re-encrypt and stage {len(plan.git_files)} file(s): {', '.join(plan.git_files)}")
+    else:
+        print("  Git:          skipped" if args.skip_git else "  Git:          no secret files for this profile")
+    print(f"  Local key:    write new ~/.kist/pwd_{plan.profile}, keep the old one as a backup")
+    if args.dry_run:
+        print("Dry run: nothing changed.")
+        return
+    if not plan.database and not plan.git_files:
+        raise KistError(f"Nothing to rotate for profile '{plan.profile}'.")
+
+    new_password = None
+    if args.new_password_stdin:
+        new_password = sys.stdin.readline().rstrip("\n")
+        if not new_password:
+            raise KistError("No password received on stdin.")
+    if not args.yes:
+        if not sys.stdin.isatty() or args.new_password_stdin:
+            raise KistError("Refusing to rotate without confirmation; pass --yes in non-interactive use.")
+        try:
+            answer = input("Rotate now? Running services will need the new password. [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nkist: rotation cancelled.", file=sys.stderr)
+            sys.exit(130)
+        if answer not in ("y", "yes"):
+            print("kist: rotation cancelled.", file=sys.stderr)
+            sys.exit(1)
+    if args.show_password:
+        _require_tty_for_key_display()
+
+    result = rotate_profile(args.name, new_password=new_password, scope=scope, use_database=use_db,
+                            use_git=not args.skip_git, rewrap_only=args.rewrap_only, log=print)
+    if args.show_password:
+        print("New profile password (shown once):")
+        print(get_profile_password(args.name, allow_env=False))
+    print("\nRotation complete. Still to do:")
+    for i, item in enumerate(result.checklist, 1):
+        print(f"  {i}. {item}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Kist: Git-native encrypted configuration and secret hygiene tooling")
     parser.add_argument("--org", help="Organization namespace; defaults to KIST_ORG_ID or local")
@@ -63,6 +124,22 @@ def main() -> None:
     delete_prof_parser.add_argument("--delete-key", "-k", action="store_true", help="Also delete local key file")
     delete_prof_parser.add_argument("--force", "-f", action="store_true", help="Bypass confirmation prompt")
     delete_prof_parser.add_argument("--yes", "-y", action="store_true", help="Automatically confirm prompts")
+
+    rotate_parser = profile_subparsers.add_parser(
+        "rotate", help="Rotate a profile password: new keys in PostgreSQL, re-encrypted Git files, new local key")
+    rotate_parser.add_argument("name", type=str, help="Profile name")
+    rotate_parser.add_argument("--dry-run", action="store_true", help="Show what would change and validate the current key")
+    rotate_parser.add_argument("--yes", "-y", action="store_true", help="Do not ask for confirmation (required when not interactive)")
+    rotate_parser.add_argument("--rewrap-only", action="store_true",
+                               help="Only rewrap the database key bundle; keep data keys (faster, weaker)")
+    rotate_parser.add_argument("--skip-db", action="store_true", help="Do not touch PostgreSQL")
+    rotate_parser.add_argument("--skip-git", action="store_true", help="Do not re-encrypt Git secret files")
+    rotate_parser.add_argument("--git-only", action="store_true",
+                               help="Recovery: re-encrypt Git files with the current key, change nothing else")
+    rotate_parser.add_argument("--new-password-stdin", action="store_true",
+                               help="Read the new password from stdin instead of generating one")
+    rotate_parser.add_argument("--show-password", action="store_true",
+                               help="Print the new password once (interactive terminals only)")
 
     rm_key_parser = profile_subparsers.add_parser("remove-key", aliases=["delete-key"], help="Remove local key file (~/.kist/pwd_<name>)")
     rm_key_parser.add_argument("name", type=str, help="Profile name")
@@ -147,6 +224,9 @@ def main() -> None:
                 key_removed = remove_profile_key(args.name)
                 msg += " Removed local key file." if key_removed else " Local key file not found."
             print(msg)
+            return
+        if args.command == "profile" and args.profile_command == "rotate":
+            _run_rotate(args)
             return
         if args.command == "profile" and args.profile_command in {"remove-key", "delete-key"}:
             bypass_prompt = getattr(args, "force", False) or getattr(args, "yes", False)
