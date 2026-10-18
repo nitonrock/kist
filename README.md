@@ -899,6 +899,25 @@ with Kist.from_file("/usr/share/gateway/gateway.kist",
 
 systemd decrypts the credential into a private, in-memory directory that only this service can read. A cloned SD card is useless on another board, because the TPM will not unseal it. Add `--tpm2-pcrs=7` when encrypting to also bind it to the device's Secure Boot state.
 
+Try it on any Linux machine with systemd 250+ and a TPM 2.0, without writing a unit file:
+
+```bash
+sudo systemd-run --wait --pipe -p DynamicUser=yes \
+  -p LoadCredentialEncrypted=kist-password:/etc/credstore.encrypted/kist-password.cred \
+  /opt/gateway/bin/python -m gateway
+```
+
+Verified on openSUSE with TPM 2.0 and Kist 0.2.0:
+
+| Check | Result |
+|--|--|
+| Service runs as a throwaway `DynamicUser` and reads secrets via `Kist.from_file()` | Works |
+| Same service without `LoadCredentialEncrypted=` | Cannot read anything (`CREDENTIALS_DIRECTORY` absent) |
+| Password on disk | Only the sealed `.cred` file; no plaintext anywhere |
+| Credential loaded under another name | Refused by systemd: `Embedded credential name 'kist-password' does not match filename 'other', refusing` (status `243/CREDENTIALS`) |
+
+Files the service needs (Python, the `.kist` file) must live outside `/home` and `/tmp`: `DynamicUser=yes` gives the service a private `/tmp` and read-only, inaccessible home directories.
+
 #### Firmware build in GitHub Actions
 
 Export from the release tag so that every image is reproducible and traceable to a reviewed commit:
