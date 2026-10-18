@@ -1,6 +1,6 @@
 # Kist encrypted-secret filters
 
-secrets*.yaml filter=kist
-secrets*.yml filter=kist
-secrets/*.yaml filter=kist
-secrets/*.yml filter=kist
+secrets*.yaml filter=kist diff=kist
+secrets*.yml filter=kist diff=kist
+**/secrets/**/*.yaml filter=kist diff=kist
+**/secrets/**/*.yml filter=kist diff=kist
