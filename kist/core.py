@@ -7,7 +7,7 @@ One existing profile password unlocks a randomly generated content/index key
 bundle. Names and values are encrypted together; exact name lookup uses HMAC.
 All mutations through this module share a transaction-scoped profile lock.
 
-No KMS, recipients, Guard, key caching, automatic content-key rotation,
+No KMS, recipients, Guard, key caching, automatic content-Password rotation,
 collection-completeness proof, or rollback protection is implemented here.
 Future access constructions must have explicit versions and fail closed.
 Profile labels, row counts, sizes, revisions, and access patterns remain visible.
@@ -286,28 +286,28 @@ def get_profile_password(profile_name: str, auto_generate: bool = False, *,
         if value:
             return value
     if auto_generate:
-        raise KistError("Implicit generation is disabled; use create_profile_key().")
+        raise KistError("Implicit generation is disabled; use create_profile_password().")
     return None
 
-def key_history_enabled() -> bool:
-    return os.getenv("KIST_KEY_HISTORY", "on").strip().lower() not in {"0", "off", "false", "no"}
+def password_history_enabled() -> bool:
+    return os.getenv("KIST_USE_RETIRED_PASSWORDS", "on").strip().lower() not in {"0", "off", "false", "no"}
 
-def retired_profile_key_files(profile_name: str) -> list[Path]:
-    """Retired local keys kept by 'kist profile rotate', newest first."""
+def retired_profile_password_files(profile_name: str) -> list[Path]:
+    """Retired local passwords kept by 'kist profile rotate', newest first."""
     profile = _validate_profile_name(profile_name)
     directory = Path(get_kist_dir())
     if not directory.is_dir():
         return []
     return sorted(directory.glob(f"pwd_{profile}.old-*"), key=lambda p: p.name, reverse=True)
 
-def retired_profile_keys(profile_name: str) -> list[tuple[str, str]]:
-    """(label, password) pairs for retired keys, used for decryption only.
+def retired_profile_passwords(profile_name: str) -> list[tuple[str, str]]:
+    """(label, password) pairs for retired passwords, used for decryption only.
 
     Sources, newest first: ``KIST_RETIRED_PASSWORDS_<PROFILE>`` (one per line,
     for CI) then ``~/.kist/pwd_<profile>.old-<timestamp>`` files. Disabled
-    entirely with ``KIST_KEY_HISTORY=off``.
+    entirely with ``KIST_USE_RETIRED_PASSWORDS=off``.
     """
-    if not key_history_enabled():
+    if not password_history_enabled():
         return []
     profile = _validate_profile_name(profile_name)
     keys: list[tuple[str, str]] = []
@@ -315,19 +315,19 @@ def retired_profile_keys(profile_name: str) -> list[tuple[str, str]]:
     for index, line in enumerate(l.strip() for l in env_value.splitlines()):
         if line:
             keys.append((f"KIST_RETIRED_PASSWORDS_{profile.upper()}[{index}]", line))
-    for path in retired_profile_key_files(profile):
+    for path in retired_profile_password_files(profile):
         try:
             keys.append((path.name, read_secure_local_password(path)))
         except (OSError, KistError):
             continue
     return keys
 
-def decrypt_with_key_history(envelope: bytes, profile_name: str, context: dict[str, str],
+def decrypt_with_password_history(envelope: bytes, profile_name: str, context: dict[str, str],
                              password: Optional[str]) -> tuple[bytes, Optional[str]]:
-    """Decrypt with the current key, then with retired keys (read-only fallback).
+    """Decrypt with the current password, then with retired passwords (read-only fallback).
 
-    Returns (plaintext, label of the retired key used or None). New encryption
-    must always use the current key; this is only for reading older content.
+    Returns (plaintext, label of the retired password used or None). New encryption
+    must always use the current password; this is only for reading older content.
     """
     first_error: Optional[DecryptionError] = None
     if password:
@@ -335,7 +335,7 @@ def decrypt_with_key_history(envelope: bytes, profile_name: str, context: dict[s
             return decrypt_envelope(envelope, password, context), None
         except DecryptionError as exc:
             first_error = exc
-    for label, retired in retired_profile_keys(profile_name):
+    for label, retired in retired_profile_passwords(profile_name):
         if retired == password:
             continue
         try:
@@ -344,9 +344,9 @@ def decrypt_with_key_history(envelope: bytes, profile_name: str, context: dict[s
             continue
     if first_error is not None:
         raise first_error
-    raise MissingKeyError(f"No decryption key configured for profile {profile_name!r}.")
+    raise MissingKeyError(f"No password configured for profile {profile_name!r}.")
 
-def create_profile_key(profile_name: str, *, rotate: bool = False) -> str:
+def create_profile_password(profile_name: str, *, rotate: bool = False) -> str:
     """Create a local password only. Replacing it is NOT ciphertext rotation."""
     if rotate:
         raise KistError("Use 'kist profile rotate'; replacing a password file is not rotation.")
@@ -354,7 +354,7 @@ def create_profile_key(profile_name: str, *, rotate: bool = False) -> str:
     write_secure_local_password(profile_password_path(profile_name), password)
     return password
 
-def remove_profile_key(profile_name: str) -> bool:
+def remove_profile_password(profile_name: str) -> bool:
     """Remove a local profile password file if it exists."""
     profile = _validate_profile_name(profile_name)
     path = profile_password_path(profile)
@@ -364,7 +364,7 @@ def remove_profile_key(profile_name: str) -> bool:
     except FileNotFoundError:
         return False
 
-delete_profile_key = remove_profile_key
+delete_profile_password = remove_profile_password
 
 def resolve_secret_file_path(path_or_name: Optional[str] = None, profile: Optional[str] = None) -> str:
     if path_or_name:
@@ -658,14 +658,14 @@ class Kist:
     bundles are created only by writes. Methods open their own READ COMMITTED
     transactions. Restrict the database role and search_path to trusted schemas.
     """
-    def __init__(self, profile_name: Optional[str] = None, master_password: Optional[str] = None,
+    def __init__(self, profile_name: Optional[str] = None, password: Optional[str] = None,
                  db_url: Optional[str] = None, scope: Optional[KistScope] = None) -> None:
         resolved_profile = profile_name if profile_name is not None else os.getenv("KIST_PROFILE", "default")
         self.profile_name = _validate_profile_name(resolved_profile)
         self.scope = (scope or KistScope.from_environment()).validated()
-        self.master_password = master_password if master_password is not None else get_profile_password(self.profile_name)
-        if self.master_password is not None:
-            _password_bytes(self.master_password)
+        self.password = password if password is not None else get_profile_password(self.profile_name)
+        if self.password is not None:
+            _password_bytes(self.password)
         configured = os.getenv("KIST_DATABASE_URL") if db_url is None else db_url
         self.db_url = enforce_ssl_url(configured) if configured else None
         self.organization_id: Optional[uuid.UUID] = None
@@ -682,9 +682,9 @@ class Kist:
         return FileKist(path, **kwargs)
 
     def _require_password(self) -> str:
-        if not self.master_password:
+        if not self.password:
             raise MissingKeyError(f"No encryption key configured for profile {self.profile_name!r}.")
-        return self.master_password
+        return self.password
 
     def _require_database(self) -> str:
         if not self.db_url:
@@ -1048,7 +1048,7 @@ class Kist:
         def operation(cursor: psycopg.Cursor[Any]) -> None:
             bundle = self._load_bundle(cursor)
             if bundle is None:
-                raise KistError("No profile key bundle exists to rewrap.")
+                raise KistError("No profile password bundle exists to rewrap.")
             wrapped = encrypt_envelope(b"KKB1" + bundle.content_key + bundle.index_key,
                                        new_password, self._bundle_context(bundle.id), policy)
             cursor.execute("""UPDATE kist_key_bundles SET wrapped_bundle = %s,
@@ -1056,7 +1056,7 @@ class Kist:
                 WHERE id = %s AND profile_id = %s""", (wrapped, bundle.id, self.profile_id))
             self._notify(cursor, bundle.id, "key_bundle_rewrapped")
         self._write(operation)
-        self.master_password = new_password
+        self.password = new_password
 
     def secret_count(self) -> Optional[int]:
         """Number of secrets in this profile, or None if it has no key bundle yet.
@@ -1090,7 +1090,7 @@ class Kist:
         def operation(cursor: psycopg.Cursor[Any]) -> int:
             old = self._load_bundle(cursor)
             if old is None:
-                raise KistError("No profile key bundle exists to rotate.")
+                raise KistError("No profile password bundle exists to rotate.")
             cursor.execute("""SELECT id, lookup_token, key_bundle_id, crypto_version, secret_version, encrypted_blob
                 FROM kist_secrets WHERE profile_id = %s ORDER BY id FOR UPDATE""", (self.profile_id,))
             records = []
@@ -1118,16 +1118,16 @@ class Kist:
             return len(records)
 
         count = self._write(operation)
-        self.master_password = new_password
+        self.password = new_password
         return count
 
     def git_clean(self) -> None:
         from kist.git import git_clean_stream
-        git_clean_stream(self.profile_name, self.master_password)
+        git_clean_stream(self.profile_name, self.password)
 
     def git_smudge(self) -> None:
         from kist.git import git_smudge_stream
-        git_smudge_stream(self.profile_name, self.master_password)
+        git_smudge_stream(self.profile_name, self.password)
 
 
 def _lock_id(name: str) -> int:

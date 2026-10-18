@@ -52,7 +52,7 @@ uv tool install kist
 export KIST_ENV=development KIST_TLS_MODE=disable
 export KIST_DATABASE_URL='postgresql://kist:kist@127.0.0.1:5432/kist'
 
-# 3. Create a profile key and the schema
+# 3. Create a profile password and the schema
 kist profile create default
 kist init-db
 
@@ -88,7 +88,7 @@ Bringing your own database also means:
 
 - **No lock-in.** The schema is documented in [Database model](#database-model), and the envelope format is open. You can leave whenever you like.
 - **No outbound dependency.** Secret retrieval keeps working when a vendor has an outage, changes its pricing or shuts down.
-- **Defence in depth.** The database never sees plaintext or secret names, only AES-256-GCM ciphertext and HMAC-blinded keys. A stolen database dump is useless without the profile keys.
+- **Defence in depth.** The database never sees plaintext or secret names, only AES-256-GCM ciphertext and HMAC-blinded keys. A stolen database dump is useless without the profile passwords.
 
 The trade-off is honest: you own backups, key custody and access control. Kist keeps those jobs small; it does not make them disappear.
 
@@ -127,7 +127,7 @@ Kist reduces moving parts in a secret workflow; it does not replace operational 
 | Where your secrets live | Your Git + your PostgreSQL | Your Git (+ cloud KMS if used) | Your Git | Your disk | Your Vault cluster | Vendor cloud (or self-hosted server) |
 | Extra infrastructure | PostgreSQL (you likely have it) | None (+ KMS optional) | None | None | Vault cluster | SaaS or self-hosted server |
 | Encryption | Argon2id → AES-256-GCM, scope-bound AAD | AES-256-GCM, age / PGP / cloud KMS | AES-256-CTR, GPG | None | AES-256-GCM | AES-256-GCM |
-| Multi-team / multi-profile isolation | ✅ per-profile keys, path-based routing | ⚠️ via `.sops.yaml` rules | ⚠️ multiple keys | ❌ | ✅ policies | ✅ projects/envs |
+| Multi-team / multi-profile isolation | ✅ per-profile passwords, path-based routing | ⚠️ via `.sops.yaml` rules | ⚠️ multiple keys | ❌ | ✅ policies | ✅ projects/envs |
 | Anti-transplant / rollback protection | ✅ context + version bound | ⚠️ MAC per file | ❌ | ❌ | n/a | n/a |
 | Cloud KMS / HSM | 🔜 planned | ✅ | ❌ | ❌ | ✅ | ✅ |
 | Fine-grained access policies & audit | ❌ (use Git + DB roles) | ❌ | ❌ | ❌ | ✅ | ✅ |
@@ -182,7 +182,7 @@ For local development, configure PostgreSQL and a profile password. Never commit
 
 You can either generate local password files or inject passwords via environment variables:
 
-**Option A: Generate a secure local profile key (recommended for local development)**
+**Option A: Generate a secure local profile password (recommended for local development)**
 
 Generate a cryptographically secure random password and store it securely in `~/.kist/` with owner-only permissions (`0600`):
 
@@ -194,7 +194,7 @@ kist profile create default
 kist profile create team_a
 ```
 
-When a local key file exists in `~/.kist/`, Kist resolves it automatically—no password environment variables required.
+When a local password file exists in `~/.kist/`, Kist resolves it automatically—no password environment variables required.
 
 **Option B: Set environment variables (recommended for CI/CD and containers)**
 
@@ -462,17 +462,17 @@ kist delete stripe.api_key
 kist delete stripe.api_key --force
 ```
 
-Delete an entire profile partition or manage local key files:
+Delete an entire profile partition or manage local password files:
 
 ```bash
 # Permanently delete a profile partition and all its encrypted secrets in PostgreSQL:
 kist profile delete preview_env
 
-# Delete database partition and also remove local key file (~/.kist/pwd_preview_env):
-kist profile delete preview_env --delete-key --force
+# Delete database partition and also remove local password file (~/.kist/pwd_preview_env):
+kist profile delete preview_env --delete-password --force
 
-# Remove local key file without modifying the database:
-kist profile remove-key preview_env
+# Remove local password file without modifying the database:
+kist profile remove-password preview_env
 ```
 
 Reconstruct a profile as YAML:
@@ -571,7 +571,7 @@ kist fix --apply
 kist status
 ```
 
-`kist fix` is a dry run. `kist fix --apply` repairs only local Git integration. It does not create profile keys, restage files, or modify encrypted secret values.
+`kist fix` is a dry run. `kist fix --apply` repairs only local Git integration. It does not create profile passwords, restage files, or modify encrypted secret values.
 
 ### Local hook limits
 
@@ -661,13 +661,13 @@ Standalone, copy-paste templates are available in the [`resources/`](https://git
 
 For detailed setup instructions and variable configuration, see the [CI/CD Resources Guide](https://github.com/nitonrock/kist/blob/main/resources/README.md).
 
-## Password resolution and local profile keys
+## Password resolution and local profile passwords
 
 For any profile named `<name>`, Kist resolves the required password in the following order of precedence:
 
 1. **Profile-Specific Environment Variable**: `KIST_PASSWORD_<NAME_UPPERCASE>` (e.g., `KIST_PASSWORD_PRODUCTION`, `KIST_PASSWORD_STAGING`, `KIST_PASSWORD_DEFAULT`)
 2. **Global Fallback Environment Variable**: `KIST_PASSWORD` (used across profiles if no specific variable is defined)
-3. **Local Key File**: `~/.kist/pwd_<name>` (e.g., `~/.kist/pwd_production`, `~/.kist/pwd_staging`, `~/.kist/pwd_default`)
+3. **Local password file**: `~/.kist/pwd_<name>` (e.g., `~/.kist/pwd_production`, `~/.kist/pwd_staging`, `~/.kist/pwd_default`)
 
 ### Managing multiple profiles with the CLI
 
@@ -681,7 +681,7 @@ export KIST_PASSWORD_STAGING='staging-specific-random-key'
 kist --profile production lock secrets/production.yaml
 kist --profile staging status
 
-# 2. Using local key files (recommended for local development)
+# 2. Using local password files (recommended for local development)
 kist profile create development
 kist profile create staging
 
@@ -694,25 +694,25 @@ Create a local profile password explicitly:
 kist profile create production
 ```
 
-Kist intentionally does **not** generate profile keys implicitly during normal operations. A surprise key is a fine way to create a surprise recovery problem.
+Kist intentionally does **not** generate profile passwords implicitly during normal operations. A surprise password is a fine way to create a surprise recovery problem.
 
-On POSIX systems, Kist uses owner-only protections for local key material:
+On POSIX systems, Kist uses owner-only protections for local password material:
 
 ```text
 ~/.kist/                 0700
 ~/.kist/pwd_<profile>    0600
 ```
 
-Keep local profile keys out of Git, backups with broad access, screenshots, and chat messages. Prefer runtime-injected environment variables or a purpose-built secret delivery mechanism for deployed applications.
+Keep local profile passwords out of Git, backups with broad access, screenshots, and chat messages. Prefer runtime-injected environment variables or a purpose-built secret delivery mechanism for deployed applications.
 
 ## Rotating a profile password
 
 Rotate when someone with access leaves, on a schedule, or after a suspected leak:
 
 ```bash
-kist profile rotate production --dry-run   # validate the current key and show the plan
+kist profile rotate production --dry-run   # validate the current password and show the plan
 kist profile rotate production             # asks for confirmation; --yes in scripts
-git commit -m "rotate production profile key"
+git commit -m "rotate production profile password"
 ```
 
 One command updates everything Kist controls, in an order that never leaves you without a working key:
@@ -720,45 +720,45 @@ One command updates everything Kist controls, in an order that never leaves you 
 | Step | What happens |
 |--|--|
 | 1. Check | The current password must open the profile in PostgreSQL and in Git. Secret files must have no uncommitted changes, so the rotation commit contains only re-encryption. |
-| 2. Stage the new key | A new random password is written to `~/.kist/pwd_<profile>.new` (0600) before anything else changes. |
-| 3. PostgreSQL | In **one transaction**, Kist generates new content and index keys, re-encrypts every secret, increments every record version and wraps the new keys with the new password. Either everything is rotated or nothing is. Listeners receive a `key_bundle_rotated` notification. |
-| 4. Local key | The new key replaces `~/.kist/pwd_<profile>`. The old one is kept as `pwd_<profile>.old-<timestamp>`. |
+| 2. Stage the new password | A new random password is written to `~/.kist/pwd_<profile>.new` (0600) before anything else changes. |
+| 3. PostgreSQL | In **one transaction**, Kist generates new data keys (content and index keys), re-encrypts every secret, increments every record version and wraps the new data keys with the new password. Either everything is rotated or nothing is. Listeners receive a `key_bundle_rotated` notification. |
+| 4. Local password | The new password replaces `~/.kist/pwd_<profile>`. The old one is kept as `pwd_<profile>.old-<timestamp>`. |
 | 5. Git | `git add --renormalize` re-encrypts the profile's secret files with the new password and stages them for review. Nothing is committed for you. |
 
 The command then prints a checklist of what Kist cannot reach: CI/CD secrets, environment variables, other developers, running services, exported device bundles and TPM-sealed credentials.
 
 | Option | Use |
 |--|--|
-| `--dry-run` | Show the plan and verify the current key; change nothing |
+| `--dry-run` | Show the plan and verify the current password; change nothing |
 | `--yes` | Skip the prompt (required when not interactive) |
 | `--new-password-stdin` | Use your own password instead of a generated one, e.g. `pass show kist/prod \| kist profile rotate prod --yes --new-password-stdin` |
 | `--rewrap-only` | Only re-protect the existing keys with the new password. Faster, but anyone who already obtained the keys keeps access. Prefer a full rotation. |
 | `--skip-db` / `--skip-git` | Limit the rotation to one side |
-| `--git-only` | Recovery: if the database and key file were rotated but Git failed, re-encrypt the Git files with the current key |
+| `--git-only` | Recovery: if the database and password file were rotated but Git failed, re-encrypt the Git files with the current password |
 | `--show-password` | Print the new password once (interactive terminals only) |
 
-### Key history: old commits keep working
+### Password history: old commits keep working
 
-Rotation keeps each old key as a **retired key** (`~/.kist/pwd_<profile>.old-<timestamp>`, owner-only). Retired keys are used **only to read** older content: when you check out an old commit, `git bisect`, or rebuild an old release. Kist tries the current key first, then retired keys from newest to oldest. New content is always encrypted with the current key.
+Rotation keeps each old password as a **retired password** (`~/.kist/pwd_<profile>.old-<timestamp>`, owner-only). Retired passwords are used **only to read** older content: when you check out an old commit, `git bisect`, or rebuild an old release. Kist tries the current password first, then retired passwords from newest to oldest. New content is always encrypted with the current password.
 
 ```bash
 git checkout v1.4.0            # files from before the rotation still open
-# kist: secrets/device.yaml: opened with retired key pwd_device.old-20261018-101500 (older content).
+# kist: secrets/device.yaml: opened with retired password pwd_device.old-20261018-101500 (older content).
 
-kist profile retired-keys production                     # list
-kist profile retired-keys production --delete --keep 1   # forget all but the newest
+kist profile retired-passwords production                     # list
+kist profile retired-passwords production --delete --keep 1   # forget all but the newest
 ```
 
-- **CI and build machines** without local key files can provide retired keys with `KIST_RETIRED_PASSWORDS_<PROFILE>` (one per line), for example to rebuild an old firmware release.
-- **Turn it off** with `KIST_KEY_HISTORY=off`, for instance on machines that should only ever read current content.
-- **Deleting a retired key** makes commits encrypted only with it unreadable on that machine. That is the intended way to retire access to old history, short of deleting it.
-- Each retired key that is tried costs one Argon2id derivation, so keep the list short.
+- **CI and build machines** without local password files can provide retired passwords with `KIST_RETIRED_PASSWORDS_<PROFILE>` (one per line), for example to rebuild an old firmware release.
+- **Turn it off** with `KIST_USE_RETIRED_PASSWORDS=off`, for instance on machines that should only ever read current content.
+- **Deleting a retired password** makes commits encrypted only with it unreadable on that machine. That is the intended way to retire access to old history, short of deleting it.
+- Each retired password that is tried costs one Argon2id derivation, so keep the list short.
 
-Kist does not rewrite Git history to re-encrypt old commits. It would force-push every branch and tag and break every clone, yet anyone who had the old key and a copy of the repository could still read the old values. Key history gives the convenience without that cost; changing leaked values is what actually limits exposure.
+Kist does not rewrite Git history to re-encrypt old commits. It would force-push every branch and tag and break every clone, yet anyone who had the old password and a copy of the repository could still read the old values. Password history gives the convenience without that cost; changing leaked values is what actually limits exposure.
 
 What rotation does **not** do:
 
-- **It does not rewrite history.** Old Git commits and old database backups still open with the old password (see [Key history](#key-history-old-commits-keep-working)). After a leak, also change the secret values themselves (new API keys and so on), and treat the old key as compromised.
+- **It does not rewrite history.** Old Git commits and old database backups still open with the old password (see [Password history](#password-history-old-commits-keep-working)). After a leak, also change the secret values themselves (new API keys and so on), and treat the old password as compromised.
 - **It does not reach other machines.** Running services fail closed on their next database read until they receive the new password. Plan a short rollout: rotate, update CI and deployment secrets, restart services.
 
 From Python:
@@ -766,7 +766,7 @@ From Python:
 ```python
 from kist import Kist
 
-store = Kist("production")                 # current key
+store = Kist("production")                 # current password
 store.rotate_profile_keys(new_password)    # new keys, every secret re-encrypted
 store.rewrap_profile_password(new_password)  # or: rewrap only
 ```
@@ -833,7 +833,7 @@ kist export secrets/device.yaml -o dist/device.kist --verify --strict
 | `-o FILE` / `-o -` | Destination (default `<profile>.kist`), or stdout for pipelines |
 | `--rev REV` | Export from a tag or commit, e.g. `--rev v1.4.0` (default `HEAD`) |
 | `--staged` | Export the staged version instead of a commit |
-| `--verify` | Decrypt in memory with the profile key to prove the export works; needs the key on the build host |
+| `--verify` | Decrypt in memory with the profile password to prove the export works; needs the key on the build host |
 | `--strict` | Fail if the working copy has uncommitted changes (recommended in CI) |
 
 `kist export` reads the blob with `git cat-file`, so plaintext is never written. It refuses files that are not committed or not Kist-encrypted. Without Kist installed, `git show HEAD:secrets/device.yaml > dist/device.kist` produces the same file.
@@ -892,7 +892,7 @@ password = (Path(os.environ["CREDENTIALS_DIRECTORY"]) / "kist-password").read_te
 
 with Kist.from_file("/usr/share/gateway/gateway.kist",
                     git_path="secrets/gateway.yaml",
-                    master_password=password) as secrets:
+                    password=password) as secrets:
     mqtt_password = secrets.get("mqtt.password")
     cloud_token = secrets.get("cloud.token")
 ```
@@ -974,7 +974,7 @@ from pathlib import Path
 from kist import Kist
 
 password = Path("/run/secrets/kist_password_edge").read_text().strip()
-secrets = Kist.from_file("/app/edge.kist", git_path="secrets/edge.yaml", master_password=password)
+secrets = Kist.from_file("/app/edge.kist", git_path="secrets/edge.yaml", password=password)
 ```
 
 #### Air-gapped server
@@ -1090,7 +1090,7 @@ Set the relevant profile environment variable:
 export KIST_PASSWORD_PRODUCTION='...'
 ```
 
-or create an explicit local key:
+or create an explicit local password:
 
 ```bash
 kist profile create production

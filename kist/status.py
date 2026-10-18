@@ -45,7 +45,7 @@ def _key_source(profile: str) -> str:
     if os.getenv("KIST_PASSWORD"):
         return "environment (KIST_PASSWORD)"
     if (Path(get_kist_dir()) / f"pwd_{profile}").exists():
-        return "local key file"
+        return "local password file"
     return "MISSING"
 
 
@@ -68,7 +68,7 @@ def run_status() -> int:
         print(f"Git clean filter: {'OK' if clean else 'MISSING'}")
         print(f"Git smudge filter: {'OK' if smudge else 'MISSING'}")
         print(f"Git attributes: {'OK' if attrs else 'MISSING'}")
-        print(f"Local key ignore rule: {'OK' if ignored else 'MISSING'}")
+        print(f"Local password ignore rule: {'OK' if ignored else 'MISSING'}")
         print(f"Kist pre-commit hook: {'OK' if hook_ok else 'MISSING OR THIRD-PARTY'}")
         healthy = healthy and clean and smudge and attrs and ignored
 
@@ -79,7 +79,7 @@ def run_status() -> int:
     for profile, path in sorted(profiles.items()):
         location = path or "no matching YAML file"
         source = _key_source(profile)
-        print(f"- {profile}: {location}; key source: {source}")
+        print(f"- {profile}: {location}; password source: {source}")
         if source == "MISSING":
             healthy = False
 

@@ -14,7 +14,7 @@ import yaml
 
 from kist import (
     Kist,
-    create_profile_key,
+    create_profile_password,
     decrypt_envelope,
     encrypt_envelope,
     enforce_ssl_url,
@@ -28,7 +28,7 @@ from kist import (
     is_kist_envelope,
     main,
     mask_db_url,
-    remove_profile_key,
+    remove_profile_password,
     resolve_secret_file_path,
     run_fix,
     run_git_setup,
@@ -538,7 +538,7 @@ def test_get_profile_password_from_env_fallback(kist_env, monkeypatch):
 
 
 def test_create_and_read_profile_password_from_kist_folder(kist_env):
-    created_pwd = create_profile_key("gamma")
+    created_pwd = create_profile_password("gamma")
     assert len(created_pwd) > 20
     pwd_file = kist_env["kist_dir"] / "pwd_gamma"
     assert pwd_file.exists()
@@ -553,8 +553,8 @@ def test_implicit_auto_generate_disabled(kist_env):
 
 
 def test_get_profile_and_password_resolution(kist_env):
-    create_profile_key("default")
-    create_profile_key("staging")
+    create_profile_password("default")
+    create_profile_password("staging")
 
     prof_def, pwd_def = get_profile_and_password("secrets.yaml")
     assert prof_def == "default"
@@ -589,7 +589,7 @@ def test_resolve_secret_file_path_direct_and_extension(tmp_path, monkeypatch):
 
 def test_envelope_encryption_and_decryption():
     plaintext = b"sensitive_secret_payload"
-    password = "strong_master_password_test"
+    password = "strong_password_test"
     ctx = {"profile": "prod", "env": "cloud"}
 
     envelope = encrypt_envelope(plaintext, password, ctx)
@@ -617,7 +617,7 @@ def test_git_clean_and_smudge_stream_roundtrip():
     # 1. Clean (Encrypt)
     in_clean = io.StringIO(plaintext)
     out_clean = io.BytesIO()
-    git_clean_stream("production", master_password=password, in_stream=in_clean, out_stream=out_clean, filepath="secrets_production.yaml")
+    git_clean_stream("production", password=password, in_stream=in_clean, out_stream=out_clean, filepath="secrets_production.yaml")
 
     encrypted_bytes = out_clean.getvalue()
     assert is_kist_envelope(encrypted_bytes)
@@ -625,14 +625,14 @@ def test_git_clean_and_smudge_stream_roundtrip():
     # Re-encrypting produces fresh salt and different ciphertext
     in_clean2 = io.StringIO(plaintext)
     out_clean2 = io.BytesIO()
-    git_clean_stream("production", master_password=password, in_stream=in_clean2, out_stream=out_clean2, filepath="secrets_production.yaml")
+    git_clean_stream("production", password=password, in_stream=in_clean2, out_stream=out_clean2, filepath="secrets_production.yaml")
     encrypted_bytes2 = out_clean2.getvalue()
     assert encrypted_bytes != encrypted_bytes2
 
     # 2. Smudge (Decrypt)
     in_smudge = io.BytesIO(encrypted_bytes)
     out_smudge = io.StringIO()
-    git_smudge_stream("production", master_password=password, in_stream=in_smudge, out_stream=out_smudge, filepath="secrets_production.yaml")
+    git_smudge_stream("production", password=password, in_stream=in_smudge, out_stream=out_smudge, filepath="secrets_production.yaml")
 
     assert out_smudge.getvalue() == plaintext
 
@@ -720,7 +720,7 @@ def test_leak_guard_ignores_code_calls_and_placeholders_and_detects_secrets():
 
 
 def test_flatten_and_unflatten_nested_and_types():
-    kist_inst = Kist(profile_name="types_test", master_password="pwd", db_url="")
+    kist_inst = Kist(profile_name="types_test", password="pwd", db_url="")
     data = {
         "server": {
             "port": 8080,
@@ -748,7 +748,7 @@ def test_flatten_and_unflatten_nested_and_types():
 
 def test_lock_yaml_type_preservation_and_prune(mock_db):
     with patch("psycopg.connect", side_effect=lambda *a, **kw: MockConnection(mock_db)):
-        kist_inst = Kist(profile_name="test_prof", master_password="password", db_url="postgresql://mock")
+        kist_inst = Kist(profile_name="test_prof", password="password", db_url="postgresql://mock")
 
         yaml_content = """
         db:
@@ -775,7 +775,7 @@ def test_lock_yaml_type_preservation_and_prune(mock_db):
 
 def test_kist_set_and_get_lifecycle(mock_db):
     with patch("psycopg.connect", side_effect=lambda *a, **kw: MockConnection(mock_db)):
-        kist_inst = Kist(profile_name="prod", master_password="secret_password", db_url="postgresql://mock")
+        kist_inst = Kist(profile_name="prod", password="secret_password", db_url="postgresql://mock")
 
         # Set key
         version1 = kist_inst.set("app.api_key", "secret-value-123")
@@ -806,7 +806,7 @@ def test_kist_set_retry_on_serialization_failure(mock_db):
             return super().execute(query, params)
 
     with patch("psycopg.connect", side_effect=lambda *a, **kw: FlakyMockConnection(mock_db)):
-        kist_inst = Kist(profile_name="prod", master_password="secret_password", db_url="postgresql://mock")
+        kist_inst = Kist(profile_name="prod", password="secret_password", db_url="postgresql://mock")
         version = kist_inst.set("app.api_key", "secret-value-123", max_retries=3)
         assert version == 1
         assert not first_attempt
@@ -820,14 +820,14 @@ def test_kist_set_exhausted_retries_raises_concurrent_write_error(mock_db):
             return super().execute(query, params)
 
     with patch("psycopg.connect", side_effect=lambda *a, **kw: AlwaysFailingMockConnection(mock_db)):
-        kist_inst = Kist(profile_name="prod", master_password="secret_password", db_url="postgresql://mock")
+        kist_inst = Kist(profile_name="prod", password="secret_password", db_url="postgresql://mock")
         with pytest.raises(ConcurrentWriteError):
             kist_inst.set("app.api_key", "secret-value-123", max_retries=2)
 
 
 def test_unlock_yaml_type_reconstruction(mock_db):
     with patch("psycopg.connect", side_effect=lambda *a, **kw: MockConnection(mock_db)):
-        kist_inst = Kist(profile_name="test_prof", master_password="password", db_url="postgresql://mock")
+        kist_inst = Kist(profile_name="test_prof", password="password", db_url="postgresql://mock")
 
         yaml_content = """
         app:
@@ -846,7 +846,7 @@ def test_unlock_yaml_type_reconstruction(mock_db):
 
 def test_kist_delete_and_rewrap_with_mock_db(mock_db):
     with patch("psycopg.connect", side_effect=lambda *a, **kw: MockConnection(mock_db)):
-        kist_inst = Kist(profile_name="prod", master_password="old_password", db_url="postgresql://mock")
+        kist_inst = Kist(profile_name="prod", password="old_password", db_url="postgresql://mock")
 
         kist_inst.set("market_data.api_key", "secret_key_abc")
         assert kist_inst.get("market_data.api_key") == "secret_key_abc"
@@ -856,7 +856,7 @@ def test_kist_delete_and_rewrap_with_mock_db(mock_db):
         assert kist_inst.get("market_data.api_key") == "secret_key_abc"
 
         # Reader with old password fails decryption
-        old_reader = Kist(profile_name="prod", master_password="old_password", db_url="postgresql://mock")
+        old_reader = Kist(profile_name="prod", password="old_password", db_url="postgresql://mock")
         with pytest.raises(DecryptionError):
             old_reader.get("market_data.api_key")
 
@@ -900,8 +900,8 @@ def test_status_scopes_to_repository_files_only(tmp_path, monkeypatch, capsys):
     assert "no matching YAML file" not in captured
 
     # Check that repo files are present with accurate key source
-    assert "production: secrets/production.yaml; key source: local key file" in captured
-    assert "staging: secrets/staging.yaml; key source: MISSING" in captured
+    assert "production: secrets/production.yaml; password source: local password file" in captured
+    assert "staging: secrets/staging.yaml; password source: MISSING" in captured
 
 
 def test_run_fix_workflow(capsys):
@@ -1298,22 +1298,22 @@ def test_kist_class_defaults_to_kist_profile_env(monkeypatch):
     assert k.profile_name == "team_a"
 
 
-def test_remove_profile_key(tmp_path, monkeypatch):
+def test_remove_profile_password(tmp_path, monkeypatch):
     kist_dir = tmp_path / ".kist"
     monkeypatch.setenv("KIST_DIR", str(kist_dir))
     with patch("sys.stdout.isatty", return_value=True):
-        create_profile_key("test_del_prof")
+        create_profile_password("test_del_prof")
     key_path = kist_dir / "pwd_test_del_prof"
     assert key_path.exists()
 
-    assert remove_profile_key("test_del_prof") is True
+    assert remove_profile_password("test_del_prof") is True
     assert not key_path.exists()
-    assert remove_profile_key("test_del_prof") is False
+    assert remove_profile_password("test_del_prof") is False
 
 
 def test_kist_delete_profile_in_db(mock_db):
     with patch("psycopg.connect", side_effect=lambda *a, **kw: MockConnection(mock_db)):
-        kist_inst = Kist(profile_name="team_x", master_password="pwd", db_url="postgresql://mock")
+        kist_inst = Kist(profile_name="team_x", password="pwd", db_url="postgresql://mock")
         kist_inst.set("db.password", "secret")
         assert kist_inst.get("db.password") == "secret"
 
@@ -1326,7 +1326,7 @@ def test_kist_delete_profile_in_db(mock_db):
 
 def test_cli_delete_secret(mock_db, monkeypatch, capsys):
     with patch("psycopg.connect", side_effect=lambda *a, **kw: MockConnection(mock_db)):
-        kist_inst = Kist(profile_name="default", master_password="pwd", db_url="postgresql://mock")
+        kist_inst = Kist(profile_name="default", password="pwd", db_url="postgresql://mock")
         kist_inst.set("stripe.api_key", "sk_live_123")
         monkeypatch.setenv("KIST_PASSWORD", "pwd")
 
@@ -1347,17 +1347,17 @@ def test_cli_profile_delete(mock_db, tmp_path, monkeypatch, capsys):
     kist_dir = tmp_path / ".kist"
     monkeypatch.setenv("KIST_DIR", str(kist_dir))
     with patch("sys.stdout.isatty", return_value=True):
-        create_profile_key("team_y")
+        create_profile_password("team_y")
 
     with patch("psycopg.connect", side_effect=lambda *a, **kw: MockConnection(mock_db)):
-        kist_inst = Kist(profile_name="team_y", master_password="pwd", db_url="postgresql://mock")
+        kist_inst = Kist(profile_name="team_y", password="pwd", db_url="postgresql://mock")
         kist_inst.set("k", "v")
 
-        monkeypatch.setattr(sys, "argv", ["kist", "profile", "delete", "team_y", "--delete-key", "--force"])
+        monkeypatch.setattr(sys, "argv", ["kist", "profile", "delete", "team_y", "--delete-password", "--force"])
         main()
         captured = capsys.readouterr()
         assert "Deleted profile 'team_y' for local/default from database." in captured.out
-        assert "Removed local key file." in captured.out
+        assert "Removed local password file." in captured.out
         assert not (kist_dir / "pwd_team_y").exists()
 
 
@@ -1365,17 +1365,17 @@ def test_cli_profile_remove_key(tmp_path, monkeypatch, capsys):
     kist_dir = tmp_path / ".kist"
     monkeypatch.setenv("KIST_DIR", str(kist_dir))
     with patch("sys.stdout.isatty", return_value=True):
-        create_profile_key("key_only")
+        create_profile_password("key_only")
 
-    monkeypatch.setattr(sys, "argv", ["kist", "profile", "remove-key", "key_only", "--force"])
+    monkeypatch.setattr(sys, "argv", ["kist", "profile", "remove-password", "key_only", "--force"])
     main()
     captured = capsys.readouterr()
-    assert "Removed local key file for profile 'key_only'." in captured.out
+    assert "Removed local password file for profile 'key_only'." in captured.out
     assert not (kist_dir / "pwd_key_only").exists()
 
     with pytest.raises(SystemExit) as exc_info:
-        monkeypatch.setattr(sys, "argv", ["kist", "profile", "remove-key", "key_only", "--force"])
+        monkeypatch.setattr(sys, "argv", ["kist", "profile", "remove-password", "key_only", "--force"])
         main()
     assert exc_info.value.code == 1
     captured = capsys.readouterr()
-    assert "Local key file for profile 'key_only' not found." in captured.err
+    assert "Local password file for profile 'key_only' not found." in captured.err

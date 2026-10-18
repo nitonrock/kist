@@ -9,7 +9,7 @@ Order of operations, chosen so that a failure never loses the only copy of a key
    changing anything else.
 3. Database: replace the content/index keys and re-encrypt every secret in a
    single transaction (or only rewrap the key bundle with ``--rewrap-only``).
-4. Local key file: keep the old one as ``pwd_<profile>.old-<timestamp>`` and
+4. Local password file: keep the old one as ``pwd_<profile>.old-<timestamp>`` and
    move the new one into place.
 5. Git: ``git add --renormalize`` re-encrypts the profile's secret files with
    the new password and stages them for review; nothing is committed.
@@ -31,7 +31,7 @@ from typing import Callable, Optional
 from kist.core import (
     DecryptionError,
     Kist,
-    decrypt_with_key_history,
+    decrypt_with_password_history,
     git_context,
     KistError,
     KistScope,
@@ -118,7 +118,7 @@ def _committed_plaintext(root: str, spec: str, profile: str, path: str, password
     if not is_kist_envelope(blob.stdout):
         raise KistError(f"{path} is stored unencrypted in {spec.split(':')[0] or 'the index'}; fix that before rotating.")
     try:
-        return decrypt_with_key_history(blob.stdout, profile, git_context(profile, path), password)[0]
+        return decrypt_with_password_history(blob.stdout, profile, git_context(profile, path), password)[0]
     except DecryptionError as exc:
         raise DecryptionError(f"The current password does not open {path} in Git.") from exc
 
@@ -184,10 +184,10 @@ def _stage_new_password(profile: str, new_password: str) -> Path:
 
 
 def _install_new_password(profile: str, staged: Path, current: str) -> tuple[Path, Path]:
-    """Move the new key into place and always keep the old one as a retired key.
+    """Move the new password into place and always keep the old one as a retired password.
 
-    The old key is saved even when it came from an environment variable, so
-    older Git commits stay readable through the key history.
+    The old password is saved even when it came from an environment variable, so
+    older Git commits stay readable through the Password history.
     """
     target = profile_password_path(profile)
     backup = target.with_name(f"pwd_{profile}.old-{time.strftime('%Y%m%d-%H%M%S')}")
@@ -217,20 +217,20 @@ def _renormalize(root: str, files: list[str], profile: str, new_password: str) -
 def build_checklist(result: RotationResult) -> list[str]:
     plan, items = result.plan, []
     if plan.password_source.startswith("KIST_PASSWORD"):
-        items.append(f"Your shell sets {plan.password_source}, which overrides the key file: update or unset it now.")
+        items.append(f"Your shell sets {plan.password_source}, which overrides the password file: update or unset it now.")
     items.append("Update the profile password in CI/CD secrets and any deployment environment.")
     items.append("Share the new password with other developers through your approved channel; "
                  "after pulling, they replace ~/.kist/pwd_" + plan.profile + " and run 'git checkout -- .'.")
     if plan.database:
         items.append("Restart or reconfigure running services: they cannot open the rotated profile with the old password.")
     if result.git_restaged:
-        items.append("Review and commit the re-encrypted files: git commit -m \"rotate " + plan.profile + " profile key\"")
+        items.append("Review and commit the re-encrypted files: git commit -m \"rotate " + plan.profile + " profile password\"")
         items.append("Re-export embedded/offline bundles (kist export) and re-seal device credentials (systemd-creds, TPM).")
     items.append("Old Git commits and database backups still open with the OLD password. "
                  "If you rotate because of a leak, also rotate the secret values themselves.")
     if result.old_key_backup:
-        items.append(f"Old key kept as a retired key ({result.old_key_backup.name}): older commits and "
-                     f"'kist export --rev' keep working. Remove it with 'kist profile retired-keys "
+        items.append(f"Old password kept as a retired password ({result.old_key_backup.name}): older commits and "
+                     f"'kist export --rev' keep working. Remove it with 'kist profile retired-passwords "
                      f"{plan.profile} --delete' once nothing needs old revisions.")
     return items
 
@@ -257,7 +257,7 @@ def rotate_profile(profile: str, *, new_password: Optional[str] = None, scope: O
                 log("Database: key bundle rewrapped with the new password (data keys unchanged).")
             else:
                 result.database_secrets = store.rotate_profile_keys(new_password)
-                log(f"Database: new keys generated, {result.database_secrets} secrets re-encrypted.")
+                log(f"Database: new data keys generated, {result.database_secrets} secrets re-encrypted.")
             result.database_rotated = True
     except BaseException:
         if staged:
@@ -266,13 +266,13 @@ def rotate_profile(profile: str, *, new_password: Optional[str] = None, scope: O
 
     if staged:
         result.local_key_path, result.old_key_backup = _install_new_password(plan.profile, staged, current)
-        log(f"Local key: {result.local_key_path} updated (old key kept as {result.old_key_backup}).")
+        log(f"Local password: {result.local_key_path} updated (old password kept as {result.old_key_backup}).")
 
     if plan.git_files and plan.git_root:
         try:
             _renormalize(plan.git_root, plan.git_files, plan.profile, new_password)
         except KistError as exc:
-            hint = (f"Database and key file already use the new password. Finish with: "
+            hint = (f"Database and password file already use the new password. Finish with: "
                     f"kist profile rotate {plan.profile} --git-only")
             raise KistError(f"{exc}\n{hint}") from exc
         result.git_restaged = list(plan.git_files)
@@ -285,8 +285,8 @@ def rotate_profile(profile: str, *, new_password: Optional[str] = None, scope: O
 def restage_git_with_current_key(profile: str) -> list[str]:
     """Recovery path: re-encrypt Git files with whatever password is now current.
 
-    Used when a rotation changed the database and key file but Git failed: the
-    index then still holds envelopes for the old key, so committed content
+    Used when a rotation changed the database and password file but Git failed: the
+    index then still holds envelopes for the old password, so committed content
     cannot be compared with the new one. Review the staged diff before committing.
     """
     profile = _validate_profile_name(profile)

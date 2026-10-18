@@ -10,10 +10,10 @@ from kist.core import (
     Kist,
     KistError,
     KistScope,
-    create_profile_key,
+    create_profile_password,
     get_profile_and_password,
     get_profile_password,
-    remove_profile_key,
+    remove_profile_password,
     resolve_secret_file_path,
 )
 from kist.fix import run_diagnose, run_fix
@@ -23,7 +23,7 @@ from kist.status import run_status
 
 def _require_tty_for_key_display() -> None:
     if not sys.stdout.isatty():
-        raise KistError("Refusing to print a newly generated profile key to non-interactive stdout.")
+        raise KistError("Refusing to print a newly generated profile password to non-interactive stdout.")
 
 
 def _scope_from_args(args: argparse.Namespace) -> KistScope:
@@ -31,15 +31,15 @@ def _scope_from_args(args: argparse.Namespace) -> KistScope:
     return KistScope(organization=args.org or base.organization, project=args.project or base.project).validated()
 
 
-def _run_retired_keys(args: argparse.Namespace) -> None:
-    from kist.core import key_history_enabled, retired_profile_key_files, _validate_profile_name
+def _run_retired_passwords(args: argparse.Namespace) -> None:
+    from kist.core import password_history_enabled, retired_profile_password_files, _validate_profile_name
     profile = _validate_profile_name(args.name)
-    files = retired_profile_key_files(profile)
+    files = retired_profile_password_files(profile)
     env_name = f"KIST_RETIRED_PASSWORDS_{profile.upper()}"
     env_count = len([l for l in os.getenv(env_name, "").splitlines() if l.strip()])
     if not args.delete:
-        state = "on" if key_history_enabled() else "off (KIST_KEY_HISTORY)"
-        print(f"Retired keys for profile '{profile}' (key history {state}), newest first:")
+        state = "on" if password_history_enabled() else "off (KIST_USE_RETIRED_PASSWORDS)"
+        print(f"Retired passwords for profile '{profile}' (Password history {state}), newest first:")
         for path in files:
             print(f"  {path}")
         if env_count:
@@ -53,8 +53,8 @@ def _run_retired_keys(args: argparse.Namespace) -> None:
         return
     if not args.yes:
         if not sys.stdin.isatty():
-            raise KistError("Refusing to delete keys without confirmation; pass --yes in non-interactive use.")
-        print("Commits encrypted only with these keys will no longer open on this machine:")
+            raise KistError("Refusing to delete retired passwords without confirmation; pass --yes in non-interactive use.")
+        print("Commits encrypted only with these passwords will no longer open on this machine:")
         for path in doomed:
             print(f"  {path}")
         if input("Delete them? [y/N]: ").strip().lower() not in ("y", "yes"):
@@ -62,7 +62,7 @@ def _run_retired_keys(args: argparse.Namespace) -> None:
             sys.exit(1)
     for path in doomed:
         path.unlink()
-    print(f"Deleted {len(doomed)} retired key(s) for profile '{profile}'.")
+    print(f"Deleted {len(doomed)} retired password(s) for profile '{profile}'.")
 
 
 def _run_rotate(args: argparse.Namespace) -> None:
@@ -70,7 +70,7 @@ def _run_rotate(args: argparse.Namespace) -> None:
 
     if args.git_only:
         files = restage_git_with_current_key(args.name)
-        print(f"Re-encrypted and staged {len(files)} file(s) with the current key for profile '{args.name}'.")
+        print(f"Re-encrypted and staged {len(files)} file(s) with the current password for profile '{args.name}'.")
         for path in files:
             print(f"  {path}")
         return
@@ -79,9 +79,9 @@ def _run_rotate(args: argparse.Namespace) -> None:
     use_db = False if args.skip_db else None
     plan, _ = plan_rotation(args.name, scope=scope, use_database=use_db, use_git=not args.skip_git,
                             rewrap_only=args.rewrap_only)
-    mode = "rewrap key bundle only" if args.rewrap_only else "generate new keys and re-encrypt every secret"
+    mode = "rewrap key bundle only" if args.rewrap_only else "generate new data keys and re-encrypt every secret"
     print(f"Rotation plan for profile '{plan.profile}' ({scope.organization}/{scope.project}):")
-    print(f"  Current key:  from {'~/.kist/pwd_' + plan.profile if plan.password_source == 'file' else plan.password_source} (verified)")
+    print(f"  Current password:  from {'~/.kist/pwd_' + plan.profile if plan.password_source == 'file' else plan.password_source} (verified)")
     if plan.database:
         print(f"  PostgreSQL:   {plan.database_secrets} secrets, {mode}")
     else:
@@ -90,7 +90,7 @@ def _run_rotate(args: argparse.Namespace) -> None:
         print(f"  Git:          re-encrypt and stage {len(plan.git_files)} file(s): {', '.join(plan.git_files)}")
     else:
         print("  Git:          skipped" if args.skip_git else "  Git:          no secret files for this profile")
-    print(f"  Local key:    write new ~/.kist/pwd_{plan.profile}, keep the old one as a backup")
+    print(f"  Local password:    write new ~/.kist/pwd_{plan.profile}, keep the old one as a backup")
     if args.dry_run:
         print("Dry run: nothing changed.")
         return
@@ -147,43 +147,43 @@ def main() -> None:
     fix_parser.add_argument("--force-hook", action="store_true")
     subparsers.add_parser("pre-commit-guard", help="Scan staged changes for plaintext secrets")
 
-    profile_parser = subparsers.add_parser("profile", help="Explicit profile-key lifecycle operations")
+    profile_parser = subparsers.add_parser("profile", help="Profile password lifecycle operations")
     profile_subparsers = profile_parser.add_subparsers(dest="profile_command")
-    create_parser = profile_subparsers.add_parser("create", help="Create a local profile key")
+    create_parser = profile_subparsers.add_parser("create", help="Create a local profile password")
     create_parser.add_argument("name", type=str, help="Profile name")
     create_parser.add_argument("--rotate", action="store_true")
 
     delete_prof_parser = profile_subparsers.add_parser("delete", aliases=["rm"], help="Delete a profile and all its secrets from PostgreSQL")
     delete_prof_parser.add_argument("name", type=str, help="Profile name")
-    delete_prof_parser.add_argument("--delete-key", "-k", action="store_true", help="Also delete local key file")
+    delete_prof_parser.add_argument("--delete-password", action="store_true", help="Also delete local password file")
     delete_prof_parser.add_argument("--force", "-f", action="store_true", help="Bypass confirmation prompt")
     delete_prof_parser.add_argument("--yes", "-y", action="store_true", help="Automatically confirm prompts")
 
     rotate_parser = profile_subparsers.add_parser(
-        "rotate", help="Rotate a profile password: new keys in PostgreSQL, re-encrypted Git files, new local key")
+        "rotate", help="Rotate a profile password: new data keys in PostgreSQL, re-encrypted Git files, new local password")
     rotate_parser.add_argument("name", type=str, help="Profile name")
-    rotate_parser.add_argument("--dry-run", action="store_true", help="Show what would change and validate the current key")
+    rotate_parser.add_argument("--dry-run", action="store_true", help="Show what would change and validate the current password")
     rotate_parser.add_argument("--yes", "-y", action="store_true", help="Do not ask for confirmation (required when not interactive)")
     rotate_parser.add_argument("--rewrap-only", action="store_true",
                                help="Only rewrap the database key bundle; keep data keys (faster, weaker)")
     rotate_parser.add_argument("--skip-db", action="store_true", help="Do not touch PostgreSQL")
     rotate_parser.add_argument("--skip-git", action="store_true", help="Do not re-encrypt Git secret files")
     rotate_parser.add_argument("--git-only", action="store_true",
-                               help="Recovery: re-encrypt Git files with the current key, change nothing else")
+                               help="Recovery: re-encrypt Git files with the current password, change nothing else")
     rotate_parser.add_argument("--new-password-stdin", action="store_true",
                                help="Read the new password from stdin instead of generating one")
     rotate_parser.add_argument("--show-password", action="store_true",
                                help="Print the new password once (interactive terminals only)")
 
     retired_parser = profile_subparsers.add_parser(
-        "retired-keys", help="List or delete retired keys kept by rotation (used to read older content)")
+        "retired-passwords", help="List or delete retired passwords kept by rotation (used to read older content)")
     retired_parser.add_argument("name", type=str, help="Profile name")
-    retired_parser.add_argument("--delete", action="store_true", help="Delete retired key files for this profile")
+    retired_parser.add_argument("--delete", action="store_true", help="Delete retired password files for this profile")
     retired_parser.add_argument("--keep", type=int, default=0, metavar="N",
-                                help="With --delete, keep the N most recent retired keys")
+                                help="With --delete, keep the N most recent retired passwords")
     retired_parser.add_argument("--yes", "-y", action="store_true", help="Do not ask for confirmation")
 
-    rm_key_parser = profile_subparsers.add_parser("remove-key", aliases=["delete-key"], help="Remove local key file (~/.kist/pwd_<name>)")
+    rm_key_parser = profile_subparsers.add_parser("remove-password", aliases=["delete-password"], help="Remove local password file (~/.kist/pwd_<name>)")
     rm_key_parser.add_argument("name", type=str, help="Profile name")
     rm_key_parser.add_argument("--force", "-f", action="store_true", help="Bypass confirmation prompt")
     rm_key_parser.add_argument("--yes", "-y", action="store_true", help="Automatically confirm prompts")
@@ -214,7 +214,7 @@ def main() -> None:
     export_parser.add_argument("-o", "--output", default=None, help="Destination (default: <profile>.kist; '-' for stdout)")
     export_parser.add_argument("--rev", default="HEAD", help="Git revision to export from (default: HEAD)")
     export_parser.add_argument("--staged", action="store_true", help="Export the staged (index) version instead of a commit")
-    export_parser.add_argument("--verify", action="store_true", help="Decrypt in memory with the profile key to check the export")
+    export_parser.add_argument("--verify", action="store_true", help="Decrypt in memory with the profile password to check the export")
     export_parser.add_argument("--profile", default=None, help="Profile override (default: derived from file name)")
     export_parser.add_argument("--repository-id", default=None, help="KIST_REPOSITORY_ID used at commit time, for --verify")
     export_parser.add_argument("--strict", action="store_true", help="Fail if the working copy differs from the exported revision")
@@ -223,11 +223,11 @@ def main() -> None:
     try:
         if args.clean:
             profile_name, password = get_profile_and_password(args.clean)
-            git_clean_stream(profile_name=profile_name, master_password=password)
+            git_clean_stream(profile_name=profile_name, password=password)
             return
         if args.smudge:
             profile_name, password = get_profile_and_password(args.smudge)
-            git_smudge_stream(profile_name=profile_name, master_password=password)
+            git_smudge_stream(profile_name=profile_name, password=password)
             return
         if args.command == "init":
             if args.print_hook:
@@ -250,8 +250,8 @@ def main() -> None:
             sys.exit(run_leak_guard())
         if args.command == "profile" and args.profile_command == "create":
             _require_tty_for_key_display()
-            password = create_profile_key(args.name, rotate=args.rotate)
-            print("A new profile key was created. Store it in an approved key manager now; it will not be displayed again.")
+            password = create_profile_password(args.name, rotate=args.rotate)
+            print("A new profile password was created. Store it in an approved password manager now; it will not be displayed again.")
             print(password)
             return
         if args.command == "profile" and args.profile_command in {"delete", "rm"}:
@@ -273,34 +273,34 @@ def main() -> None:
             kist = Kist(profile_name=args.name, scope=_scope_from_args(args))
             deleted = kist.delete_profile(args.name)
             msg = f"Deleted profile '{args.name}' for {kist.scope.organization}/{kist.scope.project} from database." if deleted else f"Profile '{args.name}' not found in database."
-            if getattr(args, "delete_key", False):
-                key_removed = remove_profile_key(args.name)
-                msg += " Removed local key file." if key_removed else " Local key file not found."
+            if getattr(args, "delete_password", False):
+                key_removed = remove_profile_password(args.name)
+                msg += " Removed local password file." if key_removed else " Local password file not found."
             print(msg)
             return
-        if args.command == "profile" and args.profile_command == "retired-keys":
-            _run_retired_keys(args)
+        if args.command == "profile" and args.profile_command == "retired-passwords":
+            _run_retired_passwords(args)
             return
         if args.command == "profile" and args.profile_command == "rotate":
             _run_rotate(args)
             return
-        if args.command == "profile" and args.profile_command in {"remove-key", "delete-key"}:
+        if args.command == "profile" and args.profile_command in {"remove-password", "delete-password"}:
             bypass_prompt = getattr(args, "force", False) or getattr(args, "yes", False)
             if not bypass_prompt and sys.stdin.isatty():
                 try:
-                    prompt = f"Warning: Remove local key file for profile '{args.name}'? [y/N]: "
+                    prompt = f"Warning: Remove local password file for profile '{args.name}'? [y/N]: "
                     response = input(prompt).strip().lower()
                     if response not in ("y", "yes"):
-                        print("kist: key removal cancelled.", file=sys.stderr)
+                        print("kist: password removal cancelled.", file=sys.stderr)
                         sys.exit(1)
                 except (EOFError, KeyboardInterrupt):
-                    print("\nkist: key removal cancelled.", file=sys.stderr)
+                    print("\nkist: password removal cancelled.", file=sys.stderr)
                     sys.exit(130)
 
-            if remove_profile_key(args.name):
-                print(f"Removed local key file for profile '{args.name}'.")
+            if remove_profile_password(args.name):
+                print(f"Removed local password file for profile '{args.name}'.")
             else:
-                print(f"Local key file for profile '{args.name}' not found.", file=sys.stderr)
+                print(f"Local password file for profile '{args.name}' not found.", file=sys.stderr)
                 sys.exit(1)
             return
         if args.command in {"delete", "rm"}:
@@ -322,7 +322,7 @@ def main() -> None:
                     print("\nkist: delete operation cancelled.", file=sys.stderr)
                     sys.exit(130)
 
-            kist = Kist(profile_name=profile_name, master_password=password, scope=_scope_from_args(args))
+            kist = Kist(profile_name=profile_name, password=password, scope=_scope_from_args(args))
             if kist.delete(args.key):
                 print(f"Deleted secret '{args.key}' for {kist.scope.organization}/{kist.scope.project}/{profile_name}.")
             else:
@@ -369,7 +369,7 @@ def main() -> None:
                 profile_name = inferred_profile
                 password = inferred_password or get_profile_password(profile_name)
 
-            kist = Kist(profile_name=profile_name, master_password=password, scope=_scope_from_args(args))
+            kist = Kist(profile_name=profile_name, password=password, scope=_scope_from_args(args))
             if args.command == "lock":
                 if not os.path.isfile(target_file):
                     raise KistError(f"Secret file not found: {target_file}")

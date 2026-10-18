@@ -48,7 +48,7 @@ class TTLSecretStore:
         self,
         ttl_seconds: float = 30.0,
         profile_name: Optional[str] = None,
-        master_password: Optional[str] = None,
+        password: Optional[str] = None,
         db_url: Optional[str] = None,
         kist: Optional[Kist] = None,
         cache_policy: Optional[CachePolicy] = None,
@@ -56,7 +56,7 @@ class TTLSecretStore:
         self.profile_name = profile_name or os.getenv("KIST_PROFILE", "default")
         self.kist = kist or Kist(
             profile_name=self.profile_name,
-            master_password=master_password or get_profile_password(self.profile_name),
+            password=password or get_profile_password(self.profile_name),
             db_url=db_url,
         )
         self.policy = cache_policy or CachePolicy(enabled=True, ttl_seconds=ttl_seconds)
@@ -120,7 +120,7 @@ class DynamicSecretStore(TTLSecretStore):
     def __init__(
         self,
         profile_name: Optional[str] = None,
-        master_password: Optional[str] = None,
+        password: Optional[str] = None,
         db_url: Optional[str] = None,
         channel: str = "kist_secret_updated",
         auto_start: bool = False,
@@ -129,7 +129,7 @@ class DynamicSecretStore(TTLSecretStore):
     ) -> None:
         super().__init__(
             profile_name=profile_name,
-            master_password=master_password,
+            password=password,
             db_url=db_url,
             kist=kist,
             cache_policy=cache_policy or CachePolicy(enabled=True),
@@ -200,7 +200,7 @@ class AsyncDynamicSecretStore:
     def __init__(
         self,
         profile_name: Optional[str] = None,
-        master_password: Optional[str] = None,
+        password: Optional[str] = None,
         db_url: Optional[str] = None,
         channel: str = "kist_secret_updated",
         auto_start: bool = False,
@@ -210,7 +210,7 @@ class AsyncDynamicSecretStore:
         self.profile_name = profile_name or os.getenv("KIST_PROFILE", "default")
         self.kist = kist or Kist(
             profile_name=self.profile_name,
-            master_password=master_password or get_profile_password(self.profile_name),
+            password=password or get_profile_password(self.profile_name),
             db_url=db_url,
         )
         self.db_url = db_url or self.kist.db_url

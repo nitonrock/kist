@@ -81,4 +81,4 @@ resources/
 - **Strict TLS**: Always append `?sslmode=require` (or `sslmode=verify-full`) to `KIST_DATABASE_URL` in CI secrets.
 - **Least-Privilege Database Users**: Use a database role for CI that only possesses `SELECT`, `INSERT`, and `UPDATE` on the `kist` tables, without broad DDL/superuser privileges.
 - **Masked Variables**: Ensure profile passwords and connection strings are masked in CI output.
-- **Fail Closed**: In CI, Kist fails closed with exit code `1` if a required profile key or database URL is missing or invalid.
+- **Fail Closed**: In CI, Kist fails closed with exit code `1` if a required profile password or database URL is missing or invalid.

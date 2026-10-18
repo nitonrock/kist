@@ -49,7 +49,7 @@ def envelope_file(tmp_path):
 
 
 def test_reads_nested_values(envelope_file):
-    store = FileKist(envelope_file, git_path=GIT_PATH, master_password=PASSWORD)
+    store = FileKist(envelope_file, git_path=GIT_PATH, password=PASSWORD)
     assert store.profile_name == "device"
     assert store.get("cloud.api_key") == "example-value"
     assert store["mqtt.port"] == 8883
@@ -61,13 +61,13 @@ def test_reads_nested_values(envelope_file):
 
 
 def test_kist_from_file_classmethod(envelope_file):
-    store = Kist.from_file(envelope_file, git_path=GIT_PATH, master_password=PASSWORD)
+    store = Kist.from_file(envelope_file, git_path=GIT_PATH, password=PASSWORD)
     assert isinstance(store, FileKist)
     assert store.get_secret("cloud.api_key") == "example-value"
 
 
 def test_missing_key_and_default(envelope_file):
-    store = FileKist(envelope_file, git_path=GIT_PATH, master_password=PASSWORD)
+    store = FileKist(envelope_file, git_path=GIT_PATH, password=PASSWORD)
     with pytest.raises(KeyError):
         store.get("cloud.nope")
     assert store.get("cloud.nope", None) is None
@@ -86,7 +86,7 @@ def test_missing_password_fails_closed(envelope_file):
 
 def test_wrong_password_fails(envelope_file):
     with pytest.raises(DecryptionError):
-        FileKist(envelope_file, git_path=GIT_PATH, master_password="wrong-password-0123456789abcdef").get("cloud.api_key")
+        FileKist(envelope_file, git_path=GIT_PATH, password="wrong-password-0123456789abcdef").get("cloud.api_key")
 
 
 def test_tampered_envelope_fails(envelope_file):
@@ -94,7 +94,7 @@ def test_tampered_envelope_fails(envelope_file):
     data[-1] ^= 0x01
     envelope_file.write_bytes(bytes(data))
     with pytest.raises(DecryptionError):
-        FileKist(envelope_file, git_path=GIT_PATH, master_password=PASSWORD).get("cloud.api_key")
+        FileKist(envelope_file, git_path=GIT_PATH, password=PASSWORD).get("cloud.api_key")
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -105,7 +105,7 @@ def test_tampered_envelope_fails(envelope_file):
 ])
 def test_context_binding_rejects_transplants(envelope_file, kwargs):
     with pytest.raises(DecryptionError):
-        FileKist(envelope_file, master_password=PASSWORD, **kwargs).get("cloud.api_key")
+        FileKist(envelope_file, password=PASSWORD, **kwargs).get("cloud.api_key")
 
 
 def test_scope_and_repository_must_match_commit_time(tmp_path, monkeypatch):
@@ -113,11 +113,11 @@ def test_scope_and_repository_must_match_commit_time(tmp_path, monkeypatch):
     monkeypatch.setenv("KIST_REPOSITORY_ID", "acme/firmware")
     path = tmp_path / "device.kist"
     path.write_bytes(make_envelope())
-    assert FileKist(path, git_path=GIT_PATH, master_password=PASSWORD).get("mqtt.port") == 8883
+    assert FileKist(path, git_path=GIT_PATH, password=PASSWORD).get("mqtt.port") == 8883
     monkeypatch.delenv("KIST_REPOSITORY_ID")
     with pytest.raises(DecryptionError):
-        FileKist(path, git_path=GIT_PATH, master_password=PASSWORD).get("mqtt.port")
-    store = FileKist(path, git_path=GIT_PATH, master_password=PASSWORD, repository_id="acme/firmware")
+        FileKist(path, git_path=GIT_PATH, password=PASSWORD).get("mqtt.port")
+    store = FileKist(path, git_path=GIT_PATH, password=PASSWORD, repository_id="acme/firmware")
     assert store.get("mqtt.port") == 8883
 
 
@@ -125,25 +125,25 @@ def test_plaintext_file_is_refused(tmp_path):
     path = tmp_path / "device.yaml"
     path.write_text(YAML)
     with pytest.raises(InvalidEnvelopeError, match="git show"):
-        FileKist(path, git_path=GIT_PATH, master_password=PASSWORD).get("cloud.api_key")
+        FileKist(path, git_path=GIT_PATH, password=PASSWORD).get("cloud.api_key")
 
 
 def test_missing_file(tmp_path):
     with pytest.raises(KistError, match="not found"):
-        FileKist(tmp_path / "absent.kist", git_path=GIT_PATH, master_password=PASSWORD, lazy=False)
+        FileKist(tmp_path / "absent.kist", git_path=GIT_PATH, password=PASSWORD, lazy=False)
 
 
 def test_duplicate_yaml_keys_rejected(tmp_path):
     path = tmp_path / "device.kist"
     path.write_bytes(make_envelope("a: 1\na: 2\n"))
     with pytest.raises(KistError, match="Duplicate"):
-        FileKist(path, git_path=GIT_PATH, master_password=PASSWORD).get("a")
+        FileKist(path, git_path=GIT_PATH, password=PASSWORD).get("a")
 
 
 def test_yaml_merge_keys_supported(tmp_path):
     path = tmp_path / "device.kist"
     path.write_bytes(make_envelope("base: &b {host: h, port: 1}\nprod:\n  <<: *b\n  port: 2\n"))
-    store = FileKist(path, git_path=GIT_PATH, master_password=PASSWORD)
+    store = FileKist(path, git_path=GIT_PATH, password=PASSWORD)
     assert store.get("prod.host") == "h"
     assert store.get("prod.port") == 2
 
@@ -151,21 +151,21 @@ def test_yaml_merge_keys_supported(tmp_path):
 def test_empty_yaml(tmp_path):
     path = tmp_path / "device.kist"
     path.write_bytes(make_envelope("# nothing yet\n"))
-    assert len(FileKist(path, git_path=GIT_PATH, master_password=PASSWORD)) == 0
+    assert len(FileKist(path, git_path=GIT_PATH, password=PASSWORD)) == 0
 
 
 def test_default_profile_derivation(tmp_path):
     path = tmp_path / "secrets.yaml"
     path.write_bytes(make_envelope(git_path="secrets.yaml", profile="default"))
-    store = FileKist(path, git_path="secrets.yaml", master_password=PASSWORD)
+    store = FileKist(path, git_path="secrets.yaml", password=PASSWORD)
     assert store.profile_name == "default"
     assert store.get("mqtt.port") == 8883
 
 
 def test_lazy_eager_reload_and_close(envelope_file):
-    lazy = FileKist(envelope_file, git_path=GIT_PATH, master_password=PASSWORD)
+    lazy = FileKist(envelope_file, git_path=GIT_PATH, password=PASSWORD)
     assert "not loaded" in repr(lazy)
-    eager = FileKist(envelope_file, git_path=GIT_PATH, master_password=PASSWORD, lazy=False)
+    eager = FileKist(envelope_file, git_path=GIT_PATH, password=PASSWORD, lazy=False)
     assert "loaded" in repr(eager) and "not loaded" not in repr(eager)
 
     envelope_file.write_bytes(make_envelope("cloud:\n  api_key: rotated-value\n"))
@@ -173,17 +173,17 @@ def test_lazy_eager_reload_and_close(envelope_file):
     eager.reload()
     assert eager.get("cloud.api_key") == "rotated-value"
 
-    with FileKist(envelope_file, git_path=GIT_PATH, master_password=PASSWORD, lazy=False) as store:
+    with FileKist(envelope_file, git_path=GIT_PATH, password=PASSWORD, lazy=False) as store:
         assert store.get("cloud.api_key") == "rotated-value"
     assert "not loaded" in repr(store)
 
 
 def test_argon2_runs_once_per_load(envelope_file, monkeypatch):
-    import kist.file_store as fs
+    import kist.core as fs
     calls = []
     real = fs.decrypt_envelope
     monkeypatch.setattr(fs, "decrypt_envelope", lambda *a, **k: calls.append(1) or real(*a, **k))
-    store = FileKist(envelope_file, git_path=GIT_PATH, master_password=PASSWORD)
+    store = FileKist(envelope_file, git_path=GIT_PATH, password=PASSWORD)
     for _ in range(5):
         store.get("cloud.api_key")
     assert len(calls) == 1
@@ -193,7 +193,7 @@ def test_no_database_access(envelope_file, monkeypatch):
     import kist.core as core
     monkeypatch.setattr(core, "safe_db_connect", lambda *a, **k: pytest.fail("database used"))
     monkeypatch.setenv("KIST_DATABASE_URL", "postgresql://unreachable.invalid/kist")
-    assert FileKist(envelope_file, git_path=GIT_PATH, master_password=PASSWORD).get("mqtt.port") == 8883
+    assert FileKist(envelope_file, git_path=GIT_PATH, password=PASSWORD).get("mqtt.port") == 8883
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
