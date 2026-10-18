@@ -31,7 +31,7 @@ from typing import Callable, Optional
 from kist.core import (
     DecryptionError,
     Kist,
-    decrypt_envelope,
+    decrypt_with_key_history,
     git_context,
     KistError,
     KistScope,
@@ -118,7 +118,7 @@ def _committed_plaintext(root: str, spec: str, profile: str, path: str, password
     if not is_kist_envelope(blob.stdout):
         raise KistError(f"{path} is stored unencrypted in {spec.split(':')[0] or 'the index'}; fix that before rotating.")
     try:
-        return decrypt_envelope(blob.stdout, password, git_context(profile, path))
+        return decrypt_with_key_history(blob.stdout, profile, git_context(profile, path), password)[0]
     except DecryptionError as exc:
         raise DecryptionError(f"The current password does not open {path} in Git.") from exc
 
@@ -183,12 +183,21 @@ def _stage_new_password(profile: str, new_password: str) -> Path:
     return staged
 
 
-def _install_new_password(profile: str, staged: Path) -> tuple[Path, Optional[Path]]:
+def _install_new_password(profile: str, staged: Path, current: str) -> tuple[Path, Path]:
+    """Move the new key into place and always keep the old one as a retired key.
+
+    The old key is saved even when it came from an environment variable, so
+    older Git commits stay readable through the key history.
+    """
     target = profile_password_path(profile)
-    backup: Optional[Path] = None
+    backup = target.with_name(f"pwd_{profile}.old-{time.strftime('%Y%m%d-%H%M%S')}")
+    suffix = 1
+    while backup.exists():
+        backup = backup.with_name(f"{backup.name.split('~')[0]}~{suffix}")
+        suffix += 1
+    write_secure_local_password(backup, current, overwrite=False)
     if target.exists():
-        backup = target.with_name(f"pwd_{profile}.old-{time.strftime('%Y%m%d-%H%M%S')}")
-        os.replace(target, backup)
+        target.unlink()
     os.replace(staged, target)
     return target, backup
 
@@ -220,7 +229,9 @@ def build_checklist(result: RotationResult) -> list[str]:
     items.append("Old Git commits and database backups still open with the OLD password. "
                  "If you rotate because of a leak, also rotate the secret values themselves.")
     if result.old_key_backup:
-        items.append(f"Old key kept at {result.old_key_backup}; archive it securely or delete it when no longer needed.")
+        items.append(f"Old key kept as a retired key ({result.old_key_backup.name}): older commits and "
+                     f"'kist export --rev' keep working. Remove it with 'kist profile retired-keys "
+                     f"{plan.profile} --delete' once nothing needs old revisions.")
     return items
 
 
@@ -254,7 +265,7 @@ def rotate_profile(profile: str, *, new_password: Optional[str] = None, scope: O
         raise
 
     if staged:
-        result.local_key_path, result.old_key_backup = _install_new_password(plan.profile, staged)
+        result.local_key_path, result.old_key_backup = _install_new_password(plan.profile, staged, current)
         log(f"Local key: {result.local_key_path} updated (old key kept as {result.old_key_backup}).")
 
     if plan.git_files and plan.git_root:

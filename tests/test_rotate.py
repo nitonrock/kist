@@ -363,3 +363,127 @@ def test_profile_create_rotate_points_to_new_command(home, monkeypatch):
     from kist.core import create_profile_key
     with pytest.raises(KistError, match="kist profile rotate"):
         create_profile_key("device", rotate=True)
+
+
+# --------------------------------------------------------------------------- key history (retired keys)
+
+THIRD = "third-rotation-password-0123456789abcd"
+
+
+def checkout(rev):
+    return subprocess.run(["git", "checkout", "-q", rev, "--", "secrets/device.yaml"], capture_output=True, text=True)
+
+
+@needs_git
+def test_old_commit_opens_with_retired_key(repo, home):
+    rotate_profile("device", use_database=False, new_password=NEW)
+    git("commit", "-q", "-m", "rotate")
+    (repo / "secrets" / "device.yaml").unlink()
+    proc = checkout("HEAD~1")                     # encrypted with OLD, current key is NEW
+    assert proc.returncode == 0, proc.stderr
+    assert (repo / "secrets" / "device.yaml").read_text() == YAML
+    assert "retired key pwd_device.old-" in proc.stderr
+
+
+@needs_git
+def test_two_rotations_both_old_revisions_open(repo, home):
+    (repo / "secrets" / "device.yaml").write_text("v: 1\n")
+    git("commit", "-q", "-am", "v1")             # OLD
+    rotate_profile("device", use_database=False, new_password=NEW)
+    git("commit", "-q", "-m", "rotate 1")
+    (repo / "secrets" / "device.yaml").write_text("v: 2\n")
+    git("commit", "-q", "-am", "v2")             # NEW
+    import time; time.sleep(1.1)                 # distinct retired-key timestamps
+    rotate_profile("device", use_database=False, new_password=THIRD)
+    git("commit", "-q", "-m", "rotate 2")
+    assert len(list((home / ".kist").glob("pwd_device.old-*"))) == 2
+    for rev, expected in (("HEAD~3", "v: 1\n"), ("HEAD~1", "v: 2\n"), ("HEAD", "v: 2\n")):
+        (repo / "secrets" / "device.yaml").unlink()
+        assert checkout(rev).returncode == 0
+        assert (repo / "secrets" / "device.yaml").read_text() == expected
+
+
+@needs_git
+def test_key_history_can_be_disabled(repo, home, monkeypatch):
+    rotate_profile("device", use_database=False, new_password=NEW)
+    git("commit", "-q", "-m", "rotate")
+    (repo / "secrets" / "device.yaml").unlink()
+    monkeypatch.setenv("KIST_KEY_HISTORY", "off")
+    proc = checkout("HEAD~1")
+    assert proc.returncode != 0
+    assert not (repo / "secrets" / "device.yaml").exists() or \
+        (repo / "secrets" / "device.yaml").read_text() != YAML
+
+
+@needs_git
+def test_retired_keys_from_environment_for_ci(repo, home, monkeypatch):
+    rotate_profile("device", use_database=False, new_password=NEW)
+    git("commit", "-q", "-m", "rotate")
+    for path in (home / ".kist").glob("pwd_device.old-*"):
+        path.unlink()                            # e.g. a CI runner without local files
+    (repo / "secrets" / "device.yaml").unlink()
+    assert checkout("HEAD~1").returncode != 0
+    monkeypatch.setenv("KIST_RETIRED_PASSWORDS_DEVICE", "some-other-old-key-0123456789abcdef\n" + OLD + "\n")
+    proc = checkout("HEAD~1")
+    assert proc.returncode == 0, proc.stderr
+    assert "KIST_RETIRED_PASSWORDS_DEVICE[1]" in proc.stderr
+
+
+def test_key_history_never_used_for_encryption(home):
+    import io
+    from kist import git_clean_stream
+    (home / ".kist" / "pwd_device.old-20200101-000000").write_text(NEW)
+    (home / ".kist" / "pwd_device.old-20200101-000000").chmod(0o600)
+    out = io.BytesIO()
+    git_clean_stream("device", OLD, io.StringIO(YAML), out, "secrets/device.yaml")
+    ctx = git_context("device", "secrets/device.yaml")
+    assert decrypt_envelope(out.getvalue(), OLD, ctx).decode() == YAML
+    with pytest.raises(DecryptionError):
+        decrypt_envelope(out.getvalue(), NEW, ctx)
+
+
+def test_decrypt_with_key_history_reports_original_error(home):
+    import io
+    from kist import git_clean_stream
+    from kist.core import decrypt_with_key_history
+    out = io.BytesIO()
+    git_clean_stream("device", THIRD, io.StringIO(YAML), out, "secrets/device.yaml")
+    with pytest.raises(DecryptionError):
+        decrypt_with_key_history(out.getvalue(), "device", git_context("device", "secrets/device.yaml"), OLD)
+
+
+@needs_git
+def test_rotation_from_env_password_still_keeps_retired_key(repo, home, monkeypatch):
+    key_file(home).unlink()
+    monkeypatch.setenv("KIST_PASSWORD_DEVICE", OLD)
+    result = rotate_profile("device", use_database=False, new_password=NEW)
+    assert result.old_key_backup.read_text() == OLD
+
+
+@needs_git
+def test_cli_retired_keys_list_and_delete(repo, home, monkeypatch, capsys):
+    rotate_profile("device", use_database=False, new_password=NEW)
+    git("commit", "-q", "-m", "r1")
+    import time; time.sleep(1.1)
+    rotate_profile("device", use_database=False, new_password=THIRD)
+    monkeypatch.setattr(sys, "argv", ["kist", "profile", "retired-keys", "device"])
+    main()
+    assert capsys.readouterr().out.count("pwd_device.old-") == 2
+    proc = subprocess.run([sys.executable, "-m", "kist", "profile", "retired-keys", "device", "--delete"],
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    assert proc.returncode == 1 and "--yes" in proc.stderr
+    monkeypatch.setattr(sys, "argv", ["kist", "profile", "retired-keys", "device", "--delete", "--keep", "1", "--yes"])
+    main()
+    remaining = list((home / ".kist").glob("pwd_device.old-*"))
+    assert len(remaining) == 1 and remaining[0].read_text() == NEW   # newest retired key kept
+
+
+@needs_git
+def test_rotation_after_skip_git_rotation(repo, home):
+    """Files still under a retired key (earlier --skip-git) can be rotated forward."""
+    from kist.rotate import _install_new_password, _stage_new_password
+    staged = _stage_new_password("device", NEW)
+    _install_new_password("device", staged, OLD)       # key changed, Git untouched
+    result = rotate_profile("device", use_database=False, new_password=THIRD)
+    assert result.git_restaged == ["secrets/device.yaml"]
+    assert index_plaintext("secrets/device.yaml", THIRD).decode() == YAML

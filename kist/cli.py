@@ -31,6 +31,40 @@ def _scope_from_args(args: argparse.Namespace) -> KistScope:
     return KistScope(organization=args.org or base.organization, project=args.project or base.project).validated()
 
 
+def _run_retired_keys(args: argparse.Namespace) -> None:
+    from kist.core import key_history_enabled, retired_profile_key_files, _validate_profile_name
+    profile = _validate_profile_name(args.name)
+    files = retired_profile_key_files(profile)
+    env_name = f"KIST_RETIRED_PASSWORDS_{profile.upper()}"
+    env_count = len([l for l in os.getenv(env_name, "").splitlines() if l.strip()])
+    if not args.delete:
+        state = "on" if key_history_enabled() else "off (KIST_KEY_HISTORY)"
+        print(f"Retired keys for profile '{profile}' (key history {state}), newest first:")
+        for path in files:
+            print(f"  {path}")
+        if env_count:
+            print(f"  {env_count} from {env_name}")
+        if not files and not env_count:
+            print("  none")
+        return
+    doomed = files[max(args.keep, 0):]
+    if not doomed:
+        print("Nothing to delete.")
+        return
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise KistError("Refusing to delete keys without confirmation; pass --yes in non-interactive use.")
+        print("Commits encrypted only with these keys will no longer open on this machine:")
+        for path in doomed:
+            print(f"  {path}")
+        if input("Delete them? [y/N]: ").strip().lower() not in ("y", "yes"):
+            print("kist: cancelled.", file=sys.stderr)
+            sys.exit(1)
+    for path in doomed:
+        path.unlink()
+    print(f"Deleted {len(doomed)} retired key(s) for profile '{profile}'.")
+
+
 def _run_rotate(args: argparse.Namespace) -> None:
     from kist.rotate import plan_rotation, restage_git_with_current_key, rotate_profile
 
@@ -141,6 +175,14 @@ def main() -> None:
     rotate_parser.add_argument("--show-password", action="store_true",
                                help="Print the new password once (interactive terminals only)")
 
+    retired_parser = profile_subparsers.add_parser(
+        "retired-keys", help="List or delete retired keys kept by rotation (used to read older content)")
+    retired_parser.add_argument("name", type=str, help="Profile name")
+    retired_parser.add_argument("--delete", action="store_true", help="Delete retired key files for this profile")
+    retired_parser.add_argument("--keep", type=int, default=0, metavar="N",
+                                help="With --delete, keep the N most recent retired keys")
+    retired_parser.add_argument("--yes", "-y", action="store_true", help="Do not ask for confirmation")
+
     rm_key_parser = profile_subparsers.add_parser("remove-key", aliases=["delete-key"], help="Remove local key file (~/.kist/pwd_<name>)")
     rm_key_parser.add_argument("name", type=str, help="Profile name")
     rm_key_parser.add_argument("--force", "-f", action="store_true", help="Bypass confirmation prompt")
@@ -224,6 +266,9 @@ def main() -> None:
                 key_removed = remove_profile_key(args.name)
                 msg += " Removed local key file." if key_removed else " Local key file not found."
             print(msg)
+            return
+        if args.command == "profile" and args.profile_command == "retired-keys":
+            _run_retired_keys(args)
             return
         if args.command == "profile" and args.profile_command == "rotate":
             _run_rotate(args)

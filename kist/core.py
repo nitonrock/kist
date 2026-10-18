@@ -289,6 +289,63 @@ def get_profile_password(profile_name: str, auto_generate: bool = False, *,
         raise KistError("Implicit generation is disabled; use create_profile_key().")
     return None
 
+def key_history_enabled() -> bool:
+    return os.getenv("KIST_KEY_HISTORY", "on").strip().lower() not in {"0", "off", "false", "no"}
+
+def retired_profile_key_files(profile_name: str) -> list[Path]:
+    """Retired local keys kept by 'kist profile rotate', newest first."""
+    profile = _validate_profile_name(profile_name)
+    directory = Path(get_kist_dir())
+    if not directory.is_dir():
+        return []
+    return sorted(directory.glob(f"pwd_{profile}.old-*"), key=lambda p: p.name, reverse=True)
+
+def retired_profile_keys(profile_name: str) -> list[tuple[str, str]]:
+    """(label, password) pairs for retired keys, used for decryption only.
+
+    Sources, newest first: ``KIST_RETIRED_PASSWORDS_<PROFILE>`` (one per line,
+    for CI) then ``~/.kist/pwd_<profile>.old-<timestamp>`` files. Disabled
+    entirely with ``KIST_KEY_HISTORY=off``.
+    """
+    if not key_history_enabled():
+        return []
+    profile = _validate_profile_name(profile_name)
+    keys: list[tuple[str, str]] = []
+    env_value = os.getenv(f"KIST_RETIRED_PASSWORDS_{profile.upper()}", "")
+    for index, line in enumerate(l.strip() for l in env_value.splitlines()):
+        if line:
+            keys.append((f"KIST_RETIRED_PASSWORDS_{profile.upper()}[{index}]", line))
+    for path in retired_profile_key_files(profile):
+        try:
+            keys.append((path.name, read_secure_local_password(path)))
+        except (OSError, KistError):
+            continue
+    return keys
+
+def decrypt_with_key_history(envelope: bytes, profile_name: str, context: dict[str, str],
+                             password: Optional[str]) -> tuple[bytes, Optional[str]]:
+    """Decrypt with the current key, then with retired keys (read-only fallback).
+
+    Returns (plaintext, label of the retired key used or None). New encryption
+    must always use the current key; this is only for reading older content.
+    """
+    first_error: Optional[DecryptionError] = None
+    if password:
+        try:
+            return decrypt_envelope(envelope, password, context), None
+        except DecryptionError as exc:
+            first_error = exc
+    for label, retired in retired_profile_keys(profile_name):
+        if retired == password:
+            continue
+        try:
+            return decrypt_envelope(envelope, retired, context), label
+        except DecryptionError:
+            continue
+    if first_error is not None:
+        raise first_error
+    raise MissingKeyError(f"No decryption key configured for profile {profile_name!r}.")
+
 def create_profile_key(profile_name: str, *, rotate: bool = False) -> str:
     """Create a local password only. Replacing it is NOT ciphertext rotation."""
     if rotate:

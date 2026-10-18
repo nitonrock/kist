@@ -719,9 +719,28 @@ The command then prints a checklist of what Kist cannot reach: CI/CD secrets, en
 | `--git-only` | Recovery: if the database and key file were rotated but Git failed, re-encrypt the Git files with the current key |
 | `--show-password` | Print the new password once (interactive terminals only) |
 
+### Key history: old commits keep working
+
+Rotation keeps each old key as a **retired key** (`~/.kist/pwd_<profile>.old-<timestamp>`, owner-only). Retired keys are used **only to read** older content: when you check out an old commit, `git bisect`, or rebuild an old release. Kist tries the current key first, then retired keys from newest to oldest. New content is always encrypted with the current key.
+
+```bash
+git checkout v1.4.0            # files from before the rotation still open
+# kist: secrets/device.yaml: opened with retired key pwd_device.old-20261018-101500 (older content).
+
+kist profile retired-keys production                     # list
+kist profile retired-keys production --delete --keep 1   # forget all but the newest
+```
+
+- **CI and build machines** without local key files can provide retired keys with `KIST_RETIRED_PASSWORDS_<PROFILE>` (one per line), for example to rebuild an old firmware release.
+- **Turn it off** with `KIST_KEY_HISTORY=off`, for instance on machines that should only ever read current content.
+- **Deleting a retired key** makes commits encrypted only with it unreadable on that machine. That is the intended way to retire access to old history, short of deleting it.
+- Each retired key that is tried costs one Argon2id derivation, so keep the list short.
+
+Kist does not rewrite Git history to re-encrypt old commits. It would force-push every branch and tag and break every clone, yet anyone who had the old key and a copy of the repository could still read the old values. Key history gives the convenience without that cost; changing leaked values is what actually limits exposure.
+
 What rotation does **not** do:
 
-- **It does not rewrite history.** Old Git commits and old database backups still open with the old password. After a leak, also change the secret values themselves (new API keys and so on), and treat the old key as compromised.
+- **It does not rewrite history.** Old Git commits and old database backups still open with the old password (see [Key history](#key-history-old-commits-keep-working)). After a leak, also change the secret values themselves (new API keys and so on), and treat the old key as compromised.
 - **It does not reach other machines.** Running services fail closed on their next database read until they receive the new password. Plan a short rollout: rotate, update CI and deployment secrets, restart services.
 
 From Python:
