@@ -18,12 +18,13 @@
 
 <p align="center">
   <a href="#status">Status</a> ·
-  <a href="#example-value-in-60-seconds">60-second demo</a> ·
+  <a href="#hello-kist-in-60-seconds">60-second demo</a> ·
   <a href="#how-kist-compares">Comparison</a> ·
   <a href="#quick-start">Quick start</a> ·
   <a href="#how-it-works">How it works</a> ·
   <a href="#git-workflow">Git workflow</a> ·
   <a href="#cicd-integration--gitops">CI/CD & GitOps</a> ·
+  <a href="#offline-and-embedded-systems">Offline & embedded</a> ·
   <a href="#security-boundaries">Security boundaries</a> ·
   <a href="#license">License</a>
 </p>
@@ -74,6 +75,22 @@ Your working copy of `secrets/default.yaml` stays readable; Git only stores ciph
 
 The full setup, including production TLS, is in [Quick start](#quick-start).
 
+## Why your own PostgreSQL
+
+Kist does not ask you to sign up for anything. Ciphertext lives in your Git repository and in a PostgreSQL database you already run. Keys live with the people and machines you trust. This is deliberate, for two reasons.
+
+**Keep it simple.** Most teams already operate PostgreSQL: they back it up, monitor it, restrict access to it and know how to restore it. Reusing it means no new cluster to run, no extra agent, and no new vendor to evaluate. That is the first half of the name.
+
+**Keep it trusted.** Secrets are never better protected than by those who own them. Handing them to a third party does not remove the risk; it moves it somewhere you can neither see nor control. A hosted secret manager or CI platform holds the credentials of thousands of customers, which makes it one of the most valuable targets on the internet. When it is breached, every customer rotates at once, on someone else's timeline. With Kist, your secrets are only as exposed as your own infrastructure, and only your own incident response decides what happens next.
+
+Bringing your own database also means:
+
+- **No lock-in.** The schema is documented in [Database model](#database-model), and the envelope format is open. You can leave whenever you like.
+- **No outbound dependency.** Secret retrieval keeps working when a vendor has an outage, changes its pricing or shuts down.
+- **Defence in depth.** The database never sees plaintext or secret names, only AES-256-GCM ciphertext and HMAC-blinded keys. A stolen database dump is useless without the profile keys.
+
+The trade-off is honest: you own backups, key custody and access control. Kist keeps those jobs small; it does not make them disappear.
+
 ## What Kist does
 
 - Encrypts JSON-compatible secret values with **Argon2id-derived AES-256-GCM** keys.
@@ -106,6 +123,7 @@ Kist reduces moving parts in a secret workflow; it does not replace operational 
 | Transparent Git workflow | ✅ clean/smudge filters | ⚠️ explicit `sops edit` | ✅ clean/smudge filters | ❌ | ❌ | ❌ |
 | Runtime retrieval API (Python) | ✅ `Kist().get()` | ⚠️ decrypt file at startup | ❌ file only | ✅ plaintext env | ✅ client libs | ✅ SDKs |
 | Live reload without restart | ✅ PostgreSQL `LISTEN/NOTIFY` | ❌ | ❌ | ❌ | ⚠️ leases / agent | ✅ |
+| Where your secrets live | Your Git + your PostgreSQL | Your Git (+ cloud KMS if used) | Your Git | Your disk | Your Vault cluster | Vendor cloud (or self-hosted server) |
 | Extra infrastructure | PostgreSQL (you likely have it) | None (+ KMS optional) | None | None | Vault cluster | SaaS or self-hosted server |
 | Encryption | Argon2id → AES-256-GCM, scope-bound AAD | AES-256-GCM, age / PGP / cloud KMS | AES-256-CTR, GPG | None | AES-256-GCM | AES-256-GCM |
 | Multi-team / multi-profile isolation | ✅ per-profile keys, path-based routing | ⚠️ via `.sops.yaml` rules | ⚠️ multiple keys | ❌ | ✅ policies | ✅ projects/envs |
@@ -732,6 +750,202 @@ async def use_secrets() -> None:
 ### Caching warning
 
 Caching makes reads faster by retaining **plaintext** in process memory for a bounded period. Use it only when that trade-off is acceptable for your application. Set an explicit cache policy or disable caching if you need every read to go back through Kist.
+
+## Offline and embedded systems
+
+Devices, air-gapped hosts and CI jobs that cannot reach PostgreSQL can read secrets straight from the encrypted envelope that Git stores, with no database involved.
+
+Export the committed blob at build time. It is ciphertext, so it is safe to ship in an image:
+
+```bash
+kist export secrets/device.yaml -o dist/device.kist --verify --strict
+```
+
+| Option | Effect |
+|--|--|
+| `-o FILE` / `-o -` | Destination (default `<profile>.kist`), or stdout for pipelines |
+| `--rev REV` | Export from a tag or commit, e.g. `--rev v1.4.0` (default `HEAD`) |
+| `--staged` | Export the staged version instead of a commit |
+| `--verify` | Decrypt in memory with the profile key to prove the export works; needs the key on the build host |
+| `--strict` | Fail if the working copy has uncommitted changes (recommended in CI) |
+
+`kist export` reads the blob with `git cat-file`, so plaintext is never written. It refuses files that are not committed or not Kist-encrypted. Without Kist installed, `git show HEAD:secrets/device.yaml > dist/device.kist` produces the same file.
+
+### Reading on the device
+
+
+```python
+from kist import Kist
+
+with Kist.from_file("/etc/app/device.kist", git_path="secrets/device.yaml") as store:
+    api_key = store.get("cloud.api_key")
+    port = store.get("mqtt.port", 8883)
+```
+
+- `git_path` is the repository-relative path at commit time. It is authenticated, together with the profile, `KIST_ORGANIZATION`, `KIST_PROJECT` and `KIST_REPOSITORY_ID`. An envelope moved to another path, profile or scope fails to decrypt.
+- The profile defaults to the one Git used (`secrets/device.yaml` → `device`). The password comes from the usual lookup: `KIST_PASSWORD_DEVICE`, `KIST_PASSWORD`, or `~/.kist`.
+- Argon2id runs once per load, not per `get()`. Values stay in memory only. Call `reload()` after an update; `close()` (or leaving the `with` block) drops them.
+- The store is read-only and has no live reload. Plaintext working copies are refused.
+
+### Practical examples
+
+The pattern is the same everywhere: **CI exports ciphertext, the device holds the key.** The build pipeline never needs the profile password, so a compromised build runner cannot leak plaintext. Run `--verify` only where the key is legitimately present.
+
+Use one profile per device class (`secrets/gateway.yaml`, `secrets/sensor.yaml`) so that a compromised unit only exposes its own class.
+
+#### Embedded Linux fleet with the password sealed in the TPM
+
+On systemd 250 or later, `systemd-creds` can seal the profile password to the device's TPM 2.0, so it never sits in plaintext on disk. Kist needs no TPM code for this.
+
+Provision each device once:
+
+```bash
+# Read the password from stdin, seal it to this device's TPM, keep only the sealed file
+systemd-creds encrypt --with-key=tpm2 --name=kist-password - \
+  /etc/credstore.encrypted/kist-password.cred
+```
+
+Service unit `/etc/systemd/system/gateway.service`:
+
+```ini
+[Service]
+ExecStart=/usr/bin/python3 -m gateway
+LoadCredentialEncrypted=kist-password:/etc/credstore.encrypted/kist-password.cred
+DynamicUser=yes
+```
+
+Application:
+
+```python
+import os
+from pathlib import Path
+from kist import Kist
+
+password = (Path(os.environ["CREDENTIALS_DIRECTORY"]) / "kist-password").read_text().strip()
+
+with Kist.from_file("/usr/share/gateway/gateway.kist",
+                    git_path="secrets/gateway.yaml",
+                    master_password=password) as secrets:
+    mqtt_password = secrets.get("mqtt.password")
+    cloud_token = secrets.get("cloud.token")
+```
+
+systemd decrypts the credential into a private, in-memory directory that only this service can read. A cloned SD card is useless on another board, because the TPM will not unseal it. Add `--tpm2-pcrs=7` when encrypting to also bind it to the device's Secure Boot state.
+
+#### Firmware build in GitHub Actions
+
+Export from the release tag so that every image is reproducible and traceable to a reviewed commit:
+
+```yaml
+# .github/workflows/firmware.yml
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"   # Kist requires Python 3.13+
+      - run: pip install kist
+      # No KIST_PASSWORD here: CI handles ciphertext only.
+      - run: kist export secrets/gateway.yaml -o rootfs/usr/share/gateway/gateway.kist --rev "$GITHUB_REF_NAME"
+      - run: ./build-image.sh rootfs/   # Yocto, Buildroot, mkosi, RAUC bundle…
+      - uses: actions/upload-artifact@v7
+        with:
+          name: gateway-${{ github.ref_name }}
+          path: out/*.img
+```
+
+#### Yocto / BitBake recipe
+
+Copy the exported file next to your application's recipe (`files/gateway.kist`) and add this to the recipe or a `.bbappend`:
+
+```bitbake
+SRC_URI += "file://gateway.kist"
+
+do_install:append() {
+    # Use ${WORKDIR} instead of ${UNPACKDIR} on Yocto releases before 5.1
+    install -D -m 0644 ${UNPACKDIR}/gateway.kist ${D}${datadir}/gateway/gateway.kist
+}
+
+FILES:${PN} += "${datadir}/gateway/gateway.kist"
+```
+
+A standalone recipe that only ships this file also needs `S = "${UNPACKDIR}"` on Yocto 5.1 and later.
+
+Ciphertext in the image is fine. Keep the profile password out of the image and provision it per device, as shown above.
+
+#### Edge container with Docker secrets
+
+Bake the envelope into the image and inject the password only at run time:
+
+```dockerfile
+FROM python:3.13-slim
+RUN pip install --no-cache-dir kist
+COPY dist/edge.kist /app/edge.kist
+COPY app/ /app/
+CMD ["python", "/app/main.py"]
+```
+
+```yaml
+# compose.yaml on the edge host
+services:
+  edge:
+    image: registry.example.com/edge:1.4.0
+    secrets: [kist_password_edge]
+secrets:
+  kist_password_edge:
+    file: /etc/edge/kist_password    # chmod 600, provisioned per host; the container user must be able to read it
+```
+
+```python
+from pathlib import Path
+from kist import Kist
+
+password = Path("/run/secrets/kist_password_edge").read_text().strip()
+secrets = Kist.from_file("/app/edge.kist", git_path="secrets/edge.yaml", master_password=password)
+```
+
+#### Air-gapped server
+
+Export on a connected machine, carry the file across, and check it on arrival:
+
+```bash
+# Connected side
+kist export secrets/plant.yaml -o plant.kist --rev v2.3.0 --strict
+sha256sum plant.kist > plant.kist.sha256    # transfer both, e.g. on removable media
+
+# Air-gapped side
+sha256sum -c plant.kist.sha256
+sudo install -m 0644 plant.kist /etc/plant/plant.kist
+```
+
+The checksum catches corruption in transit, and Kist's authenticated encryption rejects any tampering. Neither replaces your site's media-transfer policy.
+
+#### Integration tests without a database
+
+Test jobs can read real, reviewed configuration without a PostgreSQL service:
+
+```python
+# conftest.py
+import pytest
+from kist import Kist
+
+@pytest.fixture(scope="session")
+def secrets():
+    with Kist.from_file("build/ci.kist", git_path="secrets/ci.yaml") as store:
+        yield store
+```
+
+```bash
+kist export secrets/ci.yaml -o build/ci.kist && KIST_PASSWORD_CI="$CI_KEY" pytest
+```
+
+Native hardware-backed keys (TPM 2.0, secure elements) are planned through `kist/kms`. Until then, seal the profile password with `systemd-creds` (see above) or protect it as you would any root credential.
 
 ## Security boundaries
 
