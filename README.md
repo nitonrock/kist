@@ -916,7 +916,7 @@ Verified on openSUSE with TPM 2.0 and Kist 0.2.0:
 | Password on disk | Only the sealed `.cred` file; no plaintext anywhere |
 | Credential loaded under another name | Refused by systemd: `Embedded credential name 'kist-password' does not match filename 'other', refusing` (status `243/CREDENTIALS`) |
 
-Files the service needs (Python, the `.kist` file) must live outside `/home` and `/tmp`: `DynamicUser=yes` gives the service a private `/tmp` and read-only, inaccessible home directories.
+Files the service needs (Python, the `.kist` file) must live outside `/home` and `/tmp`: `DynamicUser=yes` gives the service a private `/tmp` and a read-only `/home`, and the throwaway user cannot enter your home folder anyway.
 
 #### Firmware build in GitHub Actions
 
