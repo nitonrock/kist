@@ -39,7 +39,8 @@ Kist means **Keep It Simple and Trusted**: your Git, your PostgreSQL, your passw
 ## What Kist does
 
 - **Encrypted secrets in Git.** YAML secret files are encrypted automatically on `git add` and readable only where the profile password is present. Changes are reviewed in pull requests like any code.
-- **A runtime store in your PostgreSQL.** Python apps read secrets with `Kist().get()`, scoped by organisation, project and profile, and pick up changes live without a restart.
+- **A runtime store in your PostgreSQL.** Python apps read secrets with `Kist().get()` and pick up changes live without a restart.
+- **Multi-team isolation.** Each team or environment gets its own profile (`secrets/payments.yaml`, `secrets/production.yaml`) with its own password and data keys, scoped by organisation and project. One profile's password opens nothing else, in Git or in PostgreSQL.
 - **Offline and embedded use.** `kist export` ships ciphertext into firmware or containers; `Kist.from_file()` reads it on the device with no database.
 - **Password rotation.** One command re-encrypts everything under fresh keys; old commits still open through retired passwords.
 - **Leak guard.** A pre-commit hook and CI templates (GitHub, GitLab, Bitbucket) catch plaintext before it lands.
