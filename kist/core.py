@@ -672,6 +672,15 @@ class Kist:
         self.project_id: Optional[uuid.UUID] = None
         self.profile_id: Optional[uuid.UUID] = None
 
+    @classmethod
+    def from_file(cls, path: Any, **kwargs: Any) -> Any:
+        """Open a read-only, offline store from an encrypted Kist envelope file.
+
+        No database is used. See :class:`kist.file_store.FileKist`.
+        """
+        from kist.file_store import FileKist
+        return FileKist(path, **kwargs)
+
     def _require_password(self) -> str:
         if not self.master_password:
             raise MissingKeyError(f"No encryption key configured for profile {self.profile_name!r}.")

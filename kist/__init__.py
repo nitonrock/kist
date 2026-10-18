@@ -44,6 +44,7 @@ from kist.core import (
     safe_db_connect,
     write_secure_local_password,
 )
+from kist.file_store import FileKist
 from kist.fix import run_diagnose, run_fix
 from kist.git import (
     git_clean_stream,
@@ -79,6 +80,7 @@ except PackageNotFoundError:
 __all__ = [
     "__version__",
     "Kist",
+    "FileKist",
     "KistScope",
     "KistError",
     "MissingKeyError",

@@ -208,6 +208,17 @@ def main() -> None:
     unlock_parser.add_argument("--allow-mismatch", action="store_true", help="Allow profile name to mismatch target file name")
     unlock_parser.add_argument("--force", "-f", action="store_true", help="Force execution and bypass mismatch checks")
 
+    export_parser = subparsers.add_parser(
+        "export", help="Copy a committed encrypted secret file out of Git for embedded/offline builds")
+    export_parser.add_argument("file", help="Secret file in this repository, e.g. secrets/device.yaml")
+    export_parser.add_argument("-o", "--output", default=None, help="Destination (default: <profile>.kist; '-' for stdout)")
+    export_parser.add_argument("--rev", default="HEAD", help="Git revision to export from (default: HEAD)")
+    export_parser.add_argument("--staged", action="store_true", help="Export the staged (index) version instead of a commit")
+    export_parser.add_argument("--verify", action="store_true", help="Decrypt in memory with the profile key to check the export")
+    export_parser.add_argument("--profile", default=None, help="Profile override (default: derived from file name)")
+    export_parser.add_argument("--repository-id", default=None, help="KIST_REPOSITORY_ID used at commit time, for --verify")
+    export_parser.add_argument("--strict", action="store_true", help="Fail if the working copy differs from the exported revision")
+
     args = parser.parse_args()
     try:
         if args.clean:
@@ -317,6 +328,21 @@ def main() -> None:
             else:
                 print(f"Secret '{args.key}' not found for {kist.scope.organization}/{kist.scope.project}/{profile_name}.", file=sys.stderr)
                 sys.exit(1)
+            return
+        if args.command == "export":
+            from kist.export import export_envelope
+            result = export_envelope(args.file, args.output, revision=args.rev, staged=args.staged,
+                                     verify=args.verify, profile_name=args.profile,
+                                     repository_id=args.repository_id, strict=args.strict)
+            if result.working_tree_differs:
+                message = (f"{result.git_path} has uncommitted changes; exported the {result.revision} version.")
+                print(f"kist: warning: {message}", file=sys.stderr)
+            target = "stdout" if result.output is None else str(result.output)
+            print(f"Exported {result.git_path} ({result.revision}, profile '{result.profile}', "
+                  f"{result.size} bytes, encrypted) to {target}.", file=sys.stderr)
+            if result.verified_keys is not None:
+                print(f"Verified: decrypts to {result.verified_keys} secrets.", file=sys.stderr)
+            print(f"Read on device: Kist.from_file(<path>, git_path={result.git_path!r})", file=sys.stderr)
             return
         if args.command in {"lock", "unlock"}:
             explicit_profile = getattr(args, "profile", None)
