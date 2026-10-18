@@ -830,7 +830,7 @@ with Kist.from_file("/usr/share/gateway/gateway.kist",
     cloud_token = secrets.get("cloud.token")
 ```
 
-systemd decrypts the credential into a private, in-memory directory that only this service can read. A cloned SD card is useless on another board, because the TPM will not unseal it.
+systemd decrypts the credential into a private, in-memory directory that only this service can read. A cloned SD card is useless on another board, because the TPM will not unseal it. Add `--tpm2-pcrs=7` when encrypting to also bind it to the device's Secure Boot state.
 
 #### Firmware build in GitHub Actions
 
@@ -846,12 +846,15 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"   # Kist requires Python 3.13+
       - run: pip install kist
       # No KIST_PASSWORD here: CI handles ciphertext only.
       - run: kist export secrets/gateway.yaml -o rootfs/usr/share/gateway/gateway.kist --rev "$GITHUB_REF_NAME"
       - run: ./build-image.sh rootfs/   # Yocto, Buildroot, mkosi, RAUC bundle…
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: gateway-${{ github.ref_name }}
           path: out/*.img
@@ -859,7 +862,7 @@ jobs:
 
 #### Yocto / BitBake recipe
 
-Copy the exported file into your layer (`files/gateway.kist`), or generate it in a task before the build:
+Copy the exported file next to your application's recipe (`files/gateway.kist`) and add this to the recipe or a `.bbappend`:
 
 ```bitbake
 SRC_URI += "file://gateway.kist"
@@ -871,6 +874,8 @@ do_install:append() {
 
 FILES:${PN} += "${datadir}/gateway/gateway.kist"
 ```
+
+A standalone recipe that only ships this file also needs `S = "${UNPACKDIR}"` on Yocto 5.1 and later.
 
 Ciphertext in the image is fine. Keep the profile password out of the image and provision it per device, as shown above.
 
@@ -894,7 +899,7 @@ services:
     secrets: [kist_password_edge]
 secrets:
   kist_password_edge:
-    file: /etc/edge/kist_password    # chmod 600, provisioned per host
+    file: /etc/edge/kist_password    # chmod 600, provisioned per host; the container user must be able to read it
 ```
 
 ```python
