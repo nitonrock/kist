@@ -34,12 +34,15 @@
 
 Kist is a Python library and CLI for teams that want secret changes reviewed in Git, stored encrypted in PostgreSQL, and retrieved by Python applications—without operating a separate Vault cluster.
 
-Kist means **Keep It Simple and Trusted**.
+Kist means **Keep It Simple and Trusted**: your Git, your PostgreSQL, your passwords. No third party ever holds your secrets ([why](#why-your-own-postgresql)).
 
-It is built for teams that want encrypted secrets and a reviewable Git workflow
-without turning secret storage into a second full-time infrastructure project.
-The model stays deliberately small: a profile password, authenticated
-encryption, PostgreSQL, and clear operational boundaries.
+## What Kist does
+
+- **Encrypted secrets in Git.** YAML secret files are encrypted automatically on `git add` and readable only where the profile password is present. Changes are reviewed in pull requests like any code.
+- **A runtime store in your PostgreSQL.** Python apps read secrets with `Kist().get()`, scoped by organisation, project and profile, and pick up changes live without a restart.
+- **Offline and embedded use.** `kist export` ships ciphertext into firmware or containers; `Kist.from_file()` reads it on the device with no database.
+- **Password rotation.** One command re-encrypts everything under fresh keys; old commits still open through retired passwords.
+- **Leak guard.** A pre-commit hook and CI templates (GitHub, GitLab, Bitbucket) catch plaintext before it lands.
 
 ## Hello Kist in 60 seconds
 
@@ -76,46 +79,6 @@ Your working copy of `secrets/default.yaml` stays readable; Git only stores ciph
 
 The full setup, including production TLS, is in [Quick start](#quick-start).
 
-## Why your own PostgreSQL
-
-Kist does not ask you to sign up for anything. Ciphertext lives in your Git repository and in a PostgreSQL database you already run. Keys live with the people and machines you trust. This is deliberate, for two reasons.
-
-**Keep it simple.** Most teams already operate PostgreSQL: they back it up, monitor it, restrict access to it and know how to restore it. Reusing it means no new cluster to run, no extra agent, and no new vendor to evaluate. That is the first half of the name.
-
-**Keep it trusted.** Secrets are never better protected than by those who own them. Handing them to a third party does not remove the risk; it moves it somewhere you can neither see nor control. A hosted secret manager or CI platform holds the credentials of thousands of customers, which makes it one of the most valuable targets on the internet. When it is breached, every customer rotates at once, on someone else's timeline. With Kist, your secrets are only as exposed as your own infrastructure, and only your own incident response decides what happens next.
-
-Bringing your own database also means:
-
-- **No lock-in.** The schema is documented in [Database model](#database-model), and the envelope format is open. You can leave whenever you like.
-- **No outbound dependency.** Secret retrieval keeps working when a vendor has an outage, changes its pricing or shuts down.
-- **Defence in depth.** The database never sees plaintext or secret names, only AES-256-GCM ciphertext and HMAC-blinded keys. A stolen database dump is useless without the profile passwords.
-
-The trade-off is honest: you own backups, key custody and access control. Kist keeps those jobs small; it does not make them disappear.
-
-## What Kist does
-
-- Encrypts JSON-compatible secret values with **Argon2id-derived AES-256-GCM** keys.
-- Stores encrypted values in PostgreSQL, scoped by organisation, project, and profile.
-- Locks nested YAML mappings into dot-separated secret keys while preserving JSON-compatible types.
-- Unlocks a profile back into readable YAML when the correct password is available.
-- Uses Git clean/smudge filters to keep selected YAML secret files encrypted in Git while exposing plaintext only in the authorised working tree.
-- Provides an optional local pre-commit guard that detects plaintext in configured Kist secret paths and common credential patterns.
-- Integrates with CI/CD pipelines (**GitHub Actions**, **GitLab CI/CD**, **Bitbucket Pipelines**) for automated PR leak scanning and continuous secret synchronization (GitOps).
-- Supports bounded in-memory caches and PostgreSQL `LISTEN` / `NOTIFY` invalidation through the optional runtime store helpers.
-
-## What Kist does not do
-
-Kist deliberately stays small:
-
-- It does **not** provide the sharks surrounding the island in the image above (you will have to supply your own biological perimeter defense).
-- It is **not** a replacement for HashiCorp Vault, a cloud secret manager, or a full identity and governance platform.
-- It does **not** include Kist Guard, cloud KMS, HSM, or managed key-release support yet.
-- It does **not** protect a secret after an authorised application has decrypted it.
-- It does **not** make a local Git hook impossible to bypass (`git commit --no-verify` will always remain an effective way to shoot oneself in the foot).
-- It does **not** replace key backup, password-sharing procedures, CI access policy, incident response, or the people responsible for operating them.
-
-Kist reduces moving parts in a secret workflow; it does not replace operational judgement, incident response, or the uncomfortable meeting after a leaked credential.
-
 ## How Kist compares
 
 | | **Kist** | **sops** | **git-crypt** | **python-dotenv** | **HashiCorp Vault** | **Infisical / Doppler** |
@@ -137,6 +100,32 @@ Kist reduces moving parts in a secret workflow; it does not replace operational 
 PostgreSQL you already run, and refreshed live—without operating a Vault cluster.
 **Choose something else when** you need cloud KMS today, dynamic credentials, or central
 access policies and audit logs.
+
+## Why your own PostgreSQL
+
+Kist does not ask you to sign up for anything. Ciphertext lives in your Git repository and in a PostgreSQL database you already run. Keys live with the people and machines you trust. This is deliberate, for two reasons.
+
+**Keep it simple.** Most teams already operate PostgreSQL: they back it up, monitor it, restrict access to it and know how to restore it. Reusing it means no new cluster to run, no extra agent, and no new vendor to evaluate. That is the first half of the name.
+
+**Keep it trusted.** Secrets are never better protected than by those who own them. Handing them to a third party does not remove the risk; it moves it somewhere you can neither see nor control. A hosted secret manager or CI platform holds the credentials of thousands of customers, which makes it one of the most valuable targets on the internet. When it is breached, every customer rotates at once, on someone else's timeline. With Kist, your secrets are only as exposed as your own infrastructure, and only your own incident response decides what happens next.
+
+Bringing your own database also means:
+
+- **No lock-in.** The schema is documented in [Database model](#database-model), and the envelope format is open. You can leave whenever you like.
+- **No outbound dependency.** Secret retrieval keeps working when a vendor has an outage, changes its pricing or shuts down.
+- **Defence in depth.** The database never sees plaintext or secret names, only AES-256-GCM ciphertext and HMAC-blinded keys. A stolen database dump is useless without the profile passwords.
+
+The trade-off is honest: you own backups, key custody and access control. Kist keeps those jobs small; it does not make them disappear.
+
+## What Kist does not do
+
+- It does **not** provide the sharks surrounding the island in the image above. Bring your own perimeter defence.
+- It is **not** a replacement for Vault, a cloud secret manager or an identity platform.
+- It does **not** support cloud KMS or HSM yet.
+- It does **not** protect a secret once an authorised application has decrypted it.
+- It does **not** make a Git hook impossible to bypass: `git commit --no-verify` remains an effective way to shoot oneself in the foot.
+
+Kist reduces moving parts; it does not replace operational judgement, backups or the uncomfortable meeting after a leaked credential.
 
 ## Status
 
