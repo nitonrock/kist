@@ -86,6 +86,7 @@ The full setup, including production TLS, is in [Quick start](#quick-start).
 |--|--|--|--|--|--|--|
 | Changes go through Git review & history | ✅ encrypted in commits + CI leak guard | ✅ | ✅ | ❌ plaintext `.env`, usually gitignored | ❌ | ⚠️ via integrations |
 | Readable diffs | ⚠️ plaintext locally with the password (`git diff`, `git log -p`), binary on GitHub | ✅ key names visible, values encrypted | ⚠️ plaintext locally when unlocked, binary on GitHub | n/a | n/a | n/a |
+| Secret names hidden in the repository | ✅ whole file encrypted, by design | ❌ key names stay in cleartext | ✅ | ❌ | n/a | n/a |
 | Transparent Git workflow | ✅ clean/smudge filters | ⚠️ explicit `sops edit` | ✅ clean/smudge filters | ❌ | ❌ | ❌ |
 | Runtime retrieval API (Python) | ✅ `Kist().get()` | ⚠️ decrypt file at startup | ❌ file only | ✅ plaintext env | ✅ client libs | ✅ SDKs |
 | Live reload without restart | ✅ PostgreSQL `LISTEN/NOTIFY` | ❌ | ❌ | ❌ | ⚠️ leases / agent | ✅ |
@@ -103,6 +104,13 @@ The full setup, including production TLS, is in [Quick start](#quick-start).
 **Choose Kist when** you want secret changes reviewed in Git, served at runtime from the
 PostgreSQL you already run, refreshed live, and shipped as an encrypted file to
 offline or embedded devices—without operating a Vault cluster.
+
+Kist and sops make opposite choices on purpose. sops keeps key names readable so pull
+requests show *which* secret changed; Kist encrypts the whole file, because names such as
+`stripe.live_secret_key`, `aws.prod_root` or `vpn.customer_acme` already reveal your vendors,
+environments and customers to anyone who can read the repository. Kist shows readable diffs
+only where the profile password is present ([Readable diffs](#readable-diffs)).
+
 **Choose something else when** you need cloud KMS today, dynamic credentials, or central
 access policies and audit logs.
 
@@ -545,7 +553,7 @@ $ git log -p -1 -- secrets/device.yaml
 - **Without the password**, the diff shows a placeholder with a short fingerprint instead of failing, so a change is still visible: `[kist: encrypted content 936e812039c9; no password for profile 'payments' opens it]`.
 - **Old commits** written before a password rotation are decrypted with the retired passwords.
 - **Renamed files** decrypt across the rename with `git log -p --follow`.
-- **On GitHub or GitLab**, pull requests still show binary changes: decryption only happens on machines that hold the password.
+- **On GitHub or GitLab**, pull requests show binary changes, by design: decryption only happens on machines that hold the password. Unlike sops, Kist does not leave key names in cleartext, because the names alone (`stripe.live_secret_key`, `vpn.customer_acme`) tell an outsider which vendors, environments and customers you have.
 
 Kist does not set `diff.kist.cachetextconv`, so decrypted text is never cached in Git notes.
 
