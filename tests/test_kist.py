@@ -1379,3 +1379,15 @@ def test_cli_profile_remove_key(tmp_path, monkeypatch, capsys):
     assert exc_info.value.code == 1
     captured = capsys.readouterr()
     assert "Local password file for profile 'key_only' not found." in captured.err
+
+
+def test_cli_version_flag(capsys, monkeypatch):
+    from importlib.metadata import version
+
+    from kist.cli import main
+
+    monkeypatch.setattr(sys, "argv", ["kist", "--version"])
+    with pytest.raises(SystemExit) as exc:
+        main()
+    assert exc.value.code == 0
+    assert capsys.readouterr().out.strip() == f"kist {version('kist')}"

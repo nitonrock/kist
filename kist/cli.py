@@ -21,6 +21,16 @@ from kist.git import git_clean_stream, git_smudge_stream, git_textconv, print_ho
 from kist.status import run_status
 
 
+
+def _package_version() -> str:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        return version("kist")
+    except PackageNotFoundError:
+        return "unknown"
+
+
 def _require_tty_for_key_display() -> None:
     if not sys.stdout.isatty():
         raise KistError("Refusing to print a newly generated profile password to non-interactive stdout.")
@@ -131,6 +141,7 @@ def main() -> None:
     parser.add_argument("--org", help="Organization namespace; defaults to KIST_ORG_ID or local")
     parser.add_argument("--project", help="Project namespace; defaults to KIST_PROJECT_ID or default")
     parser.add_argument("--profile", help="Explicit profile name override")
+    parser.add_argument("--version", action="version", version=f"kist {_package_version()}")
     parser.add_argument("--clean", type=str, metavar="FILE", help="Git clean filter entry point")
     parser.add_argument("--smudge", type=str, metavar="FILE", help="Git smudge filter entry point")
     parser.add_argument("--textconv", type=str, metavar="FILE", help="Git diff driver entry point (prints plaintext for git diff/log -p)")
