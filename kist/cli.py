@@ -17,7 +17,7 @@ from kist.core import (
     resolve_secret_file_path,
 )
 from kist.fix import run_diagnose, run_fix
-from kist.git import git_clean_stream, git_smudge_stream, print_hook, run_git_setup, run_leak_guard
+from kist.git import git_clean_stream, git_smudge_stream, git_textconv, print_hook, run_git_setup, run_leak_guard
 from kist.status import run_status
 
 
@@ -133,6 +133,7 @@ def main() -> None:
     parser.add_argument("--profile", help="Explicit profile name override")
     parser.add_argument("--clean", type=str, metavar="FILE", help="Git clean filter entry point")
     parser.add_argument("--smudge", type=str, metavar="FILE", help="Git smudge filter entry point")
+    parser.add_argument("--textconv", type=str, metavar="FILE", help="Git diff driver entry point (prints plaintext for git diff/log -p)")
     subparsers = parser.add_subparsers(dest="command")
 
     init_parser = subparsers.add_parser("init", help="Configure non-destructive local Git integration")
@@ -224,6 +225,9 @@ def main() -> None:
         if args.clean:
             profile_name, password = get_profile_and_password(args.clean)
             git_clean_stream(profile_name=profile_name, password=password)
+            return
+        if args.textconv:
+            git_textconv(args.textconv)
             return
         if args.smudge:
             profile_name, password = get_profile_and_password(args.smudge)

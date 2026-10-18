@@ -40,6 +40,7 @@ def run_diagnose() -> int:
     checks = {
         "filter.kist.clean": "git config --get filter.kist.clean",
         "filter.kist.smudge": "git config --get filter.kist.smudge",
+        "diff.kist.textconv (readable git diff)": "git config --get diff.kist.textconv",
     }
     for label, command in checks.items():
         result = subprocess.run(command.split(), capture_output=True, text=True, check=False)
@@ -92,7 +93,7 @@ def run_fix(*, apply: bool = False, force_hook: bool = False) -> int:
     if not apply:
         print("Kist repair plan (dry run)")
         print("=" * 50)
-        print("- Configure required local Git clean/smudge filters")
+        print("- Configure required local Git clean/smudge filters and the readable-diff driver")
         if _missing_attribute_rules():
             print("- Append missing Kist filter entries to .gitattributes")
         if not (Path(".gitignore").exists() and ".kist/" in Path(".gitignore").read_text(encoding="utf-8")):

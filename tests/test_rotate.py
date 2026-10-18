@@ -410,9 +410,8 @@ def test_key_history_can_be_disabled(repo, home, monkeypatch):
     (repo / "secrets" / "device.yaml").unlink()
     monkeypatch.setenv("KIST_USE_RETIRED_PASSWORDS", "off")
     proc = checkout("HEAD~1")
-    assert proc.returncode != 0
-    assert not (repo / "secrets" / "device.yaml").exists() or \
-        (repo / "secrets" / "device.yaml").read_text() != YAML
+    assert "left encrypted" in proc.stderr          # locked, never plaintext
+    assert (repo / "secrets" / "device.yaml").read_bytes().startswith(b"KIST")
 
 
 @needs_git
@@ -422,7 +421,9 @@ def test_retired_keys_from_environment_for_ci(repo, home, monkeypatch):
     for path in (home / ".kist").glob("pwd_device.old-*"):
         path.unlink()                            # e.g. a CI runner without local files
     (repo / "secrets" / "device.yaml").unlink()
-    assert checkout("HEAD~1").returncode != 0
+    assert "left encrypted" in checkout("HEAD~1").stderr
+    assert (repo / "secrets" / "device.yaml").read_bytes().startswith(b"KIST")
+    (repo / "secrets" / "device.yaml").unlink()
     monkeypatch.setenv("KIST_RETIRED_PASSWORDS_DEVICE", "some-other-old-key-0123456789abcdef\n" + OLD + "\n")
     proc = checkout("HEAD~1")
     assert proc.returncode == 0, proc.stderr

@@ -38,7 +38,7 @@ Kist means **Keep It Simple and Trusted**: your Git, your PostgreSQL, your passw
 
 ## What Kist does
 
-- **Encrypted secrets in Git.** YAML secret files are encrypted automatically on `git add` and readable only where the profile password is present. Changes are reviewed in pull requests like any code.
+- **Encrypted secrets in Git.** YAML secret files are encrypted automatically on `git add` and readable only where the profile password is present. Changes go through pull requests like any code, and `git diff` shows them in plaintext wherever the password is present.
 - **A runtime store in your PostgreSQL.** Python apps read secrets with `Kist().get()` and pick up changes live without a restart.
 - **Multi-team isolation.** Each team or environment gets its own profile (`secrets/payments.yaml`, `secrets/production.yaml`) with its own password and data keys, scoped by organisation and project. One profile's password opens nothing else, in Git or in PostgreSQL.
 - **Offline and embedded use.** `kist export` ships ciphertext into firmware or containers; `Kist.from_file()` reads it on the device with no database.
@@ -85,7 +85,7 @@ The full setup, including production TLS, is in [Quick start](#quick-start).
 | | **Kist** | **sops** | **git-crypt** | **python-dotenv** | **HashiCorp Vault** | **Infisical / Doppler** |
 |--|--|--|--|--|--|--|
 | Changes go through Git review & history | ✅ encrypted in commits + CI leak guard | ✅ | ✅ | ❌ plaintext `.env`, usually gitignored | ❌ | ⚠️ via integrations |
-| Readable diffs | ❌ binary (local plaintext diffs planned) | ✅ key names visible, values encrypted | ⚠️ plaintext locally when unlocked, binary on GitHub | n/a | n/a | n/a |
+| Readable diffs | ⚠️ plaintext locally with the password (`git diff`, `git log -p`), binary on GitHub | ✅ key names visible, values encrypted | ⚠️ plaintext locally when unlocked, binary on GitHub | n/a | n/a | n/a |
 | Transparent Git workflow | ✅ clean/smudge filters | ⚠️ explicit `sops edit` | ✅ clean/smudge filters | ❌ | ❌ | ❌ |
 | Runtime retrieval API (Python) | ✅ `Kist().get()` | ⚠️ decrypt file at startup | ❌ file only | ✅ plaintext env | ✅ client libs | ✅ SDKs |
 | Live reload without restart | ✅ PostgreSQL `LISTEN/NOTIFY` | ❌ | ❌ | ❌ | ⚠️ leases / agent | ✅ |
@@ -522,11 +522,38 @@ Kist configures local clean/smudge filters, appends missing Kist rules to `.gita
 Expected Kist attribute rules include:
 
 ```gitattributes
-secrets*.yaml filter=kist
-secrets*.yml filter=kist
-secrets/*.yaml filter=kist
-secrets/*.yml filter=kist
+secrets*.yaml filter=kist diff=kist
+secrets*.yml filter=kist diff=kist
+**/secrets/**/*.yaml filter=kist diff=kist
+**/secrets/**/*.yml filter=kist diff=kist
 ```
+
+Run `kist init` again in repositories set up by older versions: it upgrades the existing rules in place.
+
+### Readable diffs
+
+`git diff`, `git log -p` and `git show` show the plaintext YAML change wherever the profile password is present, while the repository only ever stores ciphertext:
+
+```console
+$ git log -p -1 -- secrets/device.yaml
+@@ -1,2 +1,2 @@
+ cloud:
+-  api_key: example-one
++  api_key: example-two
+```
+
+- **Without the password**, the diff shows a placeholder with a short fingerprint instead of failing, so a change is still visible: `[kist: encrypted content 936e812039c9; no password for profile 'payments' opens it]`.
+- **Old commits** written before a password rotation are decrypted with the retired passwords.
+- **Renamed files** decrypt across the rename with `git log -p --follow`.
+- **On GitHub or GitLab**, pull requests still show binary changes: decryption only happens on machines that hold the password.
+
+Kist does not set `diff.kist.cachetextconv`, so decrypted text is never cached in Git notes.
+
+### Locked files, stable ciphertext and renames
+
+- **Locked files.** When no password opens a file at checkout, Kist leaves it encrypted in the working tree instead of failing, as git-crypt does. Applications reading it fail; commits, checkouts and diffs keep working. In multi-team repositories each developer sees plaintext only for their own profiles. Content that is not a Kist envelope is still refused.
+- **Stable ciphertext.** Encryption is randomised, so `git add` reuses the existing envelope when the plaintext has not changed. Untouched files never show up as modified and commits contain only real changes. Password rotation always re-encrypts; set `KIST_FRESH_ENCRYPTION=1` to force it manually.
+- **Renames.** Each envelope is bound to its path. After `git mv`, re-encrypt for the new path with `git add --renormalize <new-path>`; the pre-commit guard blocks the commit until you do.
 
 Kist will not silently overwrite an unrelated pre-commit hook. Review the hook first, then use the explicit force option only when appropriate.
 

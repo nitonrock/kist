@@ -61,12 +61,14 @@ def run_status() -> int:
     else:
         clean = bool(_git_value("filter.kist.clean"))
         smudge = bool(_git_value("filter.kist.smudge"))
+        textconv = bool(_git_value("diff.kist.textconv"))
         attrs = Path(".gitattributes").exists() and "filter=kist" in Path(".gitattributes").read_text(encoding="utf-8")
         ignored = Path(".gitignore").exists() and ".kist/" in Path(".gitignore").read_text(encoding="utf-8")
         hook = Path(".git") / "hooks" / "pre-commit"
         hook_ok = hook.exists() and KIST_HOOK_MARKER in hook.read_text(encoding="utf-8", errors="replace")
         print(f"Git clean filter: {'OK' if clean else 'MISSING'}")
         print(f"Git smudge filter: {'OK' if smudge else 'MISSING'}")
+        print(f"Git diff driver: {'OK' if textconv else 'MISSING (run kist init for readable diffs)'}")
         print(f"Git attributes: {'OK' if attrs else 'MISSING'}")
         print(f"Local password ignore rule: {'OK' if ignored else 'MISSING'}")
         print(f"Kist pre-commit hook: {'OK' if hook_ok else 'MISSING OR THIRD-PARTY'}")
