@@ -1,59 +1,26 @@
-name: Kist Leak Guard & PR Scan
+# Kist leak guard for pull requests: blocks plaintext secret files, likely
+# credentials and envelopes moved without re-encryption. Needs no secrets.
+name: Kist leak guard
 
 on:
   pull_request:
-    branches:
-      - main
-      - master
-      - staging
-      - production
+
+permissions:
+  contents: read
+
+env:
+  # Must match what developers use when they commit:
+  KIST_ORG_ID: local
+  KIST_PROJECT_ID: default
+  # KIST_REPOSITORY_ID: local-repository
 
 jobs:
-  scan-secrets:
-    name: Verify Encrypted Secrets & Guard
+  leak-guard:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python & uv
-        uses: astral-sh/setup-uv@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-
-      - name: Install Dependencies & Kist
-        run: |
-          uv sync || pip install kist
-
-      - name: Verify Secret Envelope Encryption
-        run: |
-          python - << 'EOF'
-          import sys
-          from pathlib import Path
-          from kist.core import is_kist_envelope
-
-          secret_files = list(Path('.').glob('secrets*.yaml')) + \
-                         list(Path('.').glob('secrets*.yml')) + \
-                         list(Path('secrets').glob('*.yaml') if Path('secrets').is_dir() else []) + \
-                         list(Path('secrets').glob('*.yml') if Path('secrets').is_dir() else [])
-
-          failed = False
-          checked = 0
-          for file_path in set(secret_files):
-              if file_path.is_file() and file_path.stat().st_size > 0:
-                  checked += 1
-                  content = file_path.read_bytes()
-                  if not is_kist_envelope(content):
-                      print(f"🚨 CRITICAL: {file_path} is NOT an encrypted Kist envelope! Plaintext commit detected.", file=sys.stderr)
-                      failed = True
-                  else:
-                      print(f"🔒 OK: {file_path} verified as valid Kist encrypted envelope.")
-
-          if failed:
-              print("\n❌ PR check failed: Unencrypted secret files detected. Please encrypt with 'kist git-clean' or git filters before committing.", file=sys.stderr)
-              sys.exit(1)
-
-          print(f"\n✅ All {checked} secret file(s) successfully verified.")
-          EOF
+      - run: pip install --quiet "kist==0.2.3"
+      - run: kist pre-commit-guard --all-files

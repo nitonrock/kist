@@ -1,74 +1,77 @@
+# Kist on GitLab CI/CD: merge-request leak guard + lock every profile into PostgreSQL.
+#
+# Secret variables (Settings > CI/CD > Variables, or resources/gitlab/set-variables.sh):
+#   KIST_DATABASE_URL          Masked (or Masked and hidden), Protected, Expand variable reference OFF
+#   KIST_PASSWORD_<PROFILE>    one per profile this pipeline may lock; same flags
+# Project variables reach every job automatically: do not re-declare them below.
+#
+# Everything else is not secret and lives here, under version control.
+
+# One pipeline per change: merge-request pipelines for MRs, branch pipelines otherwise.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
 stages:
   - security
   - sync_secrets
   - deploy
 
+variables:
+  KIST_VERSION: "0.2.3"
+  KIST_ENV: production
+  KIST_TLS_MODE: require            # or verify-full with PGSSLROOTCERT (a File-type variable)
+  # Must match what developers use when they commit, or files will not decrypt:
+  KIST_ORG_ID: local                # e.g. acme
+  KIST_PROJECT_ID: default          # e.g. gateway
+  # KIST_REPOSITORY_ID: local-repository
+
 default:
   image: python:3.13-slim
   before_script:
-    - pip install --upgrade pip
-    - pip install uv
-    - uv sync || pip install kist
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends git >/dev/null
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - pip install --quiet --root-user-action=ignore "kist==${KIST_VERSION}"
 
-# 1. Leak detection on Merge Requests
-leak_guard_check:
+# 1. Block plaintext secrets, credentials and moved envelopes in merge requests.
+#    Needs no secret variables.
+kist_leak_guard:
   stage: security
-  rules:
-    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
-    - if: $CI_COMMIT_BRANCH != "main"
   script:
-    - echo "🔍 Scanning repository for unencrypted secret files..."
-    - |
-      python - << 'EOF'
-      import sys
-      from pathlib import Path
-      from kist.core import is_kist_envelope
+    - kist pre-commit-guard --all-files
 
-      secret_files = list(Path('.').glob('secrets*.yaml')) + \
-                     list(Path('.').glob('secrets*.yml')) + \
-                     list(Path('secrets').glob('*.yaml') if Path('secrets').is_dir() else []) + \
-                     list(Path('secrets').glob('*.yml') if Path('secrets').is_dir() else [])
-
-      failed = False
-      checked = 0
-      for file_path in set(secret_files):
-          if file_path.is_file() and file_path.stat().st_size > 0:
-              checked += 1
-              content = file_path.read_bytes()
-              if not is_kist_envelope(content):
-                  print(f"🚨 CRITICAL: {file_path} is NOT an encrypted Kist envelope! Plaintext commit detected.", file=sys.stderr)
-                  failed = True
-              else:
-                  print(f"🔒 OK: {file_path} verified as valid Kist encrypted envelope.")
-
-      if failed:
-          print("\n❌ Merge request check failed: Unencrypted secret files detected.", file=sys.stderr)
-          sys.exit(1)
-
-      print(f"\n✅ All {checked} secret file(s) successfully verified.")
-      EOF
-
-# 2. Lock secrets into PostgreSQL on main branch merge
-sync_production_secrets:
+# 2. After merge, decrypt each profile in memory and lock it into PostgreSQL.
+#    Profiles without a KIST_PASSWORD_<PROFILE> in this job are skipped, so a
+#    project only needs the passwords of the profiles it deploys.
+kist_sync_secrets:
   stage: sync_secrets
   rules:
-    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
       changes:
-        - secrets*.yaml
-        - secrets*.yml
-        - secrets/**
-  variables:
-    KIST_DATABASE_URL: $KIST_DATABASE_URL
-    KIST_PASSWORD_PRODUCTION: $KIST_PASSWORD_PRODUCTION
+        - "**/secrets*.yaml"
+        - "**/secrets*.yml"
+        - "**/secrets/**/*"
   script:
-    - echo "🔒 Locking secrets to centralized PostgreSQL database..."
-    - uv run kist --profile production lock secrets/production.yaml
-    - echo "✅ PostgreSQL secret state updated."
+    - kist lock --all                 # add --prune to delete keys removed from YAML
+                                      # add --require-all to fail if any password is missing
 
-# 3. Deploy application services
-deploy_prod:
+# Optional: one job per team, each with its own environment-scoped password
+# (variable KIST_PASSWORD_PAYMENTS with Environment scope "payments").
+# kist_sync_payments:
+#   stage: sync_secrets
+#   environment: payments
+#   rules:
+#     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+#   script:
+#     - kist lock --all --only payments --require-all
+
+# 3. Deploy. Applications using DynamicSecretStore reload via PostgreSQL NOTIFY.
+deploy:
   stage: deploy
   rules:
-    - if: $CI_COMMIT_BRANCH == "main"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
   script:
-    - echo "🚀 Deploying updated service..."
+    - echo "Deploy your application here."
