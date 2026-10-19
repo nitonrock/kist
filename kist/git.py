@@ -436,14 +436,13 @@ def _has_likely_credential(text: str, file_path: str = "") -> bool:
     return False
 
 
-def run_leak_guard() -> int:
-    """Block plaintext Kist files and likely credentials in every staged text file."""
-    result = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+def run_leak_guard(all_files: bool = False) -> int:
+    """Block plaintext Kist files and likely credentials in every staged text file.
+
+    With ``all_files`` every tracked file is scanned (CI, merge requests).
+    """
+    command = ["git", "ls-files"] if all_files else ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
     if result.returncode != 0:
         print("kist: unable to inspect staged Git changes.", file=sys.stderr)
         return 1
@@ -468,8 +467,9 @@ def run_leak_guard() -> int:
             except KistError:
                 bound_here = True
             if not bound_here:
-                print(f"kist: blocked {file_path}: encrypted for another path or scope (moved or copied?). "
-                      f"Re-encrypt it for its new path: git add --renormalize {file_path}", file=sys.stderr)
+                print(f"kist: blocked {file_path}: encrypted for another path or scope. If it was moved or copied, "
+                      f"re-encrypt it: git add --renormalize {file_path}. In CI, check that KIST_ORG_ID, "
+                      f"KIST_PROJECT_ID and KIST_REPOSITORY_ID match the developers' values.", file=sys.stderr)
                 return 1
             continue
 

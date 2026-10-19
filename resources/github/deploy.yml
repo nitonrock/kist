@@ -1,44 +1,44 @@
-name: Deploy & Sync Secrets to PostgreSQL
+# Lock every Kist profile into PostgreSQL after a merge, then deploy.
+#
+# Repository secrets (Settings > Secrets and variables > Actions), e.g. with gh:
+#   gh secret set KIST_DATABASE_URL
+#   gh secret set KIST_PASSWORD_PRODUCTION < ~/.kist/pwd_production
+# GitHub only passes secrets that are listed under env: below, one line per profile.
+name: Kist sync and deploy
 
 on:
   push:
-    branches:
-      - main
-    paths:
-      - 'secrets*.yaml'
-      - 'secrets*.yml'
-      - 'secrets/**'
-      - 'src/**'
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  KIST_ENV: production
+  KIST_TLS_MODE: require
+  # Must match what developers use when they commit:
+  KIST_ORG_ID: local
+  KIST_PROJECT_ID: default
+  # KIST_REPOSITORY_ID: local-repository
 
 jobs:
-  sync-secrets-and-deploy:
-    name: Sync Secrets & Deploy Application
+  sync-and-deploy:
     runs-on: ubuntu-latest
+    environment: production
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python & uv
-        uses: astral-sh/setup-uv@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          version: "latest"
           python-version: "3.13"
+      - run: pip install --quiet "kist==0.2.3"
 
-      - name: Install Project & Kist
-        run: |
-          uv sync || pip install kist
-
-      - name: Sync Secrets to Production Database
+      - name: Lock secrets into PostgreSQL
         env:
           KIST_DATABASE_URL: ${{ secrets.KIST_DATABASE_URL }}
           KIST_PASSWORD_PRODUCTION: ${{ secrets.KIST_PASSWORD_PRODUCTION }}
-        run: |
-          echo "🔒 Locking and flattening secrets into PostgreSQL..."
-          uv run kist --profile production lock secrets/production.yaml
-          echo "✅ Secrets successfully synced to PostgreSQL (LISTEN/NOTIFY signals emitted)."
+          KIST_PASSWORD_PAYMENTS: ${{ secrets.KIST_PASSWORD_PAYMENTS }}
+          # One line per profile; profiles without a secret are skipped.
+        run: kist lock --all            # --prune deletes keys removed from YAML
 
-      - name: Deploy Application Container
-        run: |
-          echo "🚀 Deploying application..."
-          # Application nodes using DynamicSecretStore or AsyncDynamicSecretStore
-          # automatically receive instant cache invalidation via PostgreSQL NOTIFY.
+      - name: Deploy
+        run: echo "Deploy your application here. DynamicSecretStore reloads via PostgreSQL NOTIFY."

@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/pypi/v/kist?logo=pypi&amp;logoColor=white" alt="PyPI" /></a>
+  <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/badge/pypi-v0.2.3-blue?logo=pypi&amp;logoColor=white" alt="PyPI" /></a>
   <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/pypi/pyversions/kist?logo=python&amp;logoColor=white" alt="Python versions" /></a>
   <a href="https://github.com/nitonrock/kist/actions/workflows/tests.yml"><img src="https://github.com/nitonrock/kist/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
   <a href="https://github.com/nitonrock/kist/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License" /></a>
@@ -629,52 +629,44 @@ Kist turns Git into a secure, reviewable control plane for application secrets (
 ```text
 ┌───────────────────────────────┐     Pull Request     ┌────────────────────────────────────┐
 │ Developer pushes branch       │ ───────────────────> │ CI Server: PR Leak Guard           │
-│ (secrets encrypted by filter) │                      │ - Verifies valid Kist envelopes    │
+│ (secrets encrypted by filter) │                      │ - kist pre-commit-guard --all-files│
 └───────────────────────────────┘                      │ - Blocks unencrypted files/tokens  │
                                                        └─────────────────┬──────────────────┘
                                                                          │ Approved & Merged
                                                                          ▼
 ┌───────────────────────────────┐     PostgreSQL       ┌────────────────────────────────────┐
 │ Application Runtime Containers│ <─────────────────── │ CI/CD Server: Secret Sync          │
-│ - DynamicSecretStore caches   │    LISTEN/NOTIFY     │ - Runs `kist lock secrets.yaml`    │
+│ - DynamicSecretStore caches   │    LISTEN/NOTIFY     │ - Runs `kist lock --all`           │
 │ - Instant auto-invalidation   │                      │ - Updates database ciphertext      │
 └───────────────────────────────┘                      └────────────────────────────────────┘
 ```
 
 ### 1. Server-side PR leak protection
 
-While local pre-commit hooks provide fast feedback for developers, server-side CI checks guarantee that no unencrypted secret file or exposed credential ever merges into protected branches (e.g., `main`, `staging`).
-
-In Pull Requests / Merge Requests, CI verifies that all tracked `secrets*.yaml` files are valid `kist-v1` binary envelopes:
-
-```yaml
-- name: Verify Secret Envelope Encryption
-  run: |
-    python - << 'EOF'
-    import sys
-    from pathlib import Path
-    from kist.core import is_kist_envelope
-
-    secret_files = list(Path('.').glob('secrets*.yaml')) + list(Path('.').glob('secrets*.yml'))
-    for file_path in secret_files:
-        if file_path.is_file() and file_path.stat().st_size > 0:
-            if not is_kist_envelope(file_path.read_bytes()):
-                print(f"🚨 Plaintext secret leak detected in {file_path}!", file=sys.stderr)
-                sys.exit(1)
-    print("✅ All secret files verified as encrypted Kist envelopes.")
-    EOF
-```
-
-### 2. Automated secret deployment & live reload
-
-When a reviewed PR merges to `main`, CI securely synchronizes the updated secrets to your centralized PostgreSQL database:
+Local hooks give fast feedback; the same check in CI guarantees that no plaintext secret file, likely credential or moved envelope reaches a protected branch, even from a developer without the hook:
 
 ```bash
-# In CI with KIST_DATABASE_URL and KIST_PASSWORD_PRODUCTION configured:
-kist --profile production lock secrets/production.yaml
+kist pre-commit-guard --all-files
 ```
 
-When secrets are locked into PostgreSQL, Kist emits a `NOTIFY kist_secret_updated` event. Applications running `DynamicSecretStore` or `AsyncDynamicSecretStore` receive the signal in real time and automatically refresh cached values without container restarts or downtime.
+It needs no secrets, only the non-secret `KIST_ORG_ID`, `KIST_PROJECT_ID` (and `KIST_REPOSITORY_ID` if you set it), which must match the values developers commit with.
+
+### 2. Lock every profile into PostgreSQL on merge
+
+CI checkouts have no Kist filter, so secret files arrive encrypted. `kist lock` decrypts them in memory; `--all` does it for every tracked secret file whose profile has a password in the job:
+
+```console
+$ kist lock --all
+locked   secrets/production.yaml -> acme/gateway/production (12 secrets)
+locked   secrets/payments.yaml -> acme/gateway/payments (4 secrets)
+skipped  secrets/eu/staging.yaml (no KIST_PASSWORD_STAGING in this job)
+2 locked, 1 skipped, 0 failed.
+```
+
+- **Multi-team:** give each pipeline or environment only the `KIST_PASSWORD_<PROFILE>` variables it may use; the other profiles are skipped. `--only <profile>` restricts a job to one profile, `--require-all` fails when a password is missing, and `--prune` deletes keys removed from the YAML.
+- **Wrong password or scope** fails the job with a message naming the variables to check.
+
+When secrets are locked, Kist emits `NOTIFY kist_secret_updated`; applications using `DynamicSecretStore` or `AsyncDynamicSecretStore` refresh their cache without a restart.
 
 ### 3. Production-ready CI templates
 

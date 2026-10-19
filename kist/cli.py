@@ -157,7 +157,9 @@ def main() -> None:
     fix_parser = subparsers.add_parser("fix", help="Apply explicit, non-credential repair actions")
     fix_parser.add_argument("--apply", action="store_true")
     fix_parser.add_argument("--force-hook", action="store_true")
-    subparsers.add_parser("pre-commit-guard", help="Scan staged changes for plaintext secrets")
+    guard_parser = subparsers.add_parser("pre-commit-guard", help="Scan staged changes for plaintext secrets")
+    guard_parser.add_argument("--all-files", action="store_true",
+                              help="Scan every tracked file instead of staged changes (use in CI)")
 
     profile_parser = subparsers.add_parser("profile", help="Profile password lifecycle operations")
     profile_subparsers = profile_parser.add_subparsers(dest="profile_command")
@@ -207,7 +209,13 @@ def main() -> None:
     delete_parser.add_argument("--yes", "-y", action="store_true", help="Automatically confirm prompts")
 
     lock_parser = subparsers.add_parser("lock", help="Flatten and encrypt a YAML file into PostgreSQL")
-    lock_parser.add_argument("file", nargs="?", default=None, help="YAML secret file (defaults to active profile secrets file)")
+    lock_parser.add_argument("file", nargs="?", default=None, help="YAML secret file, plaintext or Kist-encrypted (defaults to active profile secrets file)")
+    lock_parser.add_argument("--all", action="store_true", dest="lock_all",
+                             help="Lock every tracked Kist file whose profile has a password here (CI); others are skipped")
+    lock_parser.add_argument("--only", action="append", default=None, metavar="PROFILE",
+                             help="With --all: limit to these profiles (repeatable)")
+    lock_parser.add_argument("--require-all", action="store_true",
+                             help="With --all: fail if any profile has no password in this environment")
     lock_parser.add_argument("--profile", default=argparse.SUPPRESS, help="Explicit profile name override")
     lock_parser.add_argument("--prune", "-p", action="store_true", help="Delete database secrets absent from YAML")
     lock_parser.add_argument("--allow-mismatch", action="store_true", help="Allow profile name to mismatch target file name")
@@ -262,7 +270,7 @@ def main() -> None:
         if args.command == "fix":
             sys.exit(run_fix(apply=args.apply, force_hook=args.force_hook))
         if args.command == "pre-commit-guard":
-            sys.exit(run_leak_guard())
+            sys.exit(run_leak_guard(all_files=args.all_files))
         if args.command == "profile" and args.profile_command == "create":
             _require_tty_for_key_display()
             password = create_profile_password(args.name, rotate=args.rotate)
@@ -359,6 +367,28 @@ def main() -> None:
                 print(f"Verified: decrypts to {result.verified_keys} secrets.", file=sys.stderr)
             print(f"Read on device: Kist.from_file(<path>, git_path={result.git_path!r})", file=sys.stderr)
             return
+        if args.command == "lock" and getattr(args, "lock_all", False):
+            from kist.ci import lock_all, print_lock_all
+
+            if getattr(args, "file", None):
+                raise KistError("Use either a file or --all, not both.")
+            scope = _scope_from_args(args)
+
+            def _lock(profile: str, password: str, text: str, prune: bool) -> tuple[int, int]:
+                return Kist(profile_name=profile, password=password, scope=scope).lock_yaml(text, prune=prune)
+
+            if args.prune and not (args.force or args.yes) and sys.stdin.isatty():
+                answer = input("Warning: --prune deletes database secrets absent from each file. Continue? [y/N]: ")
+                if answer.strip().lower() not in ("y", "yes"):
+                    print("kist: prune operation cancelled.", file=sys.stderr)
+                    sys.exit(1)
+            result = lock_all(_lock, prune=args.prune, profiles=set(args.only) if args.only else None)
+            print_lock_all(result, scope.organization, scope.project)
+            if result.failed or (args.require_all and result.skipped):
+                sys.exit(1)
+            if not result.locked and not result.skipped:
+                print("kist: no tracked Kist secret files found.", file=sys.stderr)
+            return
         if args.command in {"lock", "unlock"}:
             explicit_profile = getattr(args, "profile", None)
             active_profile = explicit_profile or os.getenv("KIST_PROFILE", "default")
@@ -405,8 +435,10 @@ def main() -> None:
                             print("\nkist: prune operation cancelled.", file=sys.stderr)
                             sys.exit(130)
 
-                with open(target_file, "r", encoding="utf-8") as handle:
-                    locked_count, pruned_count = kist.lock_yaml(handle.read(), prune=args.prune)
+                from kist.ci import read_yaml_for_lock
+
+                yaml_text = read_yaml_for_lock(target_file, profile_name, password)
+                locked_count, pruned_count = kist.lock_yaml(yaml_text, prune=args.prune)
                 print(f"Locked {locked_count} secrets for {kist.scope.organization}/{kist.scope.project}/{profile_name}." + (f" Pruned {pruned_count}." if pruned_count else ""))
             else:
                 print(kist.unlock_yaml(), end="")
