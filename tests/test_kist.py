@@ -1391,3 +1391,37 @@ def test_cli_version_flag(capsys, monkeypatch):
         main()
     assert exc.value.code == 0
     assert capsys.readouterr().out.strip() == f"kist {version('kist')}"
+
+
+# --- Password lookup: a generic KIST_PASSWORD never overrides another profile's own password ---
+
+def _clear_password_env(monkeypatch):
+    for name in list(os.environ):
+        if name.startswith("KIST_PASSWORD") or name == "KIST_PROFILE":
+            monkeypatch.delenv(name, raising=False)
+
+
+def test_local_file_beats_generic_password(kist_env, monkeypatch):
+    _clear_password_env(monkeypatch)
+    create_profile_password("team_b")
+    own = (kist_env["kist_dir"] / "pwd_team_b").read_text().strip()
+    monkeypatch.setenv("KIST_PASSWORD", "generic-password-for-another-profile")
+    assert get_profile_password("team_b") == own
+    assert get_profile_password("no_file_profile") == "generic-password-for-another-profile"
+
+
+def test_generic_password_belongs_to_kist_profile(kist_env, monkeypatch):
+    _clear_password_env(monkeypatch)
+    create_profile_password("usa")
+    monkeypatch.setenv("KIST_PROFILE", "usa")
+    monkeypatch.setenv("KIST_PASSWORD", "usa-password-from-env")
+    assert get_profile_password("usa") == "usa-password-from-env"      # explicit env beats the file
+    assert get_profile_password("team_b") is None                           # never borrowed by other profiles
+
+
+def test_profile_specific_variable_accepts_exact_case(kist_env, monkeypatch):
+    _clear_password_env(monkeypatch)
+    monkeypatch.setenv("KIST_PASSWORD_team_a", "exact-case-password")
+    assert get_profile_password("team_a") == "exact-case-password"
+    monkeypatch.setenv("KIST_PASSWORD_TEAM_A", "upper-case-password")
+    assert get_profile_password("team_a") == "upper-case-password"

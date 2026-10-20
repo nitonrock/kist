@@ -155,3 +155,50 @@ def test_database_lock_all_fails_on_scope_mismatch(ci_checkout, db_env):
     proc = kist("lock", "--all", cwd=ci_checkout, env=env)
     assert proc.returncode == 1
     assert "KIST_PROJECT_ID" in proc.stderr
+
+
+def test_database_lock_all_ignores_generic_password(ci_checkout, db_env):
+    proc = kist("lock", "--all", cwd=ci_checkout, env=dict(db_env, KIST_PASSWORD=PASSWORDS["device"]))
+    assert proc.returncode == 0, proc.stderr
+    assert "0 locked, 3 skipped, 0 failed." in proc.stdout
+    assert "generic KIST_PASSWORD is not used by --all" in proc.stdout
+
+
+def test_database_lock_all_failure_names_password_source(ci_checkout, db_env):
+    env = dict(db_env, KIST_PASSWORD_PAYMENTS="wrong-password-0123456789abcdefgh")
+    proc = kist("lock", "--all", cwd=ci_checkout, env=env)
+    assert proc.returncode == 1
+    assert "[password from KIST_PASSWORD_PAYMENTS]" in proc.stderr
+
+
+def test_git_filter_uses_each_profiles_own_password_despite_generic(tmp_path, base_env, monkeypatch):
+    """Regression: an exported KIST_PASSWORD used to encrypt every profile with one password."""
+    from kist.ci import read_yaml_for_lock
+
+    kist_dir = tmp_path / ".kist"
+    kist_dir.mkdir(mode=0o700)
+    for profile, password in PASSWORDS.items():
+        (kist_dir / f"pwd_{profile}").write_text(password)
+        (kist_dir / f"pwd_{profile}").chmod(0o600)
+    dev = tmp_path / "dev"
+    dev.mkdir()
+    env = dict(base_env, KIST_PASSWORD=PASSWORDS["device"])
+    run("git", "init", "-q", cwd=dev)
+    run("git", "config", "user.email", "test@example.invalid", cwd=dev)
+    run("git", "config", "user.name", "test", cwd=dev)
+    (dev / ".gitattributes").write_text("**/secrets/**/*.yaml filter=kist\n")
+    run("git", "config", "filter.kist.clean", f"{KIST} --clean %f", cwd=dev)
+    run("git", "config", "filter.kist.required", "true", cwd=dev)
+    for path, text in FILES.items():
+        (dev / path).parent.mkdir(parents=True, exist_ok=True)
+        (dev / path).write_text(text)
+    run("git", "add", "-A", cwd=dev, env=env)
+    for key, value in base_env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.chdir(dev)
+    for path, text in FILES.items():
+        blob = subprocess.run(["git", "cat-file", "blob", f":{path}"], capture_output=True, check=True).stdout
+        (tmp_path / "blob").write_bytes(blob)
+        monkeypatch.setattr("kist.ci.repo_relative", lambda _p, path=path: path)
+        profile = path.rsplit("/", 1)[1].removesuffix(".yaml")
+        assert read_yaml_for_lock(str(tmp_path / "blob"), profile, PASSWORDS[profile]) == text

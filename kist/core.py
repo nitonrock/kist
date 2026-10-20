@@ -271,18 +271,54 @@ def write_secure_local_password(path: Path, password: str, *, overwrite: bool = 
             pass
         os.close(directory)
 
-def get_profile_password(profile_name: str, auto_generate: bool = False, *,
-                         allow_env: bool = True, allow_local_file: bool = True) -> Optional[str]:
-    profile = _validate_profile_name(profile_name)
-    if allow_env:
-        value = os.getenv(f"KIST_PASSWORD_{profile.upper()}") or os.getenv("KIST_PASSWORD")
-        if value:
-            return value
+def _profile_env_names(profile: str) -> list[str]:
+    """Profile-specific variable names: KIST_PASSWORD_<PROFILE>, then the exact-case spelling."""
+    names = [f"KIST_PASSWORD_{profile.upper()}"]
+    if profile != profile.upper():
+        names.append(f"KIST_PASSWORD_{profile}")
+    return names
+
+
+def _generic_password_applies(profile: str) -> bool:
+    """KIST_PASSWORD belongs to KIST_PROFILE when that is set; otherwise it is a last-resort fallback."""
+    active = os.getenv("KIST_PROFILE", "").strip()
+    return not active or active == profile
+
+
+def _password_sources(profile: str, allow_env: bool, allow_local_file: bool, allow_generic: bool) -> list[str]:
+    """Lookup order for a profile password.
+
+    1. KIST_PASSWORD_<PROFILE> (or the exact-case KIST_PASSWORD_<profile>)
+    2. KIST_PASSWORD, when KIST_PROFILE names this profile
+    3. ~/.kist/pwd_<profile>
+    4. KIST_PASSWORD, when KIST_PROFILE is not set
+
+    A generic password therefore never overrides another profile's own password.
+    """
+    sources: list[str] = list(_profile_env_names(profile)) if allow_env else []
+    generic = allow_env and allow_generic and _generic_password_applies(profile)
+    explicit_active = bool(os.getenv("KIST_PROFILE", "").strip())
+    if generic and explicit_active:
+        sources.append("KIST_PASSWORD")
     if allow_local_file:
-        try:
-            value = read_secure_local_password(profile_password_path(profile))
-        except FileNotFoundError:
-            value = None
+        sources.append("file")
+    if generic and not explicit_active:
+        sources.append("KIST_PASSWORD")
+    return sources
+
+
+def get_profile_password(profile_name: str, auto_generate: bool = False, *,
+                         allow_env: bool = True, allow_local_file: bool = True,
+                         allow_generic: bool = True) -> Optional[str]:
+    profile = _validate_profile_name(profile_name)
+    for source in _password_sources(profile, allow_env, allow_local_file, allow_generic):
+        if source == "file":
+            try:
+                value = read_secure_local_password(profile_password_path(profile))
+            except FileNotFoundError:
+                value = None
+        else:
+            value = os.getenv(source)
         if value:
             return value
     if auto_generate:
@@ -432,13 +468,16 @@ def get_profile_and_password(filepath: str, auto_generate: bool = False) -> tupl
     profile = profile_from_path(filepath)
     return profile, get_profile_password(profile, auto_generate)
 
-def profile_password_source(profile_name: str) -> Optional[str]:
+def profile_password_source(profile_name: str, *, allow_generic: bool = True) -> Optional[str]:
     """Where get_profile_password() would read from: env var name, 'file', or None."""
     profile = _validate_profile_name(profile_name)
-    for name in (f"KIST_PASSWORD_{profile.upper()}", "KIST_PASSWORD"):
-        if os.getenv(name):
-            return name
-    return "file" if profile_password_path(profile).exists() else None
+    for source in _password_sources(profile, True, True, allow_generic):
+        if source == "file":
+            if profile_password_path(profile).exists():
+                return "file"
+        elif os.getenv(source):
+            return source
+    return None
 
 def mask_db_url(db_url: Optional[str]) -> str:
     """Conservative diagnostic: discard userinfo, query, and fragment entirely."""
