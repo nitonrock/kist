@@ -1,63 +1,82 @@
 # Agent Guidelines for Kist
 
-These guidelines provide high-signal architectural invariants, development workflows, and coding conventions for AI agents and contributors working in this repository.
+High-signal invariants, workflows and conventions for AI agents and contributors. Kist is security-critical: when in doubt, fail closed and add a test.
 
 ---
 
-## 1. Development Toolchain & Commands
+## 1. Toolchain & commands
 
-- **Environment & Package Manager:** Always use `uv`. Never invoke bare `pip` or system `python`.
-  - Install dependencies: `uv sync`
-  - Install CLI tool globally: `uv tool install kist`
-  - Run full test suite: `uv run pytest`
-  - Run targeted test: `uv run pytest tests/test_kist.py -k <test_name>`
-  - Run package build: `uv build`
-  - Check distribution package: `uv run twine check dist/*` (or `twine check dist/*`)
-
----
-
-## 2. Core Architecture & Cryptographic Invariants
-
-Kist is a security-critical secrets management library providing Git clean/smudge filters, CLI synchronization, and PostgreSQL zero-knowledge storage.
-
-### A. Two-Tier KEK / DEK Envelope Model
-- **Database Storage (`kist-db-v1`):**
-  - Master passwords (via Argon2id) derive a **Key Encryption Key (KEK)** used *only* to wrap/unwrap a 256-bit Key Bundle (`content_key` DEK + `index_key` blind index key) in `kist_key_bundles`.
-  - Individual secret values in `kist_secrets` are encrypted using the random Data Encryption Key (`content_key`) via **AES-256-GCM**.
-  - **Invariant:** Never execute Argon2id derivations on individual secret read/write calls (`store.get()` / `store.set()`). Key bundles are unwrapped once upon store initialization.
-- **Git File Storage (`kist-git-v1`):**
-  - Direct file-level envelope encryption using Argon2id password-derived KEK over YAML payload.
-
-### B. Zero-Knowledge Database Schema & Blind Indexing
-- **No Plaintext Key Names:** Plaintext secret names (e.g. `stripe.api_key`, `db.password`) must **never** be stored in database columns or query logs.
-- **Lookup Tokens (`kist-name-index-v1`):** Lookups query deterministic 32-byte digests computed via `HMAC-SHA256(bundle.index_key, _canonical_aad(context))`.
-- **Integrity Cross-Verification:** Upon retrieval and payload decryption, verify token consistency using `hmac.compare_digest` to prevent token substitution attacks.
-
-### C. Authenticated Additional Data (AAD) Context Binding
-- Always bind canonical context dictionaries using `_canonical_aad(dict)` to AES-256-GCM ciphertext to prevent cross-scope, cross-organization, cross-project, or cross-profile payload swapping.
-
-### D. Safe Separation of Concerns
-- **`kist init`:** Purely local Git lifecycle operation (`.gitattributes`, `.gitignore`, filter configuration). Must remain completely decoupled from network or database connectivity.
-- **`kist init-db`:** Dedicated DDL schema initialization command requiring database credentials and connectivity.
+- **Always use `uv`.** Never invoke bare `pip` or system `python` for development.
+  - Install dependencies: `uv sync --group dev`
+  - Unit tests (no database): `uv run pytest -q --ignore=tests/test_ci_projects_e2e.py -k "not database and not cli_delete_secret and not cli_profile_delete"`
+  - PostgreSQL tests: start one with `docker compose up -d`, then
+    `KIST_TEST_DATABASE_URL=postgresql://kist:kist@127.0.0.1:5432/kist KIST_ENV=development KIST_TLS_MODE=disable KIST_DATABASE_URL=$KIST_TEST_DATABASE_URL uv run pytest -q --ignore=tests/test_ci_projects_e2e.py -k "database or cli_delete_secret or cli_profile_delete"`
+  - CI (`.github/workflows/tests.yml`) runs exactly these two steps. `tests/test_ci_projects_e2e.py` needs local sibling projects and is never run in CI.
+  - Build: `uv build`; check the distribution: `uvx twine check dist/*`
 
 ---
 
-## 3. Scope & Defaults Conventions
+## 2. Cryptographic invariants
 
-- **`KIST_ENV` vs `KIST_PROFILE`:**
-  - `KIST_ENV` governs operational security policy (e.g. TLS/SSL verification enforcement in `production` vs local `development`).
-  - `KIST_PROFILE` defines the logical secret scope, database partition (`kist_profiles`), and key resolution (`KIST_PASSWORD_<PROFILE>`).
-- **Default Resolution:**
-  - Calling `Kist()` with zero arguments resolves `profile_name` from `os.getenv("KIST_PROFILE", "default")`.
-  - Running `kist lock` / `kist unlock` without a positional file argument automatically targets `secrets/<profile>.yaml`, `secrets_<profile>.yaml`, or `secrets.yaml`.
+### A. Two envelope formats, one password per profile
+- **Database (`kist-db-v1`):** the profile password (Argon2id) derives a KEK that only wraps a key bundle (`content_key` + `index_key`) in `kist_key_bundles`. Secret values in `kist_secrets` are AES-256-GCM under `content_key`.
+  - Never run Argon2id per secret read/write; bundles are unwrapped once per store.
+- **Git files (`kist-git-v1`):** the whole file is one envelope, Argon2id KEK over the YAML bytes. Comments and formatting are preserved; YAML is never parsed by the filter.
+- **Offline files:** `kist export` writes the same Git envelope; `Kist.from_file()` / `FileKist` read it without a database.
+
+### B. Zero-knowledge storage
+- Plaintext secret names never reach database columns or logs. Lookups use `HMAC-SHA256(index_key, _canonical_aad(context))`, verified with `hmac.compare_digest` after decryption.
+- Git envelopes hide key names too (deliberately unlike sops): names alone leak vendors, environments and customers.
+
+### C. Context binding (AAD)
+- Every ciphertext is bound with `_canonical_aad(dict)`. Git context = format, `KIST_ORG_ID`, `KIST_PROJECT_ID`, profile, `KIST_REPOSITORY_ID`, repository-relative path. Moving a file or changing scope requires re-encryption (`git add --renormalize`).
+- The v1 header stores SHA-256 of the AAD; use it to match paths (diff driver, guard) without decrypting.
+
+### D. Git filter behaviour
+- **clean** never stages plaintext: no password means refuse. An already-encrypted file is passed through only if it is bound to this path. If the plaintext is unchanged, reuse the staged/committed envelope (stable ciphertext); `KIST_FRESH_ENCRYPTION=1` and rotation force fresh encryption.
+- **smudge** leaves the file encrypted ("locked", like git-crypt) when no password opens it; content that is not a Kist envelope is always refused.
+- **textconv** (`diff=kist`, `kist --textconv`) prints plaintext only where a password opens the blob, otherwise a placeholder with a fingerprint. Never set `diff.kist.cachetextconv` (it would cache plaintext in Git notes).
+- The pre-commit guard (`kist pre-commit-guard`, `--all-files` in CI) checks added, copied, modified and renamed files and blocks envelopes bound to another path or scope.
+
+### E. Password lookup (`get_profile_password`)
+1. `KIST_PASSWORD_<PROFILE>` (or exact-case `KIST_PASSWORD_<profile>`)
+2. `KIST_PASSWORD` when `KIST_PROFILE` names this profile
+3. `~/.kist/pwd_<profile>` (0600, directory 0700)
+4. `KIST_PASSWORD` when `KIST_PROFILE` is unset
+
+A generic password must never override another profile's own password. `kist lock --all` ignores the generic password unless `KIST_PROFILE` is set. Retired passwords (`pwd_<p>.old-<ts>`, `KIST_RETIRED_PASSWORDS_<P>`) are for decryption only.
+
+### F. Separation of concerns
+- `kist init` is purely local (attributes, filters, diff driver, hook) and upgrades old attribute rules in place. No network, no database.
+- `kist init-db` is the only DDL command.
 
 ---
 
-## 4. Coding & Contribution Rules
+## 3. Terminology & scope
 
-- **Minimal Public API:** Keep the core entry points clean: `Kist`, `KistScope`, `TTLSecretStore`, `DynamicSecretStore`.
-- **Test Integrity:**
-  - Never bypass, weaken, mock out, or mark tests as `@pytest.mark.skip` unless strictly requiring external live services (e.g. live external PostgreSQL).
-  - All new features and bug fixes must be covered by deterministic unit tests in `tests/test_kist.py` or store tests in `tests/test_stores.py`.
-- **Formatting & Style:**
-  - Follow existing PEP 8 conventions, standard library typing hints, and descriptive exception handling (`KistError`, `KistDecryptionError`, `KistNotFoundError`).
+- Say **password** (profile password), not "key" or "master password". "Key" is reserved for secret names and internal data keys.
+- `KIST_ENV` governs security policy (TLS enforcement); `KIST_PROFILE` selects the logical profile.
+- Profile from a path: `secrets/<p>.yaml`, `secrets_<p>.yaml`, any depth below a `secrets/` folder; `secrets.yaml` is `default`.
+- `Kist()` without arguments uses `KIST_PROFILE` or `default`.
+
+---
+
+## 4. Code & tests
+
+- **Public API stays small:** `Kist`, `KistScope`, `FileKist`, `TTLSecretStore`, `DynamicSecretStore`, `AsyncDynamicSecretStore`, plus the documented helpers in `kist/__init__.py`.
+- **Exceptions:** subclass `KistError` (`MissingKeyError`, `InvalidEnvelopeError`, `DecryptionError`, `InsecureKeyStoreError`, `ConcurrentWriteError`, `SchemaVersionError`). Messages must say what to check, never include secret values.
+- **Tests:**
+  - Every feature and fix needs a deterministic test, in the module matching the area (`test_git_diff.py`, `test_ci_lock.py`, `test_rotate.py`, `test_export.py`, `test_file_store.py`, `test_stores.py`, `test_kist.py`). Bug fixes get a regression test that fails before the fix.
+  - Tests needing PostgreSQL must have `database` in their name and skip without `KIST_TEST_DATABASE_URL`.
+  - Git behaviour is tested end-to-end with real `git` and `python -m kist` as the filter.
+  - Never weaken, mock out or skip security tests.
+- Use only obviously fake example secrets (`example-…`, `*.invalid`) in tests and docs.
+
+---
+
+## 5. Releases & repository hygiene
+
+- Bump `version` in `pyproject.toml` together with the README PyPI badge and the `kist==` pins in `resources/` (`tests/test_release_consistency.py` enforces it); run `uv lock`.
+- Tag with `git push origin vX.Y.Z` (one tag), never `--tags`.
+- Commits are authored by the maintainer: no `Co-authored-by:` trailers for AI agents or tools.
+- Never commit real secrets, plaintext secret files or `~/.kist` contents.
