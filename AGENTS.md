@@ -10,7 +10,11 @@ High-signal invariants, workflows and conventions for AI agents and contributors
   - Install dependencies: `uv sync --group dev`
   - Unit tests (no database): `uv run pytest -q --ignore=tests/test_ci_projects_e2e.py -k "not database and not cli_delete_secret and not cli_profile_delete"`
   - PostgreSQL tests: start one with `docker compose up -d`, then
-    `KIST_TEST_DATABASE_URL=postgresql://kist:kist@127.0.0.1:5432/kist KIST_ENV=development KIST_TLS_MODE=disable KIST_DATABASE_URL=$KIST_TEST_DATABASE_URL uv run pytest -q --ignore=tests/test_ci_projects_e2e.py -k "database or cli_delete_secret or cli_profile_delete"`
+    ```bash
+    export KIST_TEST_DATABASE_URL=postgresql://kist:kist@127.0.0.1:5432/kist
+    KIST_ENV=development KIST_TLS_MODE=disable KIST_DATABASE_URL=$KIST_TEST_DATABASE_URL \
+      uv run pytest -q --ignore=tests/test_ci_projects_e2e.py -k "database or cli_delete_secret or cli_profile_delete"
+    ```
   - CI (`.github/workflows/tests.yml`) runs exactly these two steps. `tests/test_ci_projects_e2e.py` needs local sibling projects and is never run in CI.
   - Build: `uv build`; check the distribution: `uvx twine check dist/*`
 
