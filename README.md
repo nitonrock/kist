@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/badge/pypi-v0.2.3-blue?logo=pypi&amp;logoColor=white" alt="PyPI" /></a>
+  <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/badge/pypi-v0.2.4-blue?logo=pypi&amp;logoColor=white" alt="PyPI" /></a>
   <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/pypi/pyversions/kist?logo=python&amp;logoColor=white" alt="Python versions" /></a>
   <a href="https://github.com/nitonrock/kist/actions/workflows/tests.yml"><img src="https://github.com/nitonrock/kist/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
   <a href="https://github.com/nitonrock/kist/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License" /></a>
@@ -686,9 +686,12 @@ For detailed setup instructions and variable configuration, see the [CI/CD Resou
 
 For any profile named `<name>`, Kist resolves the required password in the following order of precedence:
 
-1. **Profile-Specific Environment Variable**: `KIST_PASSWORD_<NAME_UPPERCASE>` (e.g., `KIST_PASSWORD_PRODUCTION`, `KIST_PASSWORD_STAGING`, `KIST_PASSWORD_DEFAULT`)
-2. **Global Fallback Environment Variable**: `KIST_PASSWORD` (used across profiles if no specific variable is defined)
-3. **Local password file**: `~/.kist/pwd_<name>` (e.g., `~/.kist/pwd_production`, `~/.kist/pwd_staging`, `~/.kist/pwd_default`)
+1. **Profile-specific variable**: `KIST_PASSWORD_<NAME_UPPERCASE>` (e.g. `KIST_PASSWORD_PRODUCTION`); the exact-case spelling `KIST_PASSWORD_<name>` is accepted too.
+2. **`KIST_PASSWORD`, when `KIST_PROFILE` names this profile.**
+3. **Local password file**: `~/.kist/pwd_<name>` (e.g. `~/.kist/pwd_production`).
+4. **`KIST_PASSWORD`, when `KIST_PROFILE` is not set**, as a last resort.
+
+`KIST_PASSWORD` is the password of the active profile only: it never overrides another profile's own variable or password file. That matters in multi-profile repositories, where an exported `KIST_PASSWORD` would otherwise make the Git filter encrypt every profile with the same password. `kist lock --all` ignores it unless `KIST_PROFILE` is set, and uses it for that profile only.
 
 ### Managing multiple profiles with the CLI
 

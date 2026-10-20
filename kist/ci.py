@@ -17,6 +17,7 @@ from kist.core import (
     decrypt_with_password_history,
     get_profile_password,
     git_context,
+    profile_password_source,
     is_kist_envelope,
     profile_from_path,
 )
@@ -110,16 +111,21 @@ def lock_all(lock: Callable[[str, str, str, bool], tuple[int, int]], prune: bool
             continue
         path = paths[0]
         relative = repo_relative(path)
-        password = get_profile_password(profile)
+        # The generic KIST_PASSWORD is ambiguous across many profiles: --all only
+        # uses it for the profile named by KIST_PROFILE.
+        strict_generic = bool(os.getenv("KIST_PROFILE", "").strip())
+        password = get_profile_password(profile, allow_generic=strict_generic)
         if not password:
             result.skipped.append((relative, profile))
             continue
+        source = profile_password_source(profile, allow_generic=strict_generic)
         try:
             text = read_yaml_for_lock(path, profile, password)
             locked, pruned = lock(profile, password, text, prune)
             result.locked.append((relative, profile, locked, pruned))
         except (KistError, UnicodeDecodeError) as exc:
-            result.failed.append((relative, profile, str(exc)))
+            where = "~/.kist/pwd_" + profile if source == "file" else source
+            result.failed.append((relative, profile, f"{exc} [password from {where}]"))
     return result
 
 
@@ -129,6 +135,8 @@ def print_lock_all(result: LockAllResult, organization: str, project: str) -> No
         print(f"locked   {path} -> {organization}/{project}/{profile} ({locked} secrets{extra})")
     for path, profile in result.skipped:
         print(f"skipped  {path} (no KIST_PASSWORD_{profile.upper()} in this job)")
+    if result.skipped and os.getenv("KIST_PASSWORD") and not os.getenv("KIST_PROFILE"):
+        print("note: the generic KIST_PASSWORD is not used by --all; set KIST_PASSWORD_<PROFILE> per profile.")
     for path, profile, error in result.failed:
         print(f"FAILED   {path} [{profile}]: {error}", file=sys.stderr)
     print(f"{len(result.locked)} locked, {len(result.skipped)} skipped, {len(result.failed)} failed.")
