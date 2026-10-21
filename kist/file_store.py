@@ -65,8 +65,9 @@ class FileKist:
             filter derives from ``git_path`` (``secrets/device.yaml`` -> ``device``).
         password: Profile password. Defaults to the normal Kist lookup
             (``KIST_PASSWORD_<PROFILE>``, ``KIST_PASSWORD``, ``~/.kist`` password file).
-        scope: Organization/project scope. Defaults to ``KIST_ORGANIZATION`` /
-            ``KIST_PROJECT`` like the Git filter.
+        scope: Organization/project scope. Defaults to ``KIST_ORG_ID`` /
+            ``KIST_PROJECT_ID`` (environment, then ~/.kist/env_<profile>, then ~/.kist/env),
+            like the Git filter.
         repository_id: Overrides ``KIST_REPOSITORY_ID`` used at commit time.
         lazy: When true (default), decrypt on first access instead of in ``__init__``.
     """
@@ -86,7 +87,7 @@ class FileKist:
         self.git_path = git_path if git_path is not None else os.fspath(path)
         self.profile_name = (_validate_profile_name(profile_name) if profile_name is not None
                              else _profile_from_git_path(self.git_path))
-        self.scope = (scope or KistScope.from_environment()).validated()
+        self.scope = (scope or KistScope.from_environment(self.profile_name)).validated()
         self.repository_id = repository_id
         self._password = password
         self._values: Optional[dict[str, Any]] = None
