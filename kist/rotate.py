@@ -206,6 +206,7 @@ def _renormalize(root: str, files: list[str], profile: str, new_password: str) -
     env = dict(os.environ)
     env[f"KIST_PASSWORD_{profile.upper()}"] = new_password
     env["KIST_FRESH_ENCRYPTION"] = "1"  # never reuse an envelope during rotation
+    env["KIST_ALLOW_PASSWORD_CHANGE"] = "1"  # the password change is the point
     done = _git(["add", "--renormalize", "--", *files], cwd=root, env=env)
     if done.returncode != 0:
         raise KistError("git add --renormalize failed: " + done.stderr.decode(errors="replace").strip())
