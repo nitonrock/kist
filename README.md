@@ -85,7 +85,7 @@ The full setup, including production TLS, is in [Quick start](#quick-start).
 | | **Kist** | **sops** | **git-crypt** | **python-dotenv** | **HashiCorp Vault** | **Infisical / Doppler** |
 |--|--|--|--|--|--|--|
 | Changes go through Git review & history | ✅ encrypted in commits + CI leak guard | ✅ | ✅ | ❌ plaintext `.env`, usually gitignored | ❌ | ⚠️ via integrations |
-| Readable diffs | ⚠️ plaintext locally with the password (`git diff`, `git log -p`), binary on GitHub | ✅ key names visible, values encrypted | ⚠️ plaintext locally when unlocked, binary on GitHub | n/a | n/a | n/a |
+| Readable diffs | ✅ full plaintext locally with the password (`git diff`, `git log -p`, merges); ⚠️ binary on GitHub/GitLab, by design: even key names reveal too much ([why](#readable-diffs)) | ✅ key names visible, values encrypted | ⚠️ plaintext locally when unlocked, binary on GitHub | n/a | n/a | n/a |
 | Secret names hidden in the repository | ✅ whole file encrypted, by design | ❌ key names stay in cleartext | ✅ | ❌ | n/a | n/a |
 | Transparent Git workflow | ✅ clean/smudge filters | ⚠️ explicit `sops edit` | ✅ clean/smudge filters | ❌ | ❌ | ❌ |
 | Runtime retrieval API (Python) | ✅ `Kist().get()` | ⚠️ decrypt file at startup | ❌ file only | ✅ plaintext env | ✅ client libs | ✅ SDKs |
