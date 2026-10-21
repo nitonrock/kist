@@ -600,6 +600,19 @@ def is_kist_envelope(data: bytes) -> bool:
     """Framing check only; not proof of validity or authentication."""
     return isinstance(data, bytes) and len(data) >= HEADER_SIZE + WRAPPED_KEY_LENGTH + NONCE_LENGTH + AES_GCM_TAG_LENGTH and data.startswith(MAGIC)
 
+def envelope_header_problem(data: bytes) -> Optional[str]:
+    """Why ``data`` is not a well-formed v1 envelope, or None. Checks the header only; no password needed."""
+    if not is_kist_envelope(data):
+        return "not a Kist envelope"
+    _, version, algorithm, kdf, flags, memory, iterations, lanes = _PREFIX.unpack(data[:_PREFIX.size])
+    if version != ENVELOPE_VERSION or (algorithm, kdf, flags) != (ALGORITHM_AES_256_GCM, KDF_ARGON2ID, ENVELOPE_FLAGS):
+        return "unsupported envelope version or algorithms"
+    try:
+        Argon2Policy(memory, iterations, lanes).validated()
+    except KistError:
+        return "invalid key-derivation parameters"
+    return None
+
 def encrypt_envelope(plaintext: bytes, password: str, context: dict[str, Any],
                      policy: Argon2Policy = Argon2Policy()) -> bytes:
     """Whole-object v1: password wraps random key, random key encrypts content."""

@@ -11,9 +11,11 @@ import hashlib
 import hmac
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import BinaryIO, Optional, TextIO
 
@@ -25,10 +27,12 @@ from kist.core import (
     decrypt_envelope,
     decrypt_with_password_history,
     encrypt_envelope,
+    envelope_header_problem,
     get_profile_password,
     git_context,
     is_kist_envelope,
     profile_from_path,
+    profile_password_source,
     retired_profile_passwords,
 )
 from kist.core import _canonical_aad
@@ -67,7 +71,7 @@ SUSPICIOUS_EXTENSIONS = {
 # `secrets*.yaml` matches at any depth; `**/secrets/**/*.yaml` covers every file below
 # any `secrets/` folder, matching what the leak guard protects.
 KIST_ATTRIBUTE_PATTERNS = ("secrets*.yaml", "secrets*.yml", "**/secrets/**/*.yaml", "**/secrets/**/*.yml")
-KIST_ATTRIBUTE_RULES = tuple(f"{pattern} filter=kist diff=kist" for pattern in KIST_ATTRIBUTE_PATTERNS)
+KIST_ATTRIBUTE_RULES = tuple(f"{pattern} filter=kist diff=kist merge=kist" for pattern in KIST_ATTRIBUTE_PATTERNS)
 LEGACY_ATTRIBUTE_RULES = {
     "secrets*.yaml filter=kist": KIST_ATTRIBUTE_RULES[0],
     "secrets*.yml filter=kist": KIST_ATTRIBUTE_RULES[1],
@@ -75,7 +79,9 @@ LEGACY_ATTRIBUTE_RULES = {
     "secrets/*.yml filter=kist": KIST_ATTRIBUTE_RULES[3],
     "secrets/*.yaml filter=kist diff=kist": KIST_ATTRIBUTE_RULES[2],
     "secrets/*.yml filter=kist diff=kist": KIST_ATTRIBUTE_RULES[3],
+    **{f"{pattern} filter=kist diff=kist": rule for pattern, rule in zip(KIST_ATTRIBUTE_PATTERNS, KIST_ATTRIBUTE_RULES)},
 }
+TRUE_VALUES = {"1", "true", "yes", "on"}
 KIST_HOOK_MARKER = "# kist-managed-hook-v1"
 
 KIST_HOOK_SCRIPT = (
@@ -153,30 +159,73 @@ def git_clean_stream(
             f"No password configured for profile {profile_name!r}; refusing to stage plaintext."
         )
     context = git_context(profile_name, target_path)
-    previous = _unchanged_envelope(raw, password, context, target_path)
+    previous = _previous_envelope(raw, password, context, target_path, profile_name)
     out_stream.write(previous if previous is not None else encrypt_envelope(raw, password, context))
 
 
-def _unchanged_envelope(plaintext: bytes, password: str, context: dict[str, str], path: str) -> Optional[bytes]:
-    """Return the staged/committed envelope when it already holds exactly this plaintext.
+def _flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in TRUE_VALUES
 
-    Encryption is randomised, so without this every `git status`/`git add` of an
+
+def describe_password_source(profile: str) -> str:
+    source = profile_password_source(profile)
+    if source == "file":
+        return f"~/.kist/pwd_{profile}"
+    return source or "no password found"
+
+
+def _previous_envelope(plaintext: bytes, password: str, context: dict[str, str], path: str,
+                       profile: str) -> Optional[bytes]:
+    """Reuse the staged/committed envelope when it holds exactly this plaintext, and
+    refuse to re-encrypt a file with a password that does not open its previous version.
+
+    Encryption is randomised, so without reuse every `git status`/`git add` of an
     untouched file would produce new ciphertext: false "modified" files and noisy
     commits. Only the current password is tried, so rotation always re-encrypts.
+
+    The password check catches a wrong password picked up silently (for example a
+    generic KIST_PASSWORD meant for another profile). It costs nothing extra in the
+    normal case: the previous versions are decrypted for the reuse check anyway.
+    Rotation sets KIST_ALLOW_PASSWORD_CHANGE=1; content readable with a retired
+    password of this profile is accepted (it is being moved to the current password).
     """
-    if os.getenv("KIST_FRESH_ENCRYPTION", "").lower() in {"1", "true", "yes", "on"}:
-        return None
+    fresh = _flag("KIST_FRESH_ENCRYPTION")
+    allow_change = _flag("KIST_ALLOW_PASSWORD_CHANGE")
+    previous: list[bytes] = []
     for rev in (f":{path}", f"HEAD:{path}"):
         result = subprocess.run(["git", "cat-file", "blob", rev], capture_output=True, check=False)
         blob = result.stdout
-        if result.returncode != 0 or not is_kist_envelope(blob):
+        if result.returncode != 0 or not is_kist_envelope(blob) or blob in previous:
             continue
+        if not _envelope_matches(blob, profile, path):
+            continue
+        previous.append(blob)
+    if not previous or (fresh and allow_change):
+        return None
+    opened = False
+    for blob in previous:
         try:
-            if hmac.compare_digest(decrypt_envelope(blob, password, context), plaintext):
-                return blob
-        except KistError:
+            content = decrypt_envelope(blob, password, context)
+        except DecryptionError:
             continue
-    return None
+        opened = True
+        if not fresh and hmac.compare_digest(content, plaintext):
+            return blob
+    if opened or allow_change:
+        return None
+    for _, retired in retired_profile_passwords(profile):
+        for blob in previous:
+            try:
+                decrypt_envelope(blob, retired, context)
+                return None
+            except DecryptionError:
+                continue
+    raise KistError(
+        f"{path}: the password for profile '{profile}' (from {describe_password_source(profile)}) does not open "
+        f"the version already in Git, so it would silently re-encrypt the file with a different password. "
+        f"Check which password is active with `kist status` (KIST_PROFILE / KIST_PASSWORD). To change the "
+        f"password on purpose, use `kist profile rotate {profile}`, or set KIST_ALLOW_PASSWORD_CHANGE=1 for one command."
+    )
 
 
 def git_smudge_stream(
@@ -296,6 +345,93 @@ def git_textconv(blob_path: str, out_stream: Optional[TextIO] = None) -> None:
         out_stream.write(f"[kist: encrypted content {fingerprint}; no password for profile {profile!r} opens it]\n")
 
 
+def _private_tempdir() -> tempfile.TemporaryDirectory[str]:
+    """Owner-only temporary directory, in memory-backed $XDG_RUNTIME_DIR when available."""
+    runtime = os.getenv("XDG_RUNTIME_DIR")
+    base = runtime if runtime and os.path.isdir(runtime) and os.access(runtime, os.W_OK) else None
+    return tempfile.TemporaryDirectory(prefix="kist-merge-", dir=base)
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+
+
+def _merge_input(data: bytes, profile: str, path: str, password: Optional[str]) -> bytes:
+    """Plaintext of one merge input (a Git blob, normally an envelope)."""
+    if not data or not is_kist_envelope(data):
+        return data
+    if _envelope_matches(data, profile, path):
+        context_profile, context_path = profile, path
+    else:
+        resolved = resolve_envelope_path(data)
+        if resolved is None:
+            raise DecryptionError("encrypted for a path or scope not found in this repository")
+        context_path, context_profile = resolved
+    plaintext, _ = decrypt_with_password_history(
+        data, context_profile, git_context(context_profile, context_path), password)
+    return plaintext
+
+
+def git_merge(base: str, ours: str, theirs: str, path: str, marker_size: str = "7") -> int:
+    """Git merge driver (`merge=kist`): three-way merge of the decrypted versions.
+
+    Git passes the stored blobs (envelopes). They are decrypted into an owner-only
+    temporary directory, merged with `git merge-file`, and the result is encrypted
+    again into the `ours` file, as Git expects. Conflicts end up as normal conflict
+    markers inside the encrypted result, so the checked-out file shows them in
+    plaintext. Returns 0 for a clean merge, 1 for conflicts or errors (Git then
+    reports a conflict and keeps our version).
+    """
+    profile = profile_from_path(path)
+    password = get_profile_password(profile)
+    if not password:
+        print(f"kist: merge {path}: no password for profile '{profile}'; resolve this file by hand.", file=sys.stderr)
+        return 1
+    blobs = [Path(name).read_bytes() for name in (base, ours, theirs)]
+    texts = []
+    for label, data in zip(("base", "ours", "theirs"), blobs):
+        try:
+            texts.append(_merge_input(data, profile, path, password))
+        except KistError as exc:
+            print(f"kist: merge {path}: cannot decrypt the {label} version ({exc}).", file=sys.stderr)
+            return 1
+    base_text, ours_text, theirs_text = texts
+
+    def stored(blob: bytes, text: bytes) -> bytes:
+        # Keep an existing envelope for this path (no ciphertext churn); encrypt anything else.
+        if is_kist_envelope(blob) and _envelope_matches(blob, profile, path):
+            return blob
+        return encrypt_envelope(text, password, git_context(profile, path))
+
+    if ours_text == theirs_text or theirs_text == base_text:
+        Path(ours).write_bytes(stored(blobs[1], ours_text))
+        return 0
+    if ours_text == base_text:
+        Path(ours).write_bytes(stored(blobs[2], theirs_text))
+        return 0
+    with _private_tempdir() as tmp:
+        names = []
+        for label, text in (("ours", ours_text), ("base", base_text), ("theirs", theirs_text)):
+            target = Path(tmp) / label
+            _write_private(target, text)
+            names.append(str(target))
+        merged = subprocess.run(
+            ["git", "merge-file", "-p", f"--marker-size={int(marker_size or 7)}",
+             "-L", "ours", "-L", "base", "-L", "theirs", *names],
+            capture_output=True, check=False)
+    if merged.returncode < 0 or merged.returncode > 127:
+        print(f"kist: merge {path}: git merge-file failed.", file=sys.stderr)
+        return 1
+    Path(ours).write_bytes(encrypt_envelope(merged.stdout, password, git_context(profile, path)))
+    if merged.returncode:
+        print(f"kist: merge {path}: {merged.returncode} conflict(s); resolve them in the file, then git add it.",
+              file=sys.stderr)
+        return 1
+    return 0
+
+
 def _run(command: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, check=check, text=True, capture_output=True)
 
@@ -355,15 +491,72 @@ def _install_hook(hook_path: Path, *, force: bool = False) -> bool:
     return True
 
 
-def run_git_setup(*, force_hook: bool = False, install_hook: bool = True) -> None:
+def _venv_root(executable: Path) -> Optional[Path]:
+    """The virtual environment containing ``executable`` (bin/kist or Scripts/kist.exe), if any."""
+    root = executable.parent.parent
+    return root if (root / "pyvenv.cfg").is_file() else None
+
+
+def describe_kist_location(executable: Path, repo_root: Optional[Path] = None) -> tuple[str, bool]:
+    """Human label for where a kist executable lives, and whether it deserves a warning."""
+    if repo_root is None:
+        top = _git_lines("rev-parse", "--show-toplevel")
+        repo_root = Path(top[0].strip()) if top else None
+    venv = _venv_root(executable)
+    if venv is None or "/uv/tools/" in executable.as_posix():
+        return "global install", False
+    if repo_root is not None:
+        try:
+            venv.resolve().relative_to(repo_root.resolve())
+            return "project virtual environment", False
+        except ValueError:
+            pass
+    return f"virtual environment outside this repository ({venv})", True
+
+
+def kist_command(explicit: Optional[str] = None) -> tuple[str, str, bool]:
+    """Absolute command Git should run for the Kist filters: (command, location label, warn).
+
+    The kist that is running is recorded: the project's .venv when `kist init` runs from
+    an activated project environment, the global install (uv tool) otherwise. The path
+    is kept as invoked, not resolved, so `uv tool install --force` upgrades stay valid.
+    An absolute path works in IDEs started from the desktop, which lack the shell PATH.
+    """
+    if explicit:
+        executable = Path(explicit).expanduser().absolute()
+        if not (executable.is_file() and os.access(executable, os.X_OK)):
+            raise KistError(f"--kist-path {explicit}: not an executable file.")
+        return shlex.quote(executable.as_posix()), *describe_kist_location(executable)
+    argv0 = Path(sys.argv[0]) if sys.argv and sys.argv[0] else None
+    candidates = []
+    if argv0 is not None and argv0.name in {"kist", "kist.exe"}:
+        candidates.append(argv0)
+    found = shutil.which("kist")
+    if found:
+        candidates.append(Path(found))
+    for candidate in candidates:
+        executable = candidate.absolute()
+        if executable.is_file() and os.access(executable, os.X_OK):
+            return shlex.quote(executable.as_posix()), *describe_kist_location(executable)
+    return f"{shlex.quote(sys.executable)} -m kist", f"python -m kist ({sys.executable})", False
+
+
+def configure_git_drivers(command: str) -> None:
+    subprocess.run(["git", "config", "filter.kist.clean", f"{command} --clean %f"], check=True)
+    subprocess.run(["git", "config", "filter.kist.smudge", f"{command} --smudge %f"], check=True)
+    subprocess.run(["git", "config", "filter.kist.required", "true"], check=True)
+    subprocess.run(["git", "config", "diff.kist.textconv", f"{command} --textconv"], check=True)
+    subprocess.run(["git", "config", "merge.kist.name", "Kist encrypted YAML merge"], check=True)
+    subprocess.run(["git", "config", "merge.kist.driver", f"{command} --merge %O %A %B %P %L"], check=True)
+
+
+def run_git_setup(*, force_hook: bool = False, install_hook: bool = True, kist_path: Optional[str] = None) -> None:
     """Configure Git filters without overwriting unrelated repository configuration."""
     if not _is_git_repo():
         raise KistError("Not inside a Git repository. Initialize Git explicitly before running `kist init` (run `git init`).")
 
-    subprocess.run(["git", "config", "filter.kist.clean", "kist --clean %f"], check=True)
-    subprocess.run(["git", "config", "filter.kist.smudge", "kist --smudge %f"], check=True)
-    subprocess.run(["git", "config", "filter.kist.required", "true"], check=True)
-    subprocess.run(["git", "config", "diff.kist.textconv", "kist --textconv"], check=True)
+    command, location, warn = kist_command(kist_path)
+    configure_git_drivers(command)
 
     attributes_changed = _upgrade_legacy_attributes(Path(".gitattributes"))
     attributes_changed = _append_missing_lines(Path(".gitattributes"), KIST_ATTRIBUTE_RULES, "Kist encrypted-secret filters") or attributes_changed
@@ -381,9 +574,11 @@ def run_git_setup(*, force_hook: bool = False, install_hook: bool = True) -> Non
     if hook_changed:
         changes.append("pre-commit hook")
     print("Kist Git filters configured." + (f" Updated: {', '.join(changes)}." if changes else ""))
+    print(f"Git filter command: {command} ({location})")
+    if warn:
+        print("Warning: deleting that environment breaks Git operations on secret files in this repository. "
+              "Prefer the project's .venv or a global install (uv tool install kist), then re-run kist init.")
     print("Next step: Run 'kist init-db' to initialize your database schema if not already configured.")
-    if shutil.which("kist") is None:
-        print("Tip: Install kist globally ('uv tool install kist') for seamless Git commits in IDEs and non-activated shells.")
 
 
 def print_hook() -> None:
@@ -448,6 +643,9 @@ def run_leak_guard(all_files: bool = False) -> int:
         return 1
 
     staged_files = [item.strip() for item in result.stdout.splitlines() if item.strip()]
+    # Files routed through the Kist filter by .gitattributes count as protected too,
+    # including custom patterns beyond the built-in secrets*.yaml / secrets/ names.
+    protected = set(_kist_filtered(staged_files, None)) if staged_files else set()
     for file_path in staged_files:
         blob_result = subprocess.run(["git", "show", f":{file_path}"], capture_output=True, check=False)
         if blob_result.returncode != 0:
@@ -458,9 +656,15 @@ def run_leak_guard(all_files: bool = False) -> int:
             continue
 
         encrypted = is_kist_envelope(blob)
-        if _is_targeted_secret(file_path):
+        if _is_targeted_secret(file_path) or file_path in protected:
             if not encrypted:
-                print(f"kist: blocked plaintext protected secret file: {file_path}", file=sys.stderr)
+                print(f"kist: blocked plaintext protected secret file: {file_path}. Every file under the Kist "
+                      f"secret patterns must be encrypted; run `kist init` in this clone, then "
+                      f"git add --renormalize {file_path}.", file=sys.stderr)
+                return 1
+            problem = envelope_header_problem(blob)
+            if problem:
+                print(f"kist: blocked {file_path}: not a valid Kist envelope ({problem}).", file=sys.stderr)
                 return 1
             try:
                 bound_here = _envelope_matches(blob, profile_from_path(file_path), file_path)
