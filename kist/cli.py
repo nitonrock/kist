@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from typing import Optional
 
 from kist.core import (
     Kist,
@@ -38,8 +39,8 @@ def _require_tty_for_key_display() -> None:
         raise KistError("Refusing to print a newly generated profile password to non-interactive stdout.")
 
 
-def _scope_from_args(args: argparse.Namespace) -> KistScope:
-    base = KistScope.from_environment()
+def _scope_from_args(args: argparse.Namespace, profile: Optional[str] = None) -> KistScope:
+    base = KistScope.from_environment(profile)
     return KistScope(organization=args.org or base.organization, project=args.project or base.project).validated()
 
 
@@ -87,7 +88,7 @@ def _run_rotate(args: argparse.Namespace) -> None:
             print(f"  {path}")
         return
 
-    scope = _scope_from_args(args)
+    scope = _scope_from_args(args, args.name)
     use_db = False if args.skip_db else None
     plan, _ = plan_rotation(args.name, scope=scope, use_database=use_db, use_git=not args.skip_git,
                             rewrap_only=args.rewrap_only)
@@ -287,7 +288,7 @@ def main() -> None:
                 run_git_setup(force_hook=args.force_hook, install_hook=not args.no_hook, kist_path=args.kist_path)
             return
         if args.command == "init-db":
-            kist = Kist(profile_name=args.profile or "default", scope=_scope_from_args(args))
+            kist = Kist(profile_name=args.profile or "default", scope=_scope_from_args(args, args.profile or "default"))
             kist.init_db()
             print("Kist database schema initialized successfully.")
             return
@@ -321,7 +322,7 @@ def main() -> None:
                     print("\nkist: profile deletion cancelled.", file=sys.stderr)
                     sys.exit(130)
 
-            kist = Kist(profile_name=args.name, scope=_scope_from_args(args))
+            kist = Kist(profile_name=args.name, scope=_scope_from_args(args, args.name))
             deleted = kist.delete_profile(args.name)
             msg = f"Deleted profile '{args.name}' for {kist.scope.organization}/{kist.scope.project} from database." if deleted else f"Profile '{args.name}' not found in database."
             if getattr(args, "delete_password", False):
@@ -373,7 +374,7 @@ def main() -> None:
                     print("\nkist: delete operation cancelled.", file=sys.stderr)
                     sys.exit(130)
 
-            kist = Kist(profile_name=profile_name, password=password, scope=_scope_from_args(args))
+            kist = Kist(profile_name=profile_name, password=password, scope=_scope_from_args(args, profile_name))
             if kist.delete(args.key):
                 print(f"Deleted secret '{args.key}' for {kist.scope.organization}/{kist.scope.project}/{profile_name}.")
             else:
@@ -419,10 +420,9 @@ def main() -> None:
 
             if getattr(args, "file", None):
                 raise KistError("Use either a file or --all, not both.")
-            scope = _scope_from_args(args)
-
             def _lock(profile: str, password: str, text: str, prune: bool) -> tuple[int, int]:
-                return Kist(profile_name=profile, password=password, scope=scope).lock_yaml(text, prune=prune)
+                return Kist(profile_name=profile, password=password,
+                            scope=_scope_from_args(args, profile)).lock_yaml(text, prune=prune)
 
             if args.prune and not (args.force or args.yes) and sys.stdin.isatty():
                 answer = input("Warning: --prune deletes database secrets absent from each file. Continue? [y/N]: ")
@@ -430,7 +430,7 @@ def main() -> None:
                     print("kist: prune operation cancelled.", file=sys.stderr)
                     sys.exit(1)
             result = lock_all(_lock, prune=args.prune, profiles=set(args.only) if args.only else None)
-            print_lock_all(result, scope.organization, scope.project)
+            print_lock_all(result, lambda profile: _scope_from_args(args, profile))
             if result.failed or (args.require_all and result.skipped):
                 sys.exit(1)
             if not result.locked and not result.skipped:
@@ -461,7 +461,7 @@ def main() -> None:
                 profile_name = inferred_profile
                 password = inferred_password or get_profile_password(profile_name)
 
-            kist = Kist(profile_name=profile_name, password=password, scope=_scope_from_args(args))
+            kist = Kist(profile_name=profile_name, password=password, scope=_scope_from_args(args, profile_name))
             if args.command == "lock":
                 if not os.path.isfile(target_file):
                     raise KistError(f"Secret file not found: {target_file}")
