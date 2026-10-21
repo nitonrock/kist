@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import os
 import secrets
 import stat
@@ -103,9 +104,10 @@ class KistScope:
     project: str = "default"
 
     @classmethod
-    def from_environment(cls) -> KistScope:
-        return cls(os.getenv("KIST_ORG_ID", "local"),
-                   os.getenv("KIST_PROJECT_ID", "default")).validated()
+    def from_environment(cls, profile: Optional[str] = None) -> KistScope:
+        """Scope from KIST_ORG_ID / KIST_PROJECT_ID: environment, then ~/.kist/env_<profile>, then ~/.kist/env."""
+        return cls(kist_setting("KIST_ORG_ID", profile) or "local",
+                   kist_setting("KIST_PROJECT_ID", profile) or "default").validated()
 
     def validated(self) -> KistScope:
         return KistScope(_validate_scope_name(self.organization, "organization"),
@@ -326,7 +328,81 @@ def get_profile_password(profile_name: str, auto_generate: bool = False, *,
     return None
 
 def password_history_enabled() -> bool:
-    return os.getenv("KIST_USE_RETIRED_PASSWORDS", "on").strip().lower() not in {"0", "off", "false", "no"}
+    return (kist_setting("KIST_USE_RETIRED_PASSWORDS") or "on").strip().lower() not in {"0", "off", "false", "no"}
+
+# --- Settings files: ~/.kist/env and ~/.kist/env_<profile> -------------------
+# Lookup per setting: environment variable, then env_<profile>, then env, then
+# the built-in default. Files hold KIST_NAME=value lines and are never executed.
+PROFILE_FILE_SETTINGS = ("KIST_ORG_ID", "KIST_PROJECT_ID", "KIST_REPOSITORY_ID", "KIST_DATABASE_URL")
+# Machine-wide only: one TLS/production policy per machine, whatever the profile.
+MACHINE_FILE_SETTINGS = PROFILE_FILE_SETTINGS + ("KIST_ENV", "KIST_TLS_MODE", "KIST_USE_RETIRED_PASSWORDS")
+_MAX_SETTINGS_BYTES = 64 * 1024
+
+def settings_file_path(profile: Optional[str] = None) -> Path:
+    name = "env" if profile is None else f"env_{_validate_profile_name(profile)}"
+    return Path(get_kist_dir()) / name
+
+def _read_secure_text(path: Path, limit: int) -> str:
+    directory = _open_secure_directory(path.parent)
+    try:
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(fd, "rb") as handle:
+            try:
+                _secure_status(os.fstat(handle.fileno()))
+            except InsecureKeyStoreError:
+                raise InsecureKeyStoreError(
+                    f"{path} must be a regular file owned by you with mode 600 (chmod 600 {path}).") from None
+            raw = handle.read(limit + 1)
+            if len(raw) > limit:
+                raise InsecureKeyStoreError(f"{path} is too large.")
+            return raw.decode("utf-8")
+    finally:
+        os.close(directory)
+
+def read_settings_file(path: Path, allowed: tuple[str, ...]) -> dict[str, str]:
+    """Parse KIST_NAME=value lines (blank lines and # comments allowed). Missing file: empty."""
+    path = Path(path)
+    if not os.path.lexists(path):
+        return {}
+    values: dict[str, str] = {}
+    for number, line in enumerate(_read_secure_text(path, _MAX_SETTINGS_BYTES).splitlines(), 1):
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        if text.startswith("export "):
+            text = text[len("export "):].lstrip()
+        key, separator, value = text.partition("=")
+        key = key.strip()
+        if not separator or not re.fullmatch(r"KIST_[A-Z0-9_]+", key):
+            raise KistError(f"{path}:{number}: expected KIST_NAME=value.")
+        if key.startswith("KIST_PASSWORD") or key.startswith("KIST_RETIRED_PASSWORDS"):
+            raise KistError(f"{path}:{number}: passwords go in ~/.kist/pwd_<profile>, not in {path.name}.")
+        if key not in allowed:
+            raise KistError(f"{path}:{number}: {key} cannot be set in {path.name} "
+                            f"(allowed: {', '.join(allowed)}).")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+def kist_setting_with_source(name: str, profile: Optional[str] = None) -> tuple[Optional[str], str]:
+    """(value, source) for a KIST_* setting; source is 'environment', '~/.kist/env_<p>', '~/.kist/env' or 'default'."""
+    value = os.environ.get(name)
+    if value is not None and value.strip():
+        return value, "environment"
+    if profile is not None and name in PROFILE_FILE_SETTINGS:
+        value = read_settings_file(settings_file_path(profile), PROFILE_FILE_SETTINGS).get(name)
+        if value:
+            return value, f"~/.kist/env_{_validate_profile_name(profile)}"
+    if name in MACHINE_FILE_SETTINGS:
+        value = read_settings_file(settings_file_path(None), MACHINE_FILE_SETTINGS).get(name)
+        if value:
+            return value, "~/.kist/env"
+    return None, "default"
+
+def kist_setting(name: str, profile: Optional[str] = None) -> Optional[str]:
+    return kist_setting_with_source(name, profile)[0]
 
 def retired_profile_password_files(profile_name: str) -> list[Path]:
     """Retired local passwords kept by 'kist profile rotate', newest first."""
@@ -494,7 +570,7 @@ def mask_db_url(db_url: Optional[str]) -> str:
         return "<invalid database URL>"
 
 def _runtime_is_production(production: Optional[bool]) -> bool:
-    return production if production is not None else os.getenv("KIST_ENV", "development").strip().lower() == "production"
+    return production if production is not None else (kist_setting("KIST_ENV") or "development").strip().lower() == "production"
 
 def enforce_ssl_url(db_url: Optional[str], default_sslmode: str = "require", *,
                     production: Optional[bool] = None) -> Optional[str]:
@@ -507,7 +583,7 @@ def enforce_ssl_url(db_url: Optional[str], default_sslmode: str = "require", *,
     if len({k for k, _ in items}) != len(items):
         raise KistError("Duplicate database URL options are not supported.")
     query = dict(items)
-    requested = os.getenv("KIST_TLS_MODE", "auto").strip().lower()
+    requested = (kist_setting("KIST_TLS_MODE") or "auto").strip().lower()
     modes = {"disable", "require", "verify-ca", "verify-full"}
     if requested not in modes | {"auto"}:
         raise KistError("Invalid KIST_TLS_MODE.")
@@ -665,10 +741,11 @@ def git_context(profile_name: str, filepath: str, scope: Optional[KistScope] = N
     Callers must pass a canonical repository-relative path on every platform.
     Renaming paths/scope/repository IDs requires decrypting and re-encrypting.
     """
-    scope = (scope or KistScope.from_environment()).validated()
+    profile = _validate_profile_name(profile_name)
+    scope = (scope or KistScope.from_environment(profile)).validated()
     return {"format": "kist-git-v1", "organization": scope.organization,
-            "project": scope.project, "profile": _validate_profile_name(profile_name),
-            "repository": os.getenv("KIST_REPOSITORY_ID", "local-repository"),
+            "project": scope.project, "profile": profile,
+            "repository": kist_setting("KIST_REPOSITORY_ID", profile) or "local-repository",
             "path": os.path.normpath(filepath).replace("\\", "/")}
 
 @dataclass(frozen=True)
@@ -714,11 +791,11 @@ class Kist:
                  db_url: Optional[str] = None, scope: Optional[KistScope] = None) -> None:
         resolved_profile = profile_name if profile_name is not None else os.getenv("KIST_PROFILE", "default")
         self.profile_name = _validate_profile_name(resolved_profile)
-        self.scope = (scope or KistScope.from_environment()).validated()
+        self.scope = (scope or KistScope.from_environment(self.profile_name)).validated()
         self.password = password if password is not None else get_profile_password(self.profile_name)
         if self.password is not None:
             _password_bytes(self.password)
-        configured = os.getenv("KIST_DATABASE_URL") if db_url is None else db_url
+        configured = kist_setting("KIST_DATABASE_URL", self.profile_name) if db_url is None else db_url
         self.db_url = enforce_ssl_url(configured) if configured else None
         self.organization_id: Optional[uuid.UUID] = None
         self.project_id: Optional[uuid.UUID] = None

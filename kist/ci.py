@@ -8,7 +8,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from kist.core import (
     DecryptionError,
@@ -129,10 +129,12 @@ def lock_all(lock: Callable[[str, str, str, bool], tuple[int, int]], prune: bool
     return result
 
 
-def print_lock_all(result: LockAllResult, organization: str, project: str) -> None:
+def print_lock_all(result: LockAllResult, scope_for: Callable[[str], Any]) -> None:
+    """Print a lock --all summary; ``scope_for(profile)`` gives each profile's organization/project."""
     for path, profile, locked, pruned in result.locked:
         extra = f", pruned {pruned}" if pruned else ""
-        print(f"locked   {path} -> {organization}/{project}/{profile} ({locked} secrets{extra})")
+        scope = scope_for(profile)
+        print(f"locked   {path} -> {scope.organization}/{scope.project}/{profile} ({locked} secrets{extra})")
     for path, profile in result.skipped:
         print(f"skipped  {path} (no KIST_PASSWORD_{profile.upper()} in this job)")
     if result.skipped and os.getenv("KIST_PASSWORD") and not os.getenv("KIST_PROFILE"):

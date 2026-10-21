@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import Optional
 
 from kist.core import (
-    KIST_DATABASE_URL,
     KistError,
+    kist_setting_with_source,
     decrypt_with_password_history,
     get_profile_password,
     git_context,
@@ -146,6 +146,27 @@ def _committed_check(path: str, profile: str) -> str:
     return f"OK (with retired password {retired})" if retired else "OK"
 
 
+SETTING_DEFAULTS = {"KIST_ORG_ID": "local", "KIST_PROJECT_ID": "default", "KIST_REPOSITORY_ID": "local-repository"}
+
+
+def _setting_line(name: str, profile: Optional[str]) -> str:
+    value, source = kist_setting_with_source(name, profile)
+    if name == "KIST_DATABASE_URL":
+        shown = mask_db_url(value) if value else "not set"
+    else:
+        shown = value if value else SETTING_DEFAULTS.get(name, "not set")
+    return f"{name}={shown} ({source})"
+
+
+def _settings_report(profile: str) -> list[str]:
+    """Where each identifier and the database URL come from for ``profile``."""
+    try:
+        return [_setting_line(name, profile) for name in
+                ("KIST_ORG_ID", "KIST_PROJECT_ID", "KIST_REPOSITORY_ID", "KIST_DATABASE_URL")]
+    except KistError as exc:
+        return [f"SETTINGS ERROR: {exc}"]
+
+
 def setup_hint() -> Optional[str]:
     """One-line hint when this clone's Kist Git setup is missing or broken; None when fine.
 
@@ -224,14 +245,30 @@ def run_status() -> int:
             if committed.startswith(("FAILED", "COMMITTED IN PLAINTEXT")):
                 healthy = False
         print(line)
+        settings = _settings_report(profile)
+        if settings[0].startswith("SETTINGS ERROR"):
+            healthy = False
+        for item in settings:
+            print(f"    {item}")
+
+    print("\nMachine settings:")
+    try:
+        for name in ("KIST_ENV", "KIST_TLS_MODE"):
+            value, source = kist_setting_with_source(name)
+            print(f"- {name}={value or ('development' if name == 'KIST_ENV' else 'auto')} ({source})")
+        database_url, database_source = kist_setting_with_source("KIST_DATABASE_URL")
+    except KistError as exc:
+        print(f"SETTINGS ERROR: {exc}")
+        database_url, database_source = None, "default"
+        healthy = False
 
     print("\nDatabase:")
-    if not KIST_DATABASE_URL:
+    if not database_url:
         print("Not configured (Git-only mode)")
     else:
-        print(f"Configured: {mask_db_url(KIST_DATABASE_URL)}")
+        print(f"Configured: {mask_db_url(database_url)} ({database_source})")
         try:
-            with safe_db_connect(KIST_DATABASE_URL, connect_timeout=3) as conn:
+            with safe_db_connect(database_url, connect_timeout=3) as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT 1")
                     cur.fetchone()

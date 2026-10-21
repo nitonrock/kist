@@ -33,6 +33,7 @@ from kist.core import (
     Kist,
     decrypt_with_password_history,
     git_context,
+    kist_setting,
     KistError,
     KistScope,
     MissingKeyError,
@@ -156,7 +157,7 @@ def plan_rotation(profile: str, *, scope: Optional[KistScope] = None, db_url: Op
     if not current or source is None:
         raise MissingKeyError(f"No current password found for profile {profile!r}.")
 
-    configured_db = db_url if db_url is not None else os.getenv("KIST_DATABASE_URL")
+    configured_db = db_url if db_url is not None else kist_setting("KIST_DATABASE_URL", profile)
     database = bool(configured_db) if use_database is None else use_database
     if database and not configured_db:
         raise KistError("KIST_DATABASE_URL is not configured; use --skip-db to rotate Git files only.")
@@ -253,7 +254,7 @@ def rotate_profile(profile: str, *, new_password: Optional[str] = None, scope: O
     staged = _stage_new_password(plan.profile, new_password) if write_local_key else None
     try:
         if plan.database:
-            store = Kist(plan.profile, current, db_url if db_url is not None else os.getenv("KIST_DATABASE_URL"), scope)
+            store = Kist(plan.profile, current, db_url if db_url is not None else kist_setting("KIST_DATABASE_URL", plan.profile), scope)
             if rewrap_only:
                 store.rewrap_profile_password(new_password)
                 log("Database: key bundle rewrapped with the new password (data keys unchanged).")

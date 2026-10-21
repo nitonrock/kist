@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/badge/pypi-v0.2.5-blue?logo=pypi&amp;logoColor=white" alt="PyPI" /></a>
+  <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/badge/pypi-v0.2.6-blue?logo=pypi&amp;logoColor=white" alt="PyPI" /></a>
   <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/pypi/pyversions/kist?logo=python&amp;logoColor=white" alt="Python versions" /></a>
   <a href="https://github.com/nitonrock/kist/actions/workflows/tests.yml"><img src="https://github.com/nitonrock/kist/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
   <a href="https://github.com/nitonrock/kist/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License" /></a>
@@ -238,6 +238,66 @@ To maintain clarity and prevent misconfiguration, Kist separates runtime operati
 **Common Combinations:**
 - **Local development on a team profile:** `KIST_ENV=development KIST_PROFILE=team_a` (permits local non-TLS Postgres while scoping secrets to `team_a`).
 - **Production service deployment:** `KIST_ENV=production KIST_PROFILE=team_a` (strictly enforces database TLS while decrypting `team_a` secrets).
+
+#### Keeping settings in `~/.kist` instead of environment variables
+
+Like passwords in `~/.kist/pwd_<profile>`, the other settings can live in files next to them. That matters for IDEs started from the desktop menu, which do not read `~/.zshrc` or `~/.bashrc` and so never see exported variables.
+
+```text
+~/.kist/
+├── pwd_team_a      # password of profile team_a
+├── env             # settings for all profiles on this machine
+└── env_team_a      # settings for profile team_a only
+```
+
+`~/.kist/env`:
+
+```sh
+# Kist settings for this machine
+KIST_ENV=development
+KIST_TLS_MODE=disable
+KIST_DATABASE_URL=postgresql://kist:kist@127.0.0.1:5432/kist
+KIST_ORG_ID=nitonrock
+KIST_PROJECT_ID=markets
+```
+
+`~/.kist/env_team_a` (only what differs for this profile):
+
+```sh
+KIST_PROJECT_ID=project-a
+KIST_REPOSITORY_ID=app-config
+```
+
+Each setting is looked up on its own, first match wins:
+
+1. the environment variable with the same name (CI and one-off overrides);
+2. `~/.kist/env_<profile>`;
+3. `~/.kist/env`;
+4. Kist's built-in default (`local`, `default`, `local-repository`, no database).
+
+With the files above, profile `team_a` gets `KIST_ORG_ID=nitonrock` (from `env`), `KIST_PROJECT_ID=project-a` (from `env_team_a`, overriding `env`) and `KIST_REPOSITORY_ID=app-config`. A profile without its own file uses `env` entirely.
+
+| Setting | `env_<profile>` | `env` |
+|---|---|---|
+| `KIST_ORG_ID`, `KIST_PROJECT_ID`, `KIST_REPOSITORY_ID`, `KIST_DATABASE_URL` | yes | yes |
+| `KIST_ENV`, `KIST_TLS_MODE`, `KIST_USE_RETIRED_PASSWORDS` | no: one policy per machine | yes |
+| `KIST_PROFILE`, passwords, `KIST_DIR` | no | no |
+
+Rules:
+
+- **Format:** one `KIST_NAME=value` per line; blank lines and lines starting with `#` are ignored; optional `export ` prefix and surrounding quotes. No inline comments, so values may contain `#`. The file is parsed, never run as shell code, and an unknown name is an error, not silently ignored.
+- **Owner-only:** like password files, each file must be a regular file you own with mode 600 (`chmod 600 ~/.kist/env`), in an owner-only `~/.kist`. Otherwise Kist refuses it: `KIST_DATABASE_URL` contains the database password.
+- **Passwords stay in `pwd_<profile>`,** and `KIST_PROFILE` stays an environment variable: a forgotten machine-wide default profile would apply in every project.
+- **Identifiers must match everywhere.** `KIST_ORG_ID`, `KIST_PROJECT_ID` and `KIST_REPOSITORY_ID` are part of what each file is encrypted for and of the database scope. They are not secret (the encrypted file holds only a hash of them), but if your laptop, a colleague's and CI use different values, files and database rows do not open. CI still sets them as variables.
+- **`kist status` shows each value and where it came from,** with the database password masked:
+
+```text
+- team_a: secrets/secrets_team_a.yml; password source: local password file (~/.kist/pwd_team_a); opens committed version: OK
+    KIST_ORG_ID=nitonrock (~/.kist/env)
+    KIST_PROJECT_ID=project-a (~/.kist/env_team_a)
+    KIST_REPOSITORY_ID=app-config (~/.kist/env_team_a)
+    KIST_DATABASE_URL=postgresql://kist:***@127.0.0.1:5432/kist (~/.kist/env)
+```
 
 ### 2. Initialise the database schema
 
@@ -632,7 +692,7 @@ kist status
 `kist status` is read-only and shows everything in one place:
 
 ```text
-Git filter command: /home/you/project/.venv/bin/kist (kist 0.2.5, project virtual environment): OK
+Git filter command: /home/you/project/.venv/bin/kist (kist 0.2.6, project virtual environment): OK
 Git clean filter: OK
 Git smudge filter: OK
 Git diff driver: OK
@@ -939,7 +999,7 @@ with Kist.from_file("/etc/app/device.kist", git_path="secrets/device.yaml") as s
     port = store.get("mqtt.port", 8883)
 ```
 
-- `git_path` is the repository-relative path at commit time. It is authenticated, together with the profile, `KIST_ORGANIZATION`, `KIST_PROJECT` and `KIST_REPOSITORY_ID`. An envelope moved to another path, profile or scope fails to decrypt.
+- `git_path` is the repository-relative path at commit time. It is authenticated, together with the profile, `KIST_ORG_ID`, `KIST_PROJECT_ID` and `KIST_REPOSITORY_ID` (from the environment or `~/.kist/env*`). An envelope moved to another path, profile or scope fails to decrypt.
 - The profile defaults to the one Git used (`secrets/device.yaml` → `device`). The password comes from the usual lookup: `KIST_PASSWORD_DEVICE`, `KIST_PASSWORD`, or `~/.kist`.
 - Argon2id runs once per load, not per `get()`. Values stay in memory only. Call `reload()` after an update; `close()` (or leaving the `with` block) drops them.
 - The store is read-only and has no live reload. Plaintext working copies are refused.
