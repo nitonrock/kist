@@ -17,8 +17,10 @@ from kist.core import (
     resolve_secret_file_path,
 )
 from kist.fix import run_diagnose, run_fix
-from kist.git import git_clean_stream, git_smudge_stream, git_textconv, print_hook, run_git_setup, run_leak_guard
-from kist.status import run_status
+from kist.git import git_clean_stream, git_merge, git_smudge_stream, git_textconv, print_hook, run_git_setup, run_leak_guard
+from kist.status import run_status, setup_hint
+
+HINT_COMMANDS = {"lock", "unlock", "export", "share", "show", "profile", "delete", "rm"}
 
 
 
@@ -145,12 +147,15 @@ def main() -> None:
     parser.add_argument("--clean", type=str, metavar="FILE", help="Git clean filter entry point")
     parser.add_argument("--smudge", type=str, metavar="FILE", help="Git smudge filter entry point")
     parser.add_argument("--textconv", type=str, metavar="FILE", help="Git diff driver entry point (prints plaintext for git diff/log -p)")
+    parser.add_argument("--merge", nargs="+", metavar="ARG", help="Git merge driver entry point (%%O %%A %%B %%P %%L)")
     subparsers = parser.add_subparsers(dest="command")
 
     init_parser = subparsers.add_parser("init", help="Configure non-destructive local Git integration")
     init_parser.add_argument("--force-hook", action="store_true")
     init_parser.add_argument("--no-hook", action="store_true")
     init_parser.add_argument("--print-hook", action="store_true")
+    init_parser.add_argument("--kist-path", default=None, metavar="PATH",
+                             help="kist executable Git should run (default: the kist running this command)")
     subparsers.add_parser("init-db", help="Initialize the Kist PostgreSQL database schema")
     subparsers.add_parser("status", help="Inspect Kist configuration without modifying it")
     subparsers.add_parser("diagnose", help="Read-only diagnostics and repair recommendations")
@@ -239,8 +244,31 @@ def main() -> None:
     export_parser.add_argument("--repository-id", default=None, help="KIST_REPOSITORY_ID used at commit time, for --verify")
     export_parser.add_argument("--strict", action="store_true", help="Fail if the working copy differs from the exported revision")
 
+    share_parser = subparsers.add_parser(
+        "share", help="Write an encrypted, portable copy of a secret file to send to someone")
+    share_parser.add_argument("file", help="Secret file, e.g. secrets/secrets_team_a.yml")
+    share_parser.add_argument("-o", "--output", default=None,
+                              help="Destination outside the repository (default: ~/<file name>.kist)")
+    share_parser.add_argument("--profile", default=argparse.SUPPRESS, help="Profile override (default: from the file name)")
+    share_parser.add_argument("--force", "-f", action="store_true", help="Overwrite an existing destination")
+
+    show_parser = subparsers.add_parser(
+        "show", help="Print an encrypted Kist file (from kist share or a repository) without writing it to disk")
+    show_parser.add_argument("file", help="Encrypted file, e.g. secrets_team_a.yml.kist")
+    show_parser.add_argument("-o", "--output", default=None, help="Write the plaintext to this file (mode 600) instead")
+    show_parser.add_argument("--profile", default=argparse.SUPPRESS, help="Profile override")
+    show_parser.add_argument("--force", "-f", action="store_true", help="Overwrite an existing --output file")
+
     args = parser.parse_args()
     try:
+        if args.merge:
+            if len(args.merge) < 4:
+                raise KistError("--merge expects %O %A %B %P [%L] from Git.")
+            sys.exit(git_merge(*args.merge[:5]))
+        if args.command in HINT_COMMANDS:
+            hint = setup_hint()
+            if hint:
+                print(f"kist: hint: {hint}", file=sys.stderr)
         if args.clean:
             profile_name, password = get_profile_and_password(args.clean)
             git_clean_stream(profile_name=profile_name, password=password)
@@ -256,7 +284,7 @@ def main() -> None:
             if args.print_hook:
                 print_hook()
             else:
-                run_git_setup(force_hook=args.force_hook, install_hook=not args.no_hook)
+                run_git_setup(force_hook=args.force_hook, install_hook=not args.no_hook, kist_path=args.kist_path)
             return
         if args.command == "init-db":
             kist = Kist(profile_name=args.profile or "default", scope=_scope_from_args(args))
@@ -366,6 +394,25 @@ def main() -> None:
             if result.verified_keys is not None:
                 print(f"Verified: decrypts to {result.verified_keys} secrets.", file=sys.stderr)
             print(f"Read on device: Kist.from_file(<path>, git_path={result.git_path!r})", file=sys.stderr)
+            return
+        if args.command == "share":
+            from kist.share import share_file
+            result = share_file(args.file, args.output, profile_name=getattr(args, "profile", None), force=args.force)
+            if result.uncommitted:
+                print(f"kist: note: {args.file} has uncommitted changes; the shared copy includes them.", file=sys.stderr)
+            print(f"Wrote {result.output} (encrypted for profile '{result.profile}', any repository).")
+            print(f"The recipient runs: kist show {result.output.name}")
+            print(f"They need the '{result.profile}' password: send it through another channel than the file.")
+            return
+        if args.command == "show":
+            from kist.share import show_file, write_shown
+            plaintext, _ = show_file(args.file, profile_name=getattr(args, "profile", None))
+            if args.output:
+                target = write_shown(plaintext, args.output, force=args.force)
+                print(f"Wrote decrypted content to {target} (mode 600).", file=sys.stderr)
+            else:
+                sys.stdout.write(plaintext.decode("utf-8", "replace"))
+                sys.stdout.flush()
             return
         if args.command == "lock" and getattr(args, "lock_all", False):
             from kist.ci import lock_all, print_lock_all

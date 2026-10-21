@@ -648,7 +648,12 @@ def test_leak_guard_detects_plaintext_and_permits_encrypted():
         mock_show_plain.stdout = b"api_key: plain_text_secret\n"
         mock_show_plain.returncode = 0
 
-        mock_run.side_effect = [mock_diff, mock_show_plain]
+        # git check-attr unavailable: the guard falls back to the built-in secret names
+        mock_attr = MagicMock()
+        mock_attr.stdout = b""
+        mock_attr.returncode = 1
+
+        mock_run.side_effect = [mock_diff, mock_attr, mock_show_plain]
         with patch("sys.stderr", new_callable=io.StringIO):
             code = run_leak_guard()
         assert code == 1
@@ -660,7 +665,7 @@ def test_leak_guard_detects_plaintext_and_permits_encrypted():
         mock_show_encrypted.stdout = valid_envelope
         mock_show_encrypted.returncode = 0
 
-        mock_run.side_effect = [mock_diff, mock_show_encrypted]
+        mock_run.side_effect = [mock_diff, mock_attr, mock_show_encrypted]
         code2 = run_leak_guard()
         assert code2 == 0
 
@@ -673,7 +678,7 @@ def test_leak_guard_detects_plaintext_and_permits_encrypted():
         mock_show_py.stdout = b"# package initialization\n__all__ = []\n"
         mock_show_py.returncode = 0
 
-        mock_run.side_effect = [mock_diff_py, mock_show_py]
+        mock_run.side_effect = [mock_diff_py, mock_attr, mock_show_py]
         code3 = run_leak_guard()
         assert code3 == 0
 

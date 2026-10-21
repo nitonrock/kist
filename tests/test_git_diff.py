@@ -51,6 +51,7 @@ def repo(tmp_path, monkeypatch):
     git("config", "filter.kist.clean", f"{KIST} --clean %f")
     git("config", "filter.kist.smudge", f"{KIST} --smudge %f")
     git("config", "diff.kist.textconv", f"{KIST} --textconv")
+    git("config", "merge.kist.driver", f"{KIST} --merge %O %A %B %P %L")
     (root / "secrets").mkdir()
     (root / "secrets" / "device.yaml").write_text("cloud:\n  api_key: example-one\n")
     (root / "secrets" / "payments.yaml").write_text("stripe:\n  key: example-pay-one\n")
