@@ -1,6 +1,6 @@
 # Kist Encryption 101
 
-A clear, practical guide to how Kist protects secrets, why every piece exists, and how the underlying cryptography ensures maximum safety with minimum operational friction.
+A clear, practical guide to how Kist protects secrets, why every piece exists, and how the underlying cryptography ensures maximum safety with minimum operational friction. For the exact byte layout and the compatibility promise, see [FORMAT.md](FORMAT.md).
 
 ---
 
@@ -49,204 +49,198 @@ To understand Kist's security, think of it as a multi-tier vault requiring sever
 | **Profile Password** | Master Secret | The master combination in your head | The root credential used to generate Key Encryption Keys (KEK). |
 | **Salt** (16 bytes) | Cryptographic Salt | A unique grain pattern for each lock | Ensures two profiles with identical passwords produce completely different encryption keys. Defeats precomputed rainbow tables. |
 | **Key Derivation** | Argon2id | The heavy mechanical gear that takes effort to turn | Intentionally consumes CPU time and memory (64 MB RAM) so attackers cannot brute-force passwords using high-speed GPUs or ASICs. |
-| **Key Encryption Key (KEK)** | 256-bit AES Key | The master vault key | Derived via Argon2id from the password; wraps and protects the random profile password Bundle. |
+| **Key Encryption Key (KEK)** | 256-bit AES Key | The master vault key | Derived via Argon2id from the password; only ever wraps random keys: the data key of a Git file, or the database key bundle. |
 | **Key Bundle** | `_KeyBundle` (Content + Index Keys) | The inner safety-deposit key ring | Contains two randomly generated 256-bit keys: a **Data Encryption Key (DEK / `content_key`)** and a **Blind Index Key (`index_key`)**. |
 | **Data Encryption Key (DEK)** | 256-bit AES Key | The swift everyday safety deposit key | Directly encrypts individual secret payloads in PostgreSQL with AES-256-GCM in microseconds without repeating expensive Argon2id derivations on every read. |
 | **Index Key** | 256-bit HMAC Key | The blind catalogue encoder | Derives 32-byte deterministic HMAC-SHA256 lookup tokens so database queries find secrets without leaking plaintext secret names. |
 | **Nonce / IV** (12 bytes) | Initialization Vector | A single-use random lock serial number | Guarantees that encrypting the exact same secret twice results in completely different ciphertext. |
 | **Encryption Engine** | AES-256-GCM | An armored box with a tamper-evident seal | Encrypts the payload (confidentiality) and computes a 16-byte authentication tag (integrity). |
 | **Context / AAD** | Authenticated Additional Data | The indelible shipping label glued to the box | Binds ciphertexts to their exact organization, project, profile, key, and version so attackers cannot swap or transplant records. |
-| **Envelope** | `password-v1` Envelope | The final sealed shipping parcel | The standardized binary package containing header metadata, salt, nonce, context hash, and ciphertext. |
+| **Envelope** | Password envelope, format version 1 | The final sealed shipping parcel | The standardized binary package containing header metadata, salt, nonces, context hash, the wrapped data key, and ciphertext ([FORMAT.md](FORMAT.md)). |
 
 ---
 
 ## 3. Two-Tier Envelope Architecture (KEK / DEK)
 
-Kist uses two complementary encryption models tailored for operational performance and zero-knowledge storage:
+Both Git files and the database use two tiers: the slow, password-derived key (KEK) only ever wraps random keys, and random keys encrypt the actual content. The exact bytes are specified in [FORMAT.md](FORMAT.md).
 
 ### A. Git Secret Files (`kist-git-v1`)
-For Git-managed files (`secrets/<profile>.yaml`), Kist uses direct file-level envelope encryption:
+For Git-managed files (`secrets/<profile>.yaml`, `secrets_<profile>.yml`, …), each file is one **password envelope**:
 ```
 [Profile Password] + [Fresh 16-byte Salt]
                │
-               ▼ (Argon2id: 64MB RAM, 2 iterations, 4 lanes)
-       [32-byte AES-256 KEK]
+               ▼ (Argon2id: 64 MiB RAM, 2 iterations, 4 lanes)
+       [32-byte KEK (wrapping key)]
+               │
+               ▼ (AES-256-GCM, fresh 12-byte nonce)
+[Fresh random 32-byte data key] ──> [Wrapped data key + 16-byte tag]
+
+[Whole YAML file] + [Fresh 12-byte nonce] + [Git context (org/project/profile/repository/path)]
+               │
+               ▼ (AES-256-GCM with the data key)
+   [Ciphertext + 16-byte tag]
                │
                ▼
-[YAML Payload] + [Fresh 12-byte Nonce] + [Git Context (Org/Project/Profile/Path)]
-               │
-               ▼ (AES-256-GCM)
-   [Ciphertext + 16-byte Auth Tag]
-               │
-               ▼
-   [Pack into Binary Envelope]
+   [Header || wrapped data key || nonce || ciphertext]
 ```
 
-### B. PostgreSQL Database Storage (`kist-db-v1`)
-In PostgreSQL, individual secret reads (`store.get(...)`) occur frequently at application runtime. Running a 64 MB Argon2id key derivation on every single key read would introduce unacceptable latency and CPU bottlenecks.
-
-Instead, Kist employs a **Two-Tier Envelope Model**:
+### B. PostgreSQL Database Storage
+In PostgreSQL, individual secret reads (`store.get(...)`) occur frequently at application runtime. Running a 64 MiB Argon2id key derivation on every single read would introduce unacceptable latency, so the password unlocks a **key bundle** once, and secrets use its fast keys:
 
 ```
-1. UNWRAPPING THE KEY BUNDLE (Once per Profile Session):
-[Profile Password] + [Stored Bundle Salt]
+1. UNWRAPPING THE KEY BUNDLE (once per load):
+[Profile Password] + [kist_key_bundles.wrapped_bundle (a password envelope)]
                │
-               ▼ (Argon2id KEK Derivation)
-       [32-byte AES-256 KEK]
-               │
-               ▼ (AES-256-GCM Decrypt wrapped_bundle)
-   [Key Bundle: Content Key (DEK) + Index Key]
+               ▼ (Argon2id KEK derivation, AES-256-GCM unwrap, as for Git files)
+   [Key Bundle: "KKB1" || content key (32 bytes) || index key (32 bytes)]
 
-2. RETRIEVING & DECRYPTING A SECRET (Microsecond Operations):
-   [Secret Name] + [Index Key] ──> HMAC-SHA256 ──> [32-byte Lookup Token]
-                                                           │
-                                                           ▼ (Query DB)
-                                                [kist_secrets Record]
-                                                           │
-                                                           ▼ (AES-256-GCM Decrypt with DEK)
-                                                 [Decrypted Secret Value]
+2. RETRIEVING & DECRYPTING A SECRET (microseconds):
+   [Secret name + scope] + [Index Key] ──> HMAC-SHA256 ──> [32-byte lookup token]
+                                                                 │
+                                                                 ▼ (query DB)
+                                                      [kist_secrets row]
+                                                                 │
+                                                                 ▼ (AES-256-GCM with the content key)
+                                                 [{"key": name, "value": secret}]
 ```
 
-1. **Key Bundle Wrapping:** A random 256-bit `content_key` and 256-bit `index_key` are generated and wrapped using the Argon2id-derived KEK in `kist_key_bundles`.
-2. **Secret Payload Encryption:** Secret values in `kist_secrets` are encrypted using the fast `content_key` (DEK) with AES-256-GCM and bound to scope and version metadata.
-3. **Zero-Knowledge Indexing:** Plaintext secret names are hashed into 32-byte HMAC-SHA256 tokens using the `index_key`.
+1. **Key Bundle Wrapping:** a random 256-bit `content_key` and 256-bit `index_key` are generated once per profile and stored in `kist_key_bundles`, inside a password envelope.
+2. **Secret Payload Encryption:** each row of `kist_secrets` holds the secret's name and value, encrypted together with the `content_key` and bound to its row, bundle, lookup token and version.
+3. **Blind Indexing:** plaintext secret names are never stored; rows are found by a 32-byte HMAC-SHA256 token computed with the `index_key`.
 
 ---
 
 ## 4. Context & Authenticated Additional Data (AAD)
 
-To prevent "ciphertext transplant" attacks (where an attacker copies an encrypted record from a development environment into production), Kist creates deterministic JSON metadata structures bound to every cryptographic operation:
+To prevent "ciphertext transplant" attacks (for example copying an encrypted record from a development environment into production, or one secret file over another), every encryption is bound to a JSON **context**, encoded canonically (sorted keys, no spaces). A ciphertext only opens with exactly the same context. The four contexts, exactly as the code builds them:
 
-### 1. Database Secret Context (`kist-db-v1`)
-Binds the encrypted secret value to its organization, project, profile, key bundle, and version:
+### 1. Database Secret Record (`kist-db-record-v1`)
 ```json
 {
-  "format": "kist-db-v1",
+  "format": "kist-db-record-v1",
   "organization_id": "018f23a1-...",
   "project_id": "018f23a1-...",
   "profile_id": "018f23a1-...",
-  "profile": "production",
-  "key_bundle_id": "018f23a2-...",
-  "secret_version": "3"
+  "row_id": "018f23a3-...",
+  "bundle_id": "018f23a2-...",
+  "lookup_token": "9c1e...(64 hex characters)",
+  "secret_version": "3",
+  "crypto_version": "1"
 }
 ```
 
-### 2. Blind Lookup Token Context (`kist-name-index-v1`)
-Binds the HMAC-SHA256 secret name hash to its scope context:
+### 2. Blind Lookup Token (`kist-name-index-v1`)
+The HMAC-SHA256 input, keyed with the index key:
 ```json
 {
   "format": "kist-name-index-v1",
   "organization_id": "018f23a1-...",
   "project_id": "018f23a1-...",
   "profile_id": "018f23a1-...",
-  "profile": "production",
   "secret_key": "third_party.stripe.api_key"
 }
 ```
 
-### 3. Key Bundle Context (`kist-bundle-v1`)
-Binds the wrapped key bundle to its profile and bundle ID:
+### 3. Key Bundle (`kist-db-key-bundle-v1`)
 ```json
 {
-  "format": "kist-bundle-v1",
+  "format": "kist-db-key-bundle-v1",
   "organization_id": "018f23a1-...",
   "project_id": "018f23a1-...",
   "profile_id": "018f23a1-...",
-  "profile": "production",
-  "bundle_id": "018f23a2-..."
+  "bundle_id": "018f23a2-...",
+  "bundle_version": "1",
+  "access_mode": "password-wrap-v1"
 }
 ```
 
-### 4. Git Secret File Context (`kist-git-v1`)
-Binds Git secret files to the repository and relative file path:
+The database contexts use the random UUIDs of the organization, project and profile rows, so ciphertext cannot be moved to another database, profile or row.
+
+### 4. Git Secret File (`kist-git-v1`)
 ```json
 {
   "format": "kist-git-v1",
   "organization": "local",
   "project": "default",
   "profile": "production",
-  "repository": "my-service-repo",
+  "repository": "local-repository",
   "path": "secrets/production.yaml"
 }
 ```
+`organization`, `project` and `repository` come from `KIST_ORG_ID`, `KIST_PROJECT_ID` and `KIST_REPOSITORY_ID` (defaults shown). `kist share` files use `{"format": "kist-share-v1", "profile": "<profile>"}`, without path or scope, so they open anywhere.
 
 ---
 
 ## 5. Inside the Kist Binary Envelopes
 
-Every encrypted payload stored by Kist starts with a self-describing binary header:
-
-### A. Password-Derived Envelope Format (`password-v1`)
-Used for Git files and wrapped key bundles:
+### A. Password Envelope
+Used for Git files, `kist share` files and database key bundles (offsets in bytes):
 
 ```
-+---------------+---------------+---------------+---------------+
-| Magic (4B)    | Version (1B)  | Algo (1B)     | KDF (1B)      |
-| "KIST"        | 0x01          | 0x01 (AES-GCM)| 0x01 (Argon2) |
-+---------------+---------------+---------------+---------------+
-| Flags (1B)    | Memory Cost (4B, uint32)                      |
-| 0x00          | e.g. 65536 KiB                                |
-+---------------+---------------+---------------+---------------+
-| Iterations (4B, uint32)       | Lanes (2B, uint16)            |
-| e.g. 2                        | e.g. 4                        |
-+---------------+---------------+---------------+---------------+
-| Salt (16 Bytes, Random)                                       |
-+---------------------------------------------------------------+
-| Nonce (12 Bytes, Random)                                      |
-+---------------------------------------------------------------+
-| SHA-256 Hash of Context (32 Bytes)                            |
-+---------------------------------------------------------------+
-| Ciphertext + AES-GCM Auth Tag (Variable Length)               |
-+---------------------------------------------------------------+
++-------------------------------------------------------------------+
+|  0  Magic "KIST" (4) | 4 Version 0x01 | 5 Cipher 0x01 (AES-256-GCM) |
+|  6  KDF 0x01 (Argon2id) | 7 Flags 0x00                             |
++-------------------------------------------------------------------+
+|  8  Argon2 memory, KiB (uint32, e.g. 65536)                        |
+| 12  Argon2 iterations (uint32, e.g. 2)                             |
+| 16  Argon2 lanes (uint16, e.g. 4)                                  |
++-------------------------------------------------------------------+
+| 18  Salt (16, random)                                              |
+| 34  Wrap nonce (12, random)                                        |
+| 46  SHA-256 of the context (32)                                    |
++-------------------------------------------------------------------+
+| 78  Wrapped data key (32 + 16-byte tag)                            |
+|126  Content nonce (12, random)                                     |
+|138  Ciphertext + 16-byte tag (variable)                            |
++-------------------------------------------------------------------+
 ```
 
-### B. Direct Raw DEK Payload Format (Database Secrets)
-Used for high-throughput database secret blobs in `kist_secrets`:
+The first 78 bytes (the header, including the Argon2 settings) are authenticated by both AES-GCM layers. Readers refuse unknown versions and Argon2 settings outside safe limits (memory 19 MiB to 256 MiB), so a hostile file cannot exhaust memory.
+
+### B. Database Secret Record
+Column `kist_secrets.encrypted_blob`:
 
 ```
-+---------------+---------------+---------------+---------------+
-| Magic (4B)    | Version (1B)  | Algo (1B)     | Flags (2B)    |
-| "KIST"        | 0x01          | 0x02 (RAW-GCM)| 0x0000        |
-+---------------+---------------+---------------+---------------+
-| Nonce (12 Bytes, Random)                                      |
-+---------------------------------------------------------------+
-| SHA-256 Hash of Context (32 Bytes)                            |
-+---------------------------------------------------------------+
-| Ciphertext + AES-GCM Auth Tag (Variable Length)               |
-+---------------------------------------------------------------+
++-------------------------------------------------------------------+
+|  0  Magic "KSTR" + version 0x01 (5)                                |
+|  5  Nonce (12, random)                                             |
+| 17  AES-256-GCM ciphertext of {"key": ..., "value": ...} + tag     |
++-------------------------------------------------------------------+
 ```
+
+The record carries no context hash: its context (section 4.1) is rebuilt from the row's own columns and authenticated by AES-GCM.
 
 ---
 
 ## 6. How Decryption Works
 
-When an authorized application retrieves a secret (`store.get("stripe.api_key")` or `kist unlock`):
+When an application retrieves a secret (`store.get("stripe.api_key")`, or `kist unlock` for a whole profile):
 
 ```
-1. UNWRAP KEY BUNDLE (Session Initialization)
-   Fetch wrapped_bundle from `kist_key_bundles`
-   Derive KEK via Argon2id(password, bundle_salt)
-   AES-256-GCM Decrypt wrapped_bundle -> (content_key, index_key)
+1. UNWRAP KEY BUNDLE
+   Fetch wrapped_bundle from kist_key_bundles
+   Check header, context hash and Argon2 limits
+   Derive KEK via Argon2id(password, salt from the header)
+   AES-256-GCM unwrap data key, then decrypt -> (content_key, index_key)
 
-2. COMPUTE ZERO-KNOWLEDGE LOOKUP TOKEN
-   lookup_token = HMAC-SHA256(index_key, name_context)
+2. COMPUTE BLIND LOOKUP TOKEN
+   lookup_token = HMAC-SHA256(index_key, name context)
 
 3. FETCH & DECRYPT SECRET RECORD
-   SELECT encrypted_blob FROM kist_secrets
-   WHERE profile_id = %s AND lookup_token = %s
+   SELECT ... FROM kist_secrets WHERE profile_id = %s AND lookup_token = %s
+   AES-256-GCM decrypt encrypted_blob with content_key and the record context
 
-4. CONSTANT-TIME INTEGRITY & DECRYPTION CHECK
-   Verify Context Hash in header matches expected AAD
-   AES-256-GCM Decrypt encrypted_blob using content_key
-   Verify token matches hmac.compare_digest(lookup_token, token)
-   Return secret plaintext value
+4. VALIDATE THE PAYLOAD
+   Payload must be exactly {"key", "value"}
+   Recompute the lookup token from the decrypted name; compare in constant time
+   Return the value
 ```
 
-If the master password is wrong, the scope does not match, or any ciphertext byte has been altered, Kist fails closed immediately and raises `DecryptionError`.
+If the password is wrong, the scope does not match, or any byte has been altered, Kist fails closed and raises `DecryptionError`.
 
 ---
 
-## 7. Zero-Knowledge Database Hierarchy & Schema
+## 7. Database Hierarchy & Schema
 
 Kist structures PostgreSQL storage into an isolated relational hierarchy:
 
@@ -259,11 +253,11 @@ kist_organizations
 ```
 
 ### Schema Guarantees:
-1. **Zero Plaintext Secret Names:** Plaintext names (like `stripe.secret_key` or `postgres.password`) are never stored in database columns, query parameters, index structures, or query logs. Lookups query 32-byte HMAC digests.
-2. **Version Monotonicity:** Every mutation increments `secret_version`, preventing replay and rollback attacks.
-3. **Transaction Advisory Locking:** Writes acquire PostgreSQL advisory locks (`pg_advisory_xact_lock`) scoped to the profile to eliminate concurrency races.
-4. **Row-Level Write Isolation:** Programmatic single-key updates (`kist.set`) use `SELECT ... FOR UPDATE` with automatic retry loops.
-5. **Real-Time Cache Synchronization:** Database writes trigger PostgreSQL `NOTIFY kist_secret_updated`, allowing runtime stores (`DynamicSecretStore`) to invalidate in-memory caches instantly.
+1. **No Plaintext Secret Names:** names (like `stripe.secret_key`) are never stored in database columns or sent as query parameters; lookups use 32-byte HMAC tokens. Organization, project and profile names are stored in clear.
+2. **Versioned Records:** every write increments `secret_version`, and the version is bound to the ciphertext. This does **not** prevent rollback: someone who can write to the database can restore an older row as a whole. Kist has no rollback protection and no proof that the set of rows is complete.
+3. **Transaction Advisory Locking:** writes take a PostgreSQL advisory lock (`pg_advisory_xact_lock`) scoped to the profile, with automatic retries, so concurrent writers cannot interleave.
+4. **Rotation Isolation:** `kist profile rotate` re-encrypts all rows of a profile under `SELECT ... FOR UPDATE`.
+5. **Real-Time Cache Synchronization:** writes send PostgreSQL `NOTIFY kist_secret_updated`, allowing runtime stores (`DynamicSecretStore`) to invalidate in-memory caches.
 
 ---
 
@@ -277,7 +271,7 @@ Kist avoids storing passwords or plaintext keys in unsecured locations:
   - Generates 32-byte high-entropy URL-safe passwords via `kist profile create <name>`.
 * **Environment Variables:**
   - `KIST_PASSWORD_<NAME>` (profile-specific, recommended for CI/CD).
-  - `KIST_PASSWORD` (global fallback).
+  - `KIST_PASSWORD` (generic fallback, used only when no profile-specific password exists).
 
 ---
 
@@ -309,7 +303,10 @@ A common concern when storing sensitive data is whether encrypted secrets will r
    Argon2id is explicitly memory-hard (requiring 64 MB RAM per evaluation). Implementing memory-intensive graph traversal on quantum hardware requires maintaining massive arrays of fault-tolerant, error-corrected qubits with enormous $T$-gate circuit depth. This imposes extreme financial and physical overhead per guess for any hypothetical quantum adversary.
 
 4. **Algorithm Agility for Future Risk Mitigation:**
-   Kist’s self-describing binary header explicitly records the KDF, cipher, and envelope version. If future cryptographic breakthroughs necessitate parameter migration or post-quantum algorithm transitions, the architecture accommodates seamless upgrades without invalidating legacy envelopes.
+   Kist’s binary header records the envelope version, cipher and KDF. A future format would get a new version number while Kist 1.x keeps reading version 1 (see the compatibility promise in [FORMAT.md](FORMAT.md)); `kist profile rotate` re-encrypts everything with the current format.
+
+5. **The Password Is the Limit:**
+   All of the above assumes a strong profile password. Passwords generated by `kist profile create` carry 256 bits of entropy; a short human-chosen password is the weakest link, quantum or not.
 
 ---
 

@@ -1,8 +1,9 @@
 """Kist core: password-unlocked envelope encryption and opaque PostgreSQL storage.
 
-Initial v1 format for unshipped Kist. Only this format is supported; there are
-no older-format readers or migrations. Disposable test data should be recreated
-when the format changes. Git writes encrypt the whole file.
+Format version 1, specified byte by byte in FORMAT.md and frozen: every Kist 1.x
+must open data written in it (see tests/vectors/format_v1.json). A future format
+gets a new version number and readers keep reading v1. Git writes encrypt the
+whole file.
 One existing profile password unlocks a randomly generated content/index key
 bundle. Names and values are encrypted together; exact name lookup uses HMAC.
 All mutations through this module share a transaction-scoped profile lock.
