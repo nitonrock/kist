@@ -1347,6 +1347,14 @@ If a real credential was staged in plaintext, remove it, rotate it if needed, an
 
 ## Development and release notes
 
+Releases are built and published by GitHub Actions ([`release.yml`](https://github.com/nitonrock/kist/blob/main/.github/workflows/release.yml)) when a version tag is pushed, using [PyPI Trusted Publishing](https://docs.pypi.org/trusted-publishers/): no PyPI token exists to leak. Each file carries a signed [attestation](https://docs.pypi.org/attestations/) linking it to this repository and workflow. To check a release before installing it:
+
+```bash
+uvx pypi-attestations verify pypi --repository https://github.com/nitonrock/kist pypi:kist-0.2.7-py3-none-any.whl
+```
+
+Releases up to 0.2.6 were uploaded manually and have no attestation.
+
 Kist is designed to be understandable before it is expansive. If you find a security issue, report it privately through the repository’s security-advisory process rather than opening a public issue with exploit details.
 
 Before using Kist for sensitive production workloads, review:
