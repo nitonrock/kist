@@ -88,6 +88,7 @@ A generic password must never override another profile's own password. `kist loc
 ## 5. Releases & repository hygiene
 
 - Bump `version` in `pyproject.toml` together with the README PyPI badge and the `kist==` pins in `resources/` (`tests/test_release_consistency.py` enforces it); run `uv lock`.
-- Tag with `git push origin vX.Y.Z` (one tag), never `--tags`.
+- Tag with `git push origin vX.Y.Z` (one tag), never `--tags`. The tag triggers `.github/workflows/release.yml`, which tests, builds, publishes to PyPI (Trusted Publishing, attestations) and creates the GitHub release.
+- Never upload to PyPI from a laptop or with an API token, and never set `attestations: false`. Pin actions in `release.yml` to full commit SHAs.
 - Commits are authored by the maintainer: no `Co-authored-by:` trailers for AI agents or tools.
 - Never commit real secrets, plaintext secret files or `~/.kist` contents.
