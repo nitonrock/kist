@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import os
 import threading
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator, Optional, Union
+from typing import Any
 
 import yaml
 
@@ -35,17 +36,17 @@ from kist.core import (
     _validate_profile_name,
     _validate_secret_key,
     decrypt_with_password_history,
-    profile_from_path,
-    retired_profile_passwords,
     get_profile_password,
     git_context,
     is_kist_envelope,
+    profile_from_path,
+    retired_profile_passwords,
 )
 
 __all__ = ["FileKist"]
 
 _MISSING: Any = object()
-PathLike = Union[str, os.PathLike]
+PathLike = str | os.PathLike
 
 
 def _profile_from_git_path(git_path: str) -> str:
@@ -76,11 +77,11 @@ class FileKist:
         self,
         path: PathLike,
         *,
-        git_path: Optional[str] = None,
-        profile_name: Optional[str] = None,
-        password: Optional[str] = None,
-        scope: Optional[KistScope] = None,
-        repository_id: Optional[str] = None,
+        git_path: str | None = None,
+        profile_name: str | None = None,
+        password: str | None = None,
+        scope: KistScope | None = None,
+        repository_id: str | None = None,
         lazy: bool = True,
     ) -> None:
         self.path = Path(path)
@@ -90,8 +91,8 @@ class FileKist:
         self.scope = (scope or KistScope.from_environment(self.profile_name)).validated()
         self.repository_id = repository_id
         self._password = password
-        self._values: Optional[dict[str, Any]] = None
-        self.retired_password_used: Optional[str] = None
+        self._values: dict[str, Any] | None = None
+        self.retired_password_used: str | None = None
         self._lock = threading.Lock()
         if not lazy:
             self.reload()
@@ -104,7 +105,7 @@ class FileKist:
             context["repository"] = self.repository_id
         return context
 
-    def _current_password(self) -> Optional[str]:
+    def _current_password(self) -> str | None:
         password = self._password if self._password is not None else get_profile_password(self.profile_name)
         if not password and not retired_profile_passwords(self.profile_name):
             raise MissingKeyError(f"No password configured for profile {self.profile_name!r}.")
@@ -125,7 +126,7 @@ class FileKist:
             envelope, self.profile_name, self._context(), self._current_password())
         try:
             text = plaintext.decode("utf-8")
-            loaded = yaml.load(text, Loader=_UniqueSafeLoader)
+            loaded = yaml.load(text, Loader=_UniqueSafeLoader)  # noqa: S506 - subclass of yaml.SafeLoader
         except UnicodeDecodeError as exc:
             raise DecryptionError("Kist envelope does not contain UTF-8 text.") from exc
         except (yaml.YAMLError, RecursionError) as exc:
@@ -143,7 +144,8 @@ class FileKist:
             self.reload()
             with self._lock:
                 values = self._values
-        assert values is not None
+        if values is None:
+            raise KistError("Internal error: secrets file was not loaded.")
         return values
 
     # -- read API (mirrors Kist / TTLSecretStore) ----------------------------
@@ -185,7 +187,7 @@ class FileKist:
 
     clear = close
 
-    def __enter__(self) -> "FileKist":
+    def __enter__(self) -> FileKist:
         return self
 
     def __exit__(self, *exc: object) -> None:

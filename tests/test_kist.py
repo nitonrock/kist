@@ -1,9 +1,7 @@
 import io
-import json
 import os
 import struct
 import sys
-import time
 import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -34,25 +32,22 @@ from kist import (
     run_git_setup,
     run_leak_guard,
     run_status,
-    safe_async_db_connect,
     safe_db_connect,
     write_secure_local_password,
 )
 from kist.core import (
+    _ROW_MAGIC,
     ENVELOPE_VERSION,
     HEADER_SIZE,
     KEY_MODE_PASSWORD,
     SCHEMA_VERSION,
     SQL_SCHEMA,
-    Argon2Policy,
     ConcurrentWriteError,
     DecryptionError,
     InsecureKeyStoreError,
     InvalidEnvelopeError,
     KistError,
     KistScope,
-    MissingKeyError,
-    _ROW_MAGIC,
     _json_bytes,
     _strict_json,
     _UniqueSafeLoader,
@@ -157,7 +152,7 @@ class MockDB:
             self.last_result = []
         elif "UPDATE kist_secrets" in q:
             blob, version, row_id, prof_id = bytes(params[0]), params[1], params[2], params[3]
-            for (p_id, token), s in self.secrets.items():
+            for (p_id, _token), s in self.secrets.items():
                 if str(p_id) == str(prof_id) and s["id"] == row_id:
                     s["blob"] = blob
                     s["version"] = version
@@ -1287,8 +1282,8 @@ def test_cli_unlock_defaults_to_active_profile(tmp_path, monkeypatch, capsys):
 
 
 def test_kist_version():
-    from pathlib import Path
     import tomllib
+
     import kist
 
     pyproject_path = Path(__file__).resolve().parent.parent / "pyproject.toml"

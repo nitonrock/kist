@@ -6,9 +6,10 @@ import os
 import subprocess
 import sys
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 
 from kist.core import (
     DecryptionError,
@@ -17,13 +18,13 @@ from kist.core import (
     decrypt_with_password_history,
     get_profile_password,
     git_context,
-    profile_password_source,
     is_kist_envelope,
     profile_from_path,
+    profile_password_source,
 )
 
 
-def _git(args: list[str], input_bytes: Optional[bytes] = None) -> subprocess.CompletedProcess[bytes]:
+def _git(args: list[str], input_bytes: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(["git", *args], capture_output=True, check=False, input=input_bytes)
 
 
@@ -38,7 +39,7 @@ def repo_relative(path: str) -> str:
     return os.path.normpath(os.path.join(base, path)).replace("\\", "/")
 
 
-def read_yaml_for_lock(path: str, profile: str, password: Optional[str]) -> str:
+def read_yaml_for_lock(path: str, profile: str, password: str | None) -> str:
     """Return the YAML text of a secret file, decrypting it if it is a Kist envelope.
 
     CI checkouts have no Kist filter configured, so files arrive encrypted; the
@@ -87,7 +88,7 @@ class LockAllResult:
 
 
 def lock_all(lock: Callable[[str, str, str, bool], tuple[int, int]], prune: bool = False,
-             profiles: Optional[set[str]] = None) -> LockAllResult:
+             profiles: set[str] | None = None) -> LockAllResult:
     """Lock every tracked Kist file whose profile has a password in this environment.
 
     ``lock(profile, password, yaml_text, prune)`` performs the database write.

@@ -15,7 +15,6 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from kist.core import (
     DecryptionError,
@@ -46,21 +45,21 @@ def _context_hash(context: dict[str, str]) -> bytes:
     return hashlib.sha256(_canonical_aad(context)).digest()
 
 
-def _git(args: list[str], cwd: Optional[Path] = None) -> subprocess.CompletedProcess:
+def _git(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(["git", *args], cwd=cwd, capture_output=True, check=False)
     except FileNotFoundError:
         return subprocess.CompletedProcess(args, 127, b"", b"")
 
 
-def _toplevel(directory: Path) -> Optional[Path]:
+def _toplevel(directory: Path) -> Path | None:
     result = _git(["rev-parse", "--show-toplevel"], cwd=directory)
     if result.returncode != 0:
         return None
     return Path(result.stdout.decode().strip()).resolve()
 
 
-def _repo_path(file: Path) -> tuple[Optional[Path], Optional[str]]:
+def _repo_path(file: Path) -> tuple[Path | None, str | None]:
     top = _toplevel(file.parent if file.parent.exists() else Path.cwd())
     if top is None:
         return None, None
@@ -80,7 +79,7 @@ def _write_private(path: Path, data: bytes, force: bool) -> None:
     os.chmod(path, 0o600)
 
 
-def _repository_plaintext(data: bytes, profile: str, git_path: Optional[str]) -> tuple[bytes, str]:
+def _repository_plaintext(data: bytes, profile: str, git_path: str | None) -> tuple[bytes, str]:
     """Plaintext of a repository envelope (a file left encrypted at checkout)."""
     from kist.git import resolve_envelope_path
 
@@ -106,7 +105,7 @@ class ShareResult:
     uncommitted: bool
 
 
-def share_file(file: str, output: Optional[str] = None, *, profile_name: Optional[str] = None,
+def share_file(file: str, output: str | None = None, *, profile_name: str | None = None,
                force: bool = False) -> ShareResult:
     """Encrypt ``file`` as you see it now into a portable envelope for sending."""
     source = Path(file)
@@ -136,7 +135,7 @@ def share_file(file: str, output: Optional[str] = None, *, profile_name: Optiona
     return ShareResult(output=target, profile=profile, uncommitted=uncommitted)
 
 
-def _candidate_profiles(file: Path, explicit: Optional[str]) -> list[str]:
+def _candidate_profiles(file: Path, explicit: str | None) -> list[str]:
     names: list[str] = []
     if explicit:
         names.append(explicit)
@@ -161,7 +160,7 @@ def _candidate_profiles(file: Path, explicit: Optional[str]) -> list[str]:
     return valid
 
 
-def show_file(file: str, *, profile_name: Optional[str] = None) -> tuple[bytes, str]:
+def show_file(file: str, *, profile_name: str | None = None) -> tuple[bytes, str]:
     """Decrypt a shared (or repository) envelope in memory: (plaintext, profile)."""
     source = Path(file)
     if not source.is_file():

@@ -8,7 +8,6 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from kist.core import KistError, is_kist_envelope
 from kist.file_store import FileKist, _profile_from_git_path
@@ -18,16 +17,16 @@ __all__ = ["ExportResult", "export_envelope"]
 
 @dataclass(frozen=True)
 class ExportResult:
-    output: Optional[Path]  # None when written to stdout
+    output: Path | None  # None when written to stdout
     git_path: str
     profile: str
     revision: str
     size: int
-    verified_keys: Optional[int] = None
+    verified_keys: int | None = None
     working_tree_differs: bool = False
 
 
-def _git(args: list[str], *, cwd: Optional[str] = None, binary: bool = False) -> subprocess.CompletedProcess:
+def _git(args: list[str], *, cwd: str | None = None, binary: bool = False) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(["git", *args], cwd=cwd, capture_output=True, check=False, text=not binary)
     except FileNotFoundError as exc:
@@ -46,20 +45,20 @@ def _repo_relative(file: str) -> tuple[str, str]:
     return toplevel, Path(rel).as_posix()
 
 
-def _verify(path: Path, git_path: str, profile: str, repository_id: Optional[str]) -> int:
+def _verify(path: Path, git_path: str, profile: str, repository_id: str | None) -> int:
     with FileKist(path, git_path=git_path, profile_name=profile, repository_id=repository_id, lazy=False) as store:
         return len(store)
 
 
 def export_envelope(
     file: str,
-    output: Optional[str] = None,
+    output: str | None = None,
     *,
     revision: str = "HEAD",
     staged: bool = False,
     verify: bool = False,
-    profile_name: Optional[str] = None,
-    repository_id: Optional[str] = None,
+    profile_name: str | None = None,
+    repository_id: str | None = None,
     strict: bool = False,
 ) -> ExportResult:
     """Write the encrypted Git blob for ``file`` to ``output`` (``"-"`` for stdout).
@@ -88,7 +87,7 @@ def export_envelope(
         if differs and strict:
             raise KistError(f"{git_path} has uncommitted changes; commit first or drop --strict.")
 
-    out_path: Optional[Path] = None
+    out_path: Path | None = None
     if output == "-":
         if sys.stdout.isatty():
             raise KistError("Refusing to write binary envelope to a terminal; use -o FILE or redirect.")
@@ -107,7 +106,7 @@ def export_envelope(
             Path(tmp).unlink(missing_ok=True)
             raise
 
-    verified: Optional[int] = None
+    verified: int | None = None
     if verify:
         if out_path is not None:
             verified = _verify(out_path, git_path, profile, repository_id)

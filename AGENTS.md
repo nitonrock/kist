@@ -15,7 +15,8 @@ High-signal invariants, workflows and conventions for AI agents and contributors
     KIST_ENV=development KIST_TLS_MODE=disable KIST_DATABASE_URL=$KIST_TEST_DATABASE_URL \
       uv run pytest -q --ignore=tests/test_ci_projects_e2e.py -k "database or cli_delete_secret or cli_profile_delete"
     ```
-  - CI (`.github/workflows/tests.yml`) runs exactly these two steps. `tests/test_ci_projects_e2e.py` needs local sibling projects and is never run in CI.
+  - Static analysis: `uv run ruff check .` must pass (rules in `pyproject.toml`, including Bandit security rules). Silence a finding only with `# noqa: <code> - <reason>`.
+  - CI (`.github/workflows/tests.yml`) runs exactly these three steps. `tests/test_ci_projects_e2e.py` needs local sibling projects and is never run in CI.
   - Build: `uv build`; check the distribution: `uvx twine check dist/*`
 
 ---

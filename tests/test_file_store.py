@@ -203,7 +203,8 @@ def test_end_to_end_with_git_filter(tmp_path, monkeypatch):
     repo.mkdir()
     monkeypatch.chdir(repo)
     monkeypatch.setenv("KIST_PASSWORD_DEVICE", PASSWORD)
-    run = lambda *cmd: subprocess.run(cmd, check=True, capture_output=True, text=True)
+    def run(*cmd):
+        return subprocess.run(cmd, check=True, capture_output=True, text=True)
     run("git", "init", "-q")
     run("git", "config", "user.email", "test@example.invalid")
     run("git", "config", "user.name", "test")

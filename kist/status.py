@@ -6,15 +6,14 @@ import shlex
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 from kist.core import (
     KistError,
-    kist_setting_with_source,
     decrypt_with_password_history,
     get_profile_password,
     git_context,
     is_kist_envelope,
+    kist_setting_with_source,
     mask_db_url,
     safe_db_connect,
 )
@@ -30,7 +29,7 @@ def _inside_git_repo() -> bool:
     return subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], capture_output=True, check=False).returncode == 0
 
 
-def _repo_root() -> Optional[Path]:
+def _repo_root() -> Path | None:
     result = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=False)
     return Path(result.stdout.strip()) if result.returncode == 0 and result.stdout.strip() else None
 
@@ -73,7 +72,7 @@ def _key_source(profile: str) -> str:
     return f"environment ({source})"
 
 
-def filter_command_executable(command: str) -> tuple[list[str], Optional[str]]:
+def filter_command_executable(command: str) -> tuple[list[str], str | None]:
     """Split a configured filter command into the part before the Kist flag, and its executable path."""
     try:
         tokens = shlex.split(command)
@@ -94,7 +93,7 @@ def filter_command_executable(command: str) -> tuple[list[str], Optional[str]]:
     return prefix, found
 
 
-def _command_version(prefix: list[str]) -> Optional[str]:
+def _command_version(prefix: list[str]) -> str | None:
     try:
         result = subprocess.run([*prefix, "--version"], capture_output=True, text=True, check=False, timeout=20)
     except (OSError, subprocess.TimeoutExpired):
@@ -149,7 +148,7 @@ def _committed_check(path: str, profile: str) -> str:
 SETTING_DEFAULTS = {"KIST_ORG_ID": "local", "KIST_PROJECT_ID": "default", "KIST_REPOSITORY_ID": "local-repository"}
 
 
-def _setting_line(name: str, profile: Optional[str]) -> str:
+def _setting_line(name: str, profile: str | None) -> str:
     value, source = kist_setting_with_source(name, profile)
     if name == "KIST_DATABASE_URL":
         shown = mask_db_url(value) if value else "not set"
@@ -167,7 +166,7 @@ def _settings_report(profile: str) -> list[str]:
         return [f"SETTINGS ERROR: {exc}"]
 
 
-def setup_hint() -> Optional[str]:
+def setup_hint() -> str | None:
     """One-line hint when this clone's Kist Git setup is missing or broken; None when fine.
 
     Cheap and read-only, for other commands to print. `kist status` has the details.

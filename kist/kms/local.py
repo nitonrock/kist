@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Mapping
+from collections.abc import Mapping
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM

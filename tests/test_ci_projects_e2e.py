@@ -1,7 +1,6 @@
-import os
 import subprocess
-import sys
 from pathlib import Path
+
 import pytest
 
 BASE_DIR = Path("/home/nitonrock/PycharmProjects")
