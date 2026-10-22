@@ -21,7 +21,7 @@ stages:
   - deploy
 
 variables:
-  KIST_VERSION: "0.2.7"
+  KIST_VERSION: "0.2.8"
   KIST_ENV: production
   KIST_TLS_MODE: require            # or verify-full with PGSSLROOTCERT (a File-type variable)
   # Must match what developers use when they commit, or files will not decrypt:
