@@ -4,7 +4,7 @@ What Kist protects, from whom, and where it stops. Each scenario says what happe
 
 ## In one paragraph
 
-Kist protects secrets **at rest**: in Git history, in the PostgreSQL tables, in backups and in files you send. Everything there is encrypted with AES-256-GCM under keys only profile password holders can unlock, and bound to its path, profile and scope, so it can be neither read nor quietly moved. Kist does **not** protect secrets on a machine where they are in use: the working tree of a developer with the password, the memory of an application, or anyone who has the password. Whoever holds a profile's password has that profile's secrets, past and present.
+Kist keeps secrets encrypted wherever they are stored or sent: Git history, the database, backups, shared files. There they are protected with AES-256-GCM under keys only profile password holders can unlock, and bound to their path, profile and scope, so they can be neither read nor quietly moved. Once someone with the password opens them, on a laptop or in an application, they are ordinary plaintext on that machine, and protecting that machine is up to you.
 
 ## What is protected
 
@@ -29,9 +29,9 @@ Visible to anyone with the repository or the database, by design: file paths and
 |---|---|---|---|
 | Anyone who obtains the repository (leak, public fork, Git host breach) | Git history | Ciphertext, paths, profile names, change history | Encryption; no password in the repository |
 | Git host or CI administrator | Repository; CI variables | Repository: ciphertext only. CI variables: the passwords stored there | Only what you store in CI. The leak guard needs no password |
-| Database administrator or stolen dump | All Kist tables | Ciphertext, HMAC tokens, scope names, row counts. **Can delete or restore old rows** | Encryption and per-row binding. Nothing against rollback or deletion |
+| Database administrator or stolen dump | All Kist tables | Ciphertext, HMAC tokens, scope names, row counts. **Can delete or restore old rows** | Encryption and per-row binding. Nothing against putting old rows back or deleting rows |
 | Network attacker between application and PostgreSQL | Traffic | With the default TLS mode `require`: can impersonate the server, see ciphertext, serve old rows. With `verify-full`: nothing | `KIST_TLS_MODE=verify-full` and a CA certificate. TLS can't be disabled when `KIST_ENV` is production |
-| Contributor without the password (opens pull requests) | Write access to branches | Can replace a secret file with an older valid version of the same file (a rollback), or delete it. **Can't** forge content, or move another file's envelope to this path | Encryption and path binding; review; the CI guard |
+| Contributor without the password (opens pull requests) | Write access to branches | Can replace a secret file with an older genuine version of the same file, or delete it. **Can't** forge content, or move another file's envelope to this path | Encryption and path binding; review; the CI guard |
 | Team member with the password | The password | Everything in that profile, including all history | Nothing technical: this is the trust you grant |
 | Departing team member | The password, and copies of the secrets | Everything they could read, forever, including history encrypted with retired passwords | Rotation protects future content only; see below |
 | Malware, a coding assistant or any process running as your user | Your files and environment | `~/.kist/pwd_*`, the plaintext working tree, `KIST_PASSWORD_*` of your processes | Nothing in Kist; operating-system isolation only |
@@ -58,9 +58,9 @@ Visible to anyone with the repository or the database, by design: file paths and
 **What protects you:** nothing in Kist. File permissions only stop *other* users.
 **What to do:** run assistants in a container or a separate user account without `~/.kist` when the profile matters; give them a working tree where secret files stay locked (no password for that profile).
 
-### A teammate swaps or rolls back a secret file
+### A teammate swaps a secret file or puts back an old one
 
-**What happens:** copying `secrets/a.yml`'s envelope over `secrets/b.yml` fails: each envelope is bound to its path, profile and scope. Restoring an **older valid envelope of the same file** succeeds: it is genuine content, just old.
+**What happens:** copying `secrets/a.yml`'s envelope over `secrets/b.yml` fails: each envelope is bound to its path, profile and scope. Putting back an **older envelope of the same file** succeeds: it is genuine content, just old.
 **What protects you:** the binary change appears in the pull request, and readable diffs (`git diff` with the password) show what changed.
 **What to do:** review secret file changes like code; protect branches.
 
@@ -104,7 +104,7 @@ Visible to anyone with the repository or the database, by design: file paths and
 
 These are properties of format version 1, not bugs:
 
-- **No rollback protection** and no proof that a set of files or rows is complete.
+- **Old versions can be put back.** Someone who can write to the repository or the database can replace a secret with an older genuine version; Kist opens it without warning. It cannot forge new content or move content to another file or row. Kist also can't prove that a set of files or rows is complete (a deletion goes unnoticed).
 - **No sender authentication beyond the password:** every password holder can write valid content for that profile.
 - **No revocation of the past:** rotation protects future content; history stays readable with retired passwords.
 - **Plaintext in use:** in the working tree, in application memory and caches. Python can't reliably erase memory, and Kist doesn't try.
