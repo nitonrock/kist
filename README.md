@@ -30,7 +30,7 @@
   <a href="#license">License</a>
 </p>
 
-> **Alpha software.** Kist is suitable for evaluation and controlled self-hosted deployments. Its API, database schema, and encrypted-envelope format may evolve before a stable release. Review the code, test recovery procedures, and do not treat a local Git hook as an organisational security control.
+> **Alpha software.** Kist is suitable for evaluation and controlled self-hosted deployments. Its API, database schema, and encrypted-envelope format may evolve before a stable release. Review the code, test recovery procedures, and do not treat a local Git filter or hook as an organisational security control.
 
 Kist is a Python library and CLI for teams that want secret changes reviewed in Git, stored encrypted in PostgreSQL, and retrieved by Python applications—without operating a separate Vault cluster.
 
@@ -1221,7 +1221,7 @@ Native hardware-backed keys (TPM 2.0, secure elements) are planned through `kist
 
 ## Security boundaries
 
-Kist is deliberately explicit about what it protects and what it does not.
+Kist is deliberately explicit about what it protects and what it does not. The full [threat model](https://github.com/nitonrock/kist/blob/main/THREAT_MODEL.md) goes through each attacker and scenario (stolen laptop, coding assistants, departing team members, leaked dotfiles, database access) with what protects you and what you have to do.
 
 ### Kist helps protect against
 
@@ -1236,7 +1236,7 @@ Kist is deliberately explicit about what it protects and what it does not.
 - A compromised authorised application process that can legitimately retrieve a secret.
 - Malware, debug tooling, crash dumps, or hostile dependencies reading application memory.
 - A leaked profile password.
-- A developer intentionally bypassing or removing a local Git hook.
+- A developer intentionally bypassing Kist's Git filter (for example `git -c filter.kist.clean=cat`) or committing from a clone without `kist init`; only a required CI guard catches it.
 - A Git server, CI system, database administrator, or operating-system administrator compromised at a higher trust level.
 - Deletion, rollback, availability failures, or backup loss unless your infrastructure handles them.
 - Business-sensitive metadata in logical secret names, project names, or environment variables.
