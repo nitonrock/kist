@@ -36,3 +36,15 @@ def test_release_workflow_uses_trusted_publishing():
         assert forbidden not in text, forbidden
     assert "permissions: {}" in text
     assert text.count("id-token: write") == 1
+
+
+def test_ci_matrix_covers_supported_pythons():
+    pyproject = (ROOT / "pyproject.toml").read_text()
+    minimum = re.search(r'requires-python = ">=3\.(\d+)"', pyproject).group(1)
+    classified = sorted(int(m) for m in re.findall(r'Python :: 3\.(\d+)"', pyproject))
+    workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text()
+    matrix = re.search(r'python-version: \[([^\]]+)\]', workflow).group(1)
+    tested = sorted(int(v.strip().strip('"').split(".")[1]) for v in matrix.split(","))
+    assert tested[0] == int(minimum), "CI must test the minimum supported Python"
+    assert tested == classified, "classifiers and CI matrix must list the same versions"
+    assert "macos-latest" in workflow

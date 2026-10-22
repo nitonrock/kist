@@ -6,12 +6,38 @@ on:
   pull_request:
   workflow_call:
 
+permissions:
+  contents: read
+
 jobs:
-  test:
+  unit:
+    name: unit (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --group dev
+      - name: Unit tests
+        run: uv run pytest -q --ignore=tests/test_ci_projects_e2e.py -k "not database and not cli_delete_secret and not cli_profile_delete"
+
+  # Service containers only run on Linux runners, so PostgreSQL tests stay on
+  # Ubuntu, against the oldest and newest supported Python.
+  database:
+    name: PostgreSQL (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.13"]
+        python-version: ["3.11", "3.13"]
     services:
       postgres:
         image: postgres:17
@@ -25,17 +51,16 @@ jobs:
           --health-interval 2s --health-retries 15
     env:
       KIST_TEST_DATABASE_URL: postgresql://kist:kist@127.0.0.1:5432/kist_test
+      KIST_ENV: development
+      KIST_TLS_MODE: disable
+      KIST_DATABASE_URL: postgresql://kist:kist@127.0.0.1:5432/kist_test
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa # v10.3.1
         with:
           python-version: ${{ matrix.python-version }}
       - run: uv sync --group dev
-      - name: Unit tests
-        run: uv run pytest -q --ignore=tests/test_ci_projects_e2e.py -k "not database and not cli_delete_secret and not cli_profile_delete"
       - name: PostgreSQL tests
-        env:
-          KIST_ENV: development
-          KIST_TLS_MODE: disable
-          KIST_DATABASE_URL: postgresql://kist:kist@127.0.0.1:5432/kist_test
         run: uv run pytest -q --ignore=tests/test_ci_projects_e2e.py -k "database or cli_delete_secret or cli_profile_delete"
