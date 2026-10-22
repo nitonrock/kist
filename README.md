@@ -85,7 +85,7 @@ The full setup, including production TLS, is in [Quick start](#quick-start).
 | | **Kist** | **sops** | **git-crypt** | **python-dotenv** | **HashiCorp Vault** | **Infisical / Doppler** |
 |--|--|--|--|--|--|--|
 | Changes go through Git review & history | ✅ encrypted in commits + CI leak guard | ✅ | ✅ | ❌ plaintext `.env`, usually gitignored | ❌ | ⚠️ via integrations |
-| Readable diffs | ⚠️ plaintext locally with the password (`git diff`, `git log -p`), binary on GitHub | ✅ key names visible, values encrypted | ⚠️ plaintext locally when unlocked, binary on GitHub | n/a | n/a | n/a |
+| Readable diffs | ✅ full plaintext locally with the password (`git diff`, `git log -p`, merges); ⚠️ binary on GitHub/GitLab, by design: even key names reveal too much ([why](#readable-diffs)) | ✅ key names visible, values encrypted | ⚠️ plaintext locally when unlocked, binary on GitHub | n/a | n/a | n/a |
 | Secret names hidden in the repository | ✅ whole file encrypted, by design | ❌ key names stay in cleartext | ✅ | ❌ | n/a | n/a |
 | Transparent Git workflow | ✅ clean/smudge filters | ⚠️ explicit `sops edit` | ✅ clean/smudge filters | ❌ | ❌ | ❌ |
 | Runtime retrieval API (Python) | ✅ `Kist().get()` | ⚠️ decrypt file at startup | ❌ file only | ✅ plaintext env | ✅ client libs | ✅ SDKs |
@@ -98,6 +98,8 @@ The full setup, including production TLS, is in [Quick start](#quick-start).
 | Multi-team / multi-profile isolation | ✅ per-profile passwords, path-based routing | ⚠️ via `.sops.yaml` rules | ⚠️ multiple keys | ❌ | ✅ policies | ✅ projects/envs |
 | Anti-transplant / rollback protection | ✅ context + version bound | ⚠️ MAC per file | ❌ | ❌ | n/a | n/a |
 | Cloud KMS / HSM | 🔜 planned | ✅ | ❌ | ❌ | ✅ | ✅ |
+| Per-person access | ❌ one shared password per profile; 🔜 optional per-member delivery ([planned](#kist-and-sops-candidly)) | ✅ one key per person (age, PGP, KMS) | ✅ GPG users | ❌ | ✅ | ✅ |
+| File formats | ⚠️ YAML only | ✅ YAML, JSON, ENV, INI, binary | ✅ any file | `.env` | n/a | n/a |
 | Fine-grained access policies & audit | ❌ (use Git + DB roles) | ❌ | ❌ | ❌ | ✅ | ✅ |
 | Best fit | Python teams wanting GitOps secrets + runtime store, no Vault | Polyglot config files, KMS-backed | Small repos, few trusted devs | Local dev only | Enterprise, dynamic secrets | Teams wanting a managed UI |
 
@@ -113,6 +115,37 @@ only where the profile password is present ([Readable diffs](#readable-diffs)).
 
 **Choose something else when** you need cloud KMS today, dynamic credentials, or central
 access policies and audit logs.
+
+### Kist and sops, candidly
+
+[sops](https://github.com/getsops/sops) is the de facto standard for encrypted files in Git: started at Mozilla in 2015, a [CNCF Sandbox project](https://www.cncf.io/projects/sops/) since 2023, with many maintainers and integrations. Kist is young, has one maintainer and has had no external security review. For a security tool, that matters.
+
+**Where Kist is better**
+
+- **Secret names stay hidden.** sops encrypts values only; ["keys are stored in cleartext"](https://pkg.go.dev/github.com/getsops/sops/v3). Kist encrypts the whole file, comments included.
+- **Transparent editing.** Edit the file in any editor and `git add` encrypts it. With sops you go through `sops edit` or `sops set`, because editing the encrypted file directly breaks its integrity check ([sops issue #52](https://github.com/getsops/sops/issues/52)).
+- **Merges.** Kist's merge driver merges the decrypted text and shows normal conflict markers. Merging sops files is a known pain point ([sops issue #1117](https://github.com/getsops/sops/issues/1117)).
+- **Runtime store.** Kist also serves secrets at runtime from PostgreSQL, with live reload. sops is a file tool: you decrypt at deploy time.
+- **Guards built in:** leak guard in pre-commit and CI, password consistency check on commit, files bound to their path, `kist status`.
+- **No key infrastructure:** one password per profile, no age or PGP keys to manage, works offline.
+
+**Where Kist is weaker**
+
+- **Shared passwords, not per-person keys.** Everyone with access to a profile holds the same password. Removing someone means rotating it and handing the new one to the others. sops encrypts each file for several people's keys, so you add or remove one person at a time.
+- **No cloud KMS.** sops works with AWS KMS, GCP KMS, Azure Key Vault, HuaweiCloud KMS, age and PGP ([sops README](https://github.com/getsops/sops)), so access can follow your cloud permissions and their audit logs.
+- **Ecosystem.** Flux decrypts sops natively, and it is the only encryption provider Flux supports ([Flux docs](https://fluxcd.io/flux/components/kustomize/kustomizations/)). Kist ships CI templates (GitLab, GitHub, Bitbucket) but no GitOps or infrastructure-tool integrations (Flux, Argo CD, Terraform…), and its runtime library is Python only.
+- **Formats.** Kist handles YAML only; sops also handles JSON, ENV, INI and binary files.
+- **Reviews on GitHub/GitLab.** sops pull requests show which key changed; Kist's show a binary file. That is deliberate (names reveal too much), but reviewers lose information.
+- **Running a program with its secrets.** `sops exec-env` starts a command with secrets as environment variables; Kist has no equivalent for non-Python programs yet.
+
+**Planned: optional per-member access, without a KMS**
+
+The shared password stays the default: it is simple, and handing it to a team through your own channel (a team dotfiles repository, a CI variable) is a legitimate choice. For teams that prefer not to pass passwords around, a later version may deliver the profile password to each member automatically, locked with their public key ([age](https://github.com/FiloSottile/age) or SSH):
+
+- **Opt-in, per profile.** Profiles without a members list work exactly as today, and the password keeps opening everything.
+- **Same encryption.** The members list only delivers the profile password; secret files keep their format, so there is nothing to migrate.
+- **Same write protection.** Only someone holding the profile password can create a file Kist accepts. Encrypting files directly to public keys would lose that: [anyone who knows the public keys can replace a file with a valid new one](https://words.filippo.io/age-authentication/).
+- **Honest limits.** A removed member keeps what they could already read (old commits, values they saw), so the secrets themselves must still be changed, as today. Without a server, nothing records who decrypted what. Only a KMS or a central service provides those.
 
 ## Why your own PostgreSQL
 
@@ -136,7 +169,7 @@ The trade-off is honest: you own backups, key custody and access control. Kist k
 - It is **not** a replacement for Vault, a cloud secret manager or an identity platform.
 - It does **not** support cloud KMS or HSM yet.
 - It does **not** protect a secret once an authorised application has decrypted it.
-- It does **not** make a Git hook impossible to bypass: `git commit --no-verify` remains an effective way to shoot oneself in the foot.
+- It does **not** stop someone determined to commit plaintext: switching off Kist's filter for one command is still an effective way to shoot oneself in the foot. Only the required CI guard catches it.
 
 Kist reduces moving parts; it does not replace operational judgement, backups or the uncomfortable meeting after a leaked credential.
 
@@ -154,6 +187,7 @@ Kist Guard integration
 Cloud KMS providers
 Managed hosting
 Migration tooling between key modes (password → KMS/TPM)
+Optional per-member delivery of profile passwords (public keys, no KMS)
 ```
 
 ## Installation
