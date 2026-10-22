@@ -9,7 +9,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
 
 from psycopg import sql
 
@@ -28,7 +28,7 @@ class CachePolicy:
     clear_on_disconnect: bool = True
 
 
-def _notification_matches(payload: dict[str, Any], profile_name: str, profile_id: Optional[Any]) -> bool:
+def _notification_matches(payload: dict[str, Any], profile_name: str, profile_id: Any | None) -> bool:
     """Match every supplied identifier; do not use ambiguous OR matching."""
     payload_name = payload.get("profile_name")
     payload_id = payload.get("profile_id")
@@ -47,11 +47,11 @@ class TTLSecretStore:
     def __init__(
         self,
         ttl_seconds: float = 30.0,
-        profile_name: Optional[str] = None,
-        password: Optional[str] = None,
-        db_url: Optional[str] = None,
-        kist: Optional[Kist] = None,
-        cache_policy: Optional[CachePolicy] = None,
+        profile_name: str | None = None,
+        password: str | None = None,
+        db_url: str | None = None,
+        kist: Kist | None = None,
+        cache_policy: CachePolicy | None = None,
     ) -> None:
         self.profile_name = profile_name or os.getenv("KIST_PROFILE", "default")
         self.kist = kist or Kist(
@@ -96,7 +96,7 @@ class TTLSecretStore:
     def get_secret(self, key: str, default: Any = ...) -> Any:
         return self.get(key, default)
 
-    def invalidate(self, key: Optional[str] = None) -> None:
+    def invalidate(self, key: str | None = None) -> None:
         with self._lock:
             if key is None:
                 self._cache.clear()
@@ -119,13 +119,13 @@ class DynamicSecretStore(TTLSecretStore):
 
     def __init__(
         self,
-        profile_name: Optional[str] = None,
-        password: Optional[str] = None,
-        db_url: Optional[str] = None,
+        profile_name: str | None = None,
+        password: str | None = None,
+        db_url: str | None = None,
         channel: str = "kist_secret_updated",
         auto_start: bool = False,
-        kist: Optional[Kist] = None,
-        cache_policy: Optional[CachePolicy] = None,
+        kist: Kist | None = None,
+        cache_policy: CachePolicy | None = None,
     ) -> None:
         super().__init__(
             profile_name=profile_name,
@@ -137,7 +137,7 @@ class DynamicSecretStore(TTLSecretStore):
         self.db_url = db_url or self.kist.db_url
         self.channel = channel
         self._stop_event = threading.Event()
-        self._listener_thread: Optional[threading.Thread] = None
+        self._listener_thread: threading.Thread | None = None
         if auto_start:
             self.start()
 
@@ -199,13 +199,13 @@ class AsyncDynamicSecretStore:
 
     def __init__(
         self,
-        profile_name: Optional[str] = None,
-        password: Optional[str] = None,
-        db_url: Optional[str] = None,
+        profile_name: str | None = None,
+        password: str | None = None,
+        db_url: str | None = None,
         channel: str = "kist_secret_updated",
         auto_start: bool = False,
-        kist: Optional[Kist] = None,
-        cache_policy: Optional[CachePolicy] = None,
+        kist: Kist | None = None,
+        cache_policy: CachePolicy | None = None,
     ) -> None:
         self.profile_name = profile_name or os.getenv("KIST_PROFILE", "default")
         self.kist = kist or Kist(
@@ -218,7 +218,7 @@ class AsyncDynamicSecretStore:
         self.policy = cache_policy or CachePolicy(enabled=True)
         self._cache: dict[str, tuple[float, Any]] = {}
         self._lock = asyncio.Lock()
-        self._listener_task: Optional[asyncio.Task] = None
+        self._listener_task: asyncio.Task | None = None
         self._closing = False
         if auto_start:
             try:
@@ -266,7 +266,7 @@ class AsyncDynamicSecretStore:
     async def get_secret(self, key: str, default: Any = ...) -> Any:
         return await self.get(key, default)
 
-    async def invalidate(self, key: Optional[str] = None) -> None:
+    async def invalidate(self, key: str | None = None) -> None:
         async with self._lock:
             if key is None:
                 self._cache.clear()

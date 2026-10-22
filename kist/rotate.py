@@ -24,23 +24,23 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
 
 from kist.core import (
     DecryptionError,
     Kist,
-    decrypt_with_password_history,
-    git_context,
-    kist_setting,
     KistError,
     KistScope,
     MissingKeyError,
     _validate_profile_name,
+    decrypt_with_password_history,
     generate_password,
     get_profile_password,
+    git_context,
     is_kist_envelope,
+    kist_setting,
     profile_from_path,
     profile_password_path,
     profile_password_source,
@@ -56,8 +56,8 @@ class RotationPlan:
     profile: str
     password_source: str
     database: bool
-    database_secrets: Optional[int]
-    git_root: Optional[str]
+    database_secrets: int | None
+    git_root: str | None
     git_files: list[str] = field(default_factory=list)
     rewrap_only: bool = False
 
@@ -68,13 +68,13 @@ class RotationResult:
     database_rotated: bool = False
     database_secrets: int = 0
     git_restaged: list[str] = field(default_factory=list)
-    local_key_path: Optional[Path] = None
-    old_key_backup: Optional[Path] = None
+    local_key_path: Path | None = None
+    old_key_backup: Path | None = None
     checklist: list[str] = field(default_factory=list)
 
 
-def _git(args: list[str], *, cwd: Optional[str] = None, env: Optional[dict[str, str]] = None,
-         input_bytes: Optional[bytes] = None) -> subprocess.CompletedProcess:
+def _git(args: list[str], *, cwd: str | None = None, env: dict[str, str] | None = None,
+         input_bytes: bytes | None = None) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(["git", *args], cwd=cwd, env=env, input=input_bytes,
                               capture_output=True, check=False)
@@ -82,7 +82,7 @@ def _git(args: list[str], *, cwd: Optional[str] = None, env: Optional[dict[str, 
         raise KistError("git is not installed or not on PATH.") from exc
 
 
-def _git_root() -> Optional[str]:
+def _git_root() -> str | None:
     try:
         top = _git(["rev-parse", "--show-toplevel"])
     except KistError:
@@ -112,7 +112,7 @@ def find_profile_git_files(profile: str, root: str) -> list[str]:
     return sorted(selected)
 
 
-def _committed_plaintext(root: str, spec: str, profile: str, path: str, password: str) -> Optional[bytes]:
+def _committed_plaintext(root: str, spec: str, profile: str, path: str, password: str) -> bytes | None:
     blob = _git(["cat-file", "blob", spec], cwd=root)
     if blob.returncode != 0:
         return None
@@ -124,7 +124,7 @@ def _committed_plaintext(root: str, spec: str, profile: str, path: str, password
         raise DecryptionError(f"The current password does not open {path} in Git.") from exc
 
 
-def _check_git_files(root: str, files: list[str], profile: str, password: Optional[str]) -> None:
+def _check_git_files(root: str, files: list[str], profile: str, password: str | None) -> None:
     """Compare decrypted content, not ciphertext: Kist envelopes are randomised,
     so Git's own modified/unmodified view can report false changes.
 
@@ -147,8 +147,8 @@ def _check_git_files(root: str, files: list[str], profile: str, password: Option
                         "so the rotation commit contains only re-encryption.")
 
 
-def plan_rotation(profile: str, *, scope: Optional[KistScope] = None, db_url: Optional[str] = None,
-                  use_database: Optional[bool] = None, use_git: bool = True,
+def plan_rotation(profile: str, *, scope: KistScope | None = None, db_url: str | None = None,
+                  use_database: bool | None = None, use_git: bool = True,
                   rewrap_only: bool = False) -> tuple[RotationPlan, str]:
     """Inspect what would be rotated and validate the current password. Changes nothing."""
     profile = _validate_profile_name(profile)
@@ -161,7 +161,7 @@ def plan_rotation(profile: str, *, scope: Optional[KistScope] = None, db_url: Op
     database = bool(configured_db) if use_database is None else use_database
     if database and not configured_db:
         raise KistError("KIST_DATABASE_URL is not configured; use --skip-db to rotate Git files only.")
-    count: Optional[int] = None
+    count: int | None = None
     if database:
         store = Kist(profile, current, configured_db, scope)
         try:
@@ -207,7 +207,7 @@ def _renormalize(root: str, files: list[str], profile: str, new_password: str) -
     env = dict(os.environ)
     env[f"KIST_PASSWORD_{profile.upper()}"] = new_password
     env["KIST_FRESH_ENCRYPTION"] = "1"  # never reuse an envelope during rotation
-    env["KIST_ALLOW_PASSWORD_CHANGE"] = "1"  # the password change is the point
+    env["KIST_ALLOW_PASSWORD_CHANGE"] = "1"  # the password change is the point  # noqa: S105 - an environment variable name
     done = _git(["add", "--renormalize", "--", *files], cwd=root, env=env)
     if done.returncode != 0:
         raise KistError("git add --renormalize failed: " + done.stderr.decode(errors="replace").strip())
@@ -238,8 +238,8 @@ def build_checklist(result: RotationResult) -> list[str]:
     return items
 
 
-def rotate_profile(profile: str, *, new_password: Optional[str] = None, scope: Optional[KistScope] = None,
-                   db_url: Optional[str] = None, use_database: Optional[bool] = None, use_git: bool = True,
+def rotate_profile(profile: str, *, new_password: str | None = None, scope: KistScope | None = None,
+                   db_url: str | None = None, use_database: bool | None = None, use_git: bool = True,
                    rewrap_only: bool = False, write_local_key: bool = True,
                    log: Callable[[str], None] = lambda _m: None) -> RotationResult:
     plan, current = plan_rotation(profile, scope=scope, db_url=db_url, use_database=use_database,

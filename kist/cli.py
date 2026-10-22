@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from typing import Optional
 
 from kist.core import (
     Kist,
@@ -18,7 +17,15 @@ from kist.core import (
     resolve_secret_file_path,
 )
 from kist.fix import run_diagnose, run_fix
-from kist.git import git_clean_stream, git_merge, git_smudge_stream, git_textconv, print_hook, run_git_setup, run_leak_guard
+from kist.git import (
+    git_clean_stream,
+    git_merge,
+    git_smudge_stream,
+    git_textconv,
+    print_hook,
+    run_git_setup,
+    run_leak_guard,
+)
 from kist.status import run_status, setup_hint
 
 HINT_COMMANDS = {"lock", "unlock", "export", "share", "show", "profile", "delete", "rm"}
@@ -39,17 +46,21 @@ def _require_tty_for_key_display() -> None:
         raise KistError("Refusing to print a newly generated profile password to non-interactive stdout.")
 
 
-def _scope_from_args(args: argparse.Namespace, profile: Optional[str] = None) -> KistScope:
+def _scope_from_args(args: argparse.Namespace, profile: str | None = None) -> KistScope:
     base = KistScope.from_environment(profile)
     return KistScope(organization=args.org or base.organization, project=args.project or base.project).validated()
 
 
 def _run_retired_passwords(args: argparse.Namespace) -> None:
-    from kist.core import password_history_enabled, retired_profile_password_files, _validate_profile_name
+    from kist.core import (
+        _validate_profile_name,
+        password_history_enabled,
+        retired_profile_password_files,
+    )
     profile = _validate_profile_name(args.name)
     files = retired_profile_password_files(profile)
     env_name = f"KIST_RETIRED_PASSWORDS_{profile.upper()}"
-    env_count = len([l for l in os.getenv(env_name, "").splitlines() if l.strip()])
+    env_count = len([ln for ln in os.getenv(env_name, "").splitlines() if ln.strip()])
     if not args.delete:
         state = "on" if password_history_enabled() else "off (KIST_USE_RETIRED_PASSWORDS)"
         print(f"Retired passwords for profile '{profile}' (Password history {state}), newest first:")
@@ -94,7 +105,7 @@ def _run_rotate(args: argparse.Namespace) -> None:
                             rewrap_only=args.rewrap_only)
     mode = "rewrap key bundle only" if args.rewrap_only else "generate new data keys and re-encrypt every secret"
     print(f"Rotation plan for profile '{plan.profile}' ({scope.organization}/{scope.project}):")
-    print(f"  Current password:  from {'~/.kist/pwd_' + plan.profile if plan.password_source == 'file' else plan.password_source} (verified)")
+    print(f"  Current password:  from {'~/.kist/pwd_' + plan.profile if plan.password_source == 'file' else plan.password_source} (verified)")  # noqa: S105 - a source label, not a password
     if plan.database:
         print(f"  PostgreSQL:   {plan.database_secrets} secrets, {mode}")
     else:

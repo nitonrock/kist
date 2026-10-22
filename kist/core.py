@@ -17,16 +17,17 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import re
 import os
+import re
 import secrets
 import stat
 import struct
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import psycopg
@@ -36,7 +37,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 
 KIST_DATABASE_URL = os.getenv("KIST_DATABASE_URL")
-KEY_MODE_PASSWORD = "password-wrap-v1"
+KEY_MODE_PASSWORD = "password-wrap-v1"  # noqa: S105 - a format label
 SCHEMA_VERSION = 1
 MAGIC = b"KIST"
 ENVELOPE_VERSION = 1
@@ -104,7 +105,7 @@ class KistScope:
     project: str = "default"
 
     @classmethod
-    def from_environment(cls, profile: Optional[str] = None) -> KistScope:
+    def from_environment(cls, profile: str | None = None) -> KistScope:
         """Scope from KIST_ORG_ID / KIST_PROJECT_ID: environment, then ~/.kist/env_<profile>, then ~/.kist/env."""
         return cls(kist_setting("KIST_ORG_ID", profile) or "local",
                    kist_setting("KIST_PROJECT_ID", profile) or "default").validated()
@@ -311,7 +312,7 @@ def _password_sources(profile: str, allow_env: bool, allow_local_file: bool, all
 
 def get_profile_password(profile_name: str, auto_generate: bool = False, *,
                          allow_env: bool = True, allow_local_file: bool = True,
-                         allow_generic: bool = True) -> Optional[str]:
+                         allow_generic: bool = True) -> str | None:
     profile = _validate_profile_name(profile_name)
     for source in _password_sources(profile, allow_env, allow_local_file, allow_generic):
         if source == "file":
@@ -338,7 +339,7 @@ PROFILE_FILE_SETTINGS = ("KIST_ORG_ID", "KIST_PROJECT_ID", "KIST_REPOSITORY_ID",
 MACHINE_FILE_SETTINGS = PROFILE_FILE_SETTINGS + ("KIST_ENV", "KIST_TLS_MODE", "KIST_USE_RETIRED_PASSWORDS")
 _MAX_SETTINGS_BYTES = 64 * 1024
 
-def settings_file_path(profile: Optional[str] = None) -> Path:
+def settings_file_path(profile: str | None = None) -> Path:
     name = "env" if profile is None else f"env_{_validate_profile_name(profile)}"
     return Path(get_kist_dir()) / name
 
@@ -386,7 +387,7 @@ def read_settings_file(path: Path, allowed: tuple[str, ...]) -> dict[str, str]:
         values[key] = value
     return values
 
-def kist_setting_with_source(name: str, profile: Optional[str] = None) -> tuple[Optional[str], str]:
+def kist_setting_with_source(name: str, profile: str | None = None) -> tuple[str | None, str]:
     """(value, source) for a KIST_* setting; source is 'environment', '~/.kist/env_<p>', '~/.kist/env' or 'default'."""
     value = os.environ.get(name)
     if value is not None and value.strip():
@@ -401,7 +402,7 @@ def kist_setting_with_source(name: str, profile: Optional[str] = None) -> tuple[
             return value, "~/.kist/env"
     return None, "default"
 
-def kist_setting(name: str, profile: Optional[str] = None) -> Optional[str]:
+def kist_setting(name: str, profile: str | None = None) -> str | None:
     return kist_setting_with_source(name, profile)[0]
 
 def retired_profile_password_files(profile_name: str) -> list[Path]:
@@ -424,7 +425,7 @@ def retired_profile_passwords(profile_name: str) -> list[tuple[str, str]]:
     profile = _validate_profile_name(profile_name)
     keys: list[tuple[str, str]] = []
     env_value = os.getenv(f"KIST_RETIRED_PASSWORDS_{profile.upper()}", "")
-    for index, line in enumerate(l.strip() for l in env_value.splitlines()):
+    for index, line in enumerate(ln.strip() for ln in env_value.splitlines()):
         if line:
             keys.append((f"KIST_RETIRED_PASSWORDS_{profile.upper()}[{index}]", line))
     for path in retired_profile_password_files(profile):
@@ -435,13 +436,13 @@ def retired_profile_passwords(profile_name: str) -> list[tuple[str, str]]:
     return keys
 
 def decrypt_with_password_history(envelope: bytes, profile_name: str, context: dict[str, str],
-                             password: Optional[str]) -> tuple[bytes, Optional[str]]:
+                             password: str | None) -> tuple[bytes, str | None]:
     """Decrypt with the current password, then with retired passwords (read-only fallback).
 
     Returns (plaintext, label of the retired password used or None). New encryption
     must always use the current password; this is only for reading older content.
     """
-    first_error: Optional[DecryptionError] = None
+    first_error: DecryptionError | None = None
     if password:
         try:
             return decrypt_envelope(envelope, password, context), None
@@ -478,7 +479,7 @@ def remove_profile_password(profile_name: str) -> bool:
 
 delete_profile_password = remove_profile_password
 
-def resolve_secret_file_path(path_or_name: Optional[str] = None, profile: Optional[str] = None) -> str:
+def resolve_secret_file_path(path_or_name: str | None = None, profile: str | None = None) -> str:
     if path_or_name:
         candidates = [
             path_or_name,
@@ -540,11 +541,11 @@ def profile_from_path(filepath: str) -> str:
     base = name[:-5] if name.endswith(".yaml") else name[:-4] if name.endswith(".yml") else name
     return _validate_profile_name("default" if base == "secrets" else base.removeprefix("secrets_"))
 
-def get_profile_and_password(filepath: str, auto_generate: bool = False) -> tuple[str, Optional[str]]:
+def get_profile_and_password(filepath: str, auto_generate: bool = False) -> tuple[str, str | None]:
     profile = profile_from_path(filepath)
     return profile, get_profile_password(profile, auto_generate)
 
-def profile_password_source(profile_name: str, *, allow_generic: bool = True) -> Optional[str]:
+def profile_password_source(profile_name: str, *, allow_generic: bool = True) -> str | None:
     """Where get_profile_password() would read from: env var name, 'file', or None."""
     profile = _validate_profile_name(profile_name)
     for source in _password_sources(profile, True, True, allow_generic):
@@ -555,7 +556,7 @@ def profile_password_source(profile_name: str, *, allow_generic: bool = True) ->
             return source
     return None
 
-def mask_db_url(db_url: Optional[str]) -> str:
+def mask_db_url(db_url: str | None) -> str:
     """Conservative diagnostic: discard userinfo, query, and fragment entirely."""
     if not db_url:
         return ""
@@ -569,11 +570,11 @@ def mask_db_url(db_url: Optional[str]) -> str:
     except (ValueError, TypeError):
         return "<invalid database URL>"
 
-def _runtime_is_production(production: Optional[bool]) -> bool:
+def _runtime_is_production(production: bool | None) -> bool:
     return production if production is not None else (kist_setting("KIST_ENV") or "development").strip().lower() == "production"
 
-def enforce_ssl_url(db_url: Optional[str], default_sslmode: str = "require", *,
-                    production: Optional[bool] = None) -> Optional[str]:
+def enforce_ssl_url(db_url: str | None, default_sslmode: str = "require", *,
+                    production: bool | None = None) -> str | None:
     if not db_url:
         return db_url
     p = urlsplit(db_url)
@@ -597,7 +598,7 @@ def enforce_ssl_url(db_url: Optional[str], default_sslmode: str = "require", *,
     query["sslmode"] = effective
     return urlunsplit((p.scheme, p.netloc, p.path, urlencode(query), ""))
 
-def database_tls_mode(db_url: Optional[str]) -> Optional[str]:
+def database_tls_mode(db_url: str | None) -> str | None:
     normalized = enforce_ssl_url(db_url)
     return dict(parse_qsl(urlsplit(normalized).query)).get("sslmode") if normalized else None
 
@@ -676,7 +677,7 @@ def is_kist_envelope(data: bytes) -> bool:
     """Framing check only; not proof of validity or authentication."""
     return isinstance(data, bytes) and len(data) >= HEADER_SIZE + WRAPPED_KEY_LENGTH + NONCE_LENGTH + AES_GCM_TAG_LENGTH and data.startswith(MAGIC)
 
-def envelope_header_problem(data: bytes) -> Optional[str]:
+def envelope_header_problem(data: bytes) -> str | None:
     """Why ``data`` is not a well-formed v1 envelope, or None. Checks the header only; no password needed."""
     if not is_kist_envelope(data):
         return "not a Kist envelope"
@@ -735,7 +736,7 @@ def decrypt_envelope(envelope: bytes, password: str, context: dict[str, Any]) ->
     except InvalidTag as exc:
         raise DecryptionError("Wrong password or modified ciphertext.") from exc
 
-def git_context(profile_name: str, filepath: str, scope: Optional[KistScope] = None) -> dict[str, str]:
+def git_context(profile_name: str, filepath: str, scope: KistScope | None = None) -> dict[str, str]:
     """Build authenticated context for whole-file Git encryption.
 
     Callers must pass a canonical repository-relative path on every platform.
@@ -787,8 +788,8 @@ class Kist:
     bundles are created only by writes. Methods open their own READ COMMITTED
     transactions. Restrict the database role and search_path to trusted schemas.
     """
-    def __init__(self, profile_name: Optional[str] = None, password: Optional[str] = None,
-                 db_url: Optional[str] = None, scope: Optional[KistScope] = None) -> None:
+    def __init__(self, profile_name: str | None = None, password: str | None = None,
+                 db_url: str | None = None, scope: KistScope | None = None) -> None:
         resolved_profile = profile_name if profile_name is not None else os.getenv("KIST_PROFILE", "default")
         self.profile_name = _validate_profile_name(resolved_profile)
         self.scope = (scope or KistScope.from_environment(self.profile_name)).validated()
@@ -797,9 +798,9 @@ class Kist:
             _password_bytes(self.password)
         configured = kist_setting("KIST_DATABASE_URL", self.profile_name) if db_url is None else db_url
         self.db_url = enforce_ssl_url(configured) if configured else None
-        self.organization_id: Optional[uuid.UUID] = None
-        self.project_id: Optional[uuid.UUID] = None
-        self.profile_id: Optional[uuid.UUID] = None
+        self.organization_id: uuid.UUID | None = None
+        self.project_id: uuid.UUID | None = None
+        self.profile_id: uuid.UUID | None = None
 
     @classmethod
     def from_file(cls, path: Any, **kwargs: Any) -> Any:
@@ -870,7 +871,7 @@ class Kist:
         return {"format": "kist-db-key-bundle-v1", **self._scope_context(),
                 "bundle_id": str(bundle_id), "bundle_version": "1", "access_mode": KEY_MODE_PASSWORD}
 
-    def _load_bundle(self, cursor: psycopg.Cursor[Any], *, create: bool = False) -> Optional[_KeyBundle]:
+    def _load_bundle(self, cursor: psycopg.Cursor[Any], *, create: bool = False) -> _KeyBundle | None:
         _, _, profile = self._ensure_scope()
         cursor.execute("""SELECT id, access_mode, bundle_version, wrapped_bundle
                           FROM kist_key_bundles WHERE profile_id = %s""", (profile,))
@@ -910,7 +911,7 @@ class Kist:
                                "lookup_token": token.hex(), "secret_version": str(version),
                                "crypto_version": "1"})
 
-    def _decode_row(self, bundle: _KeyBundle, row: Any, expected_key: Optional[str] = None) -> tuple[str, Any]:
+    def _decode_row(self, bundle: _KeyBundle, row: Any, expected_key: str | None = None) -> tuple[str, Any]:
         row_id, token, bundle_id, crypto_version, version, blob = row
         token, blob = bytes(token), bytes(blob)
         if uuid.UUID(str(bundle_id)) != bundle.id or crypto_version != 1:
@@ -996,7 +997,8 @@ class Kist:
         _json_bytes(value)
         def operation(cursor: psycopg.Cursor[Any]) -> int:
             bundle = self._load_bundle(cursor, create=True)
-            assert bundle is not None
+            if bundle is None:
+                raise KistError("Internal error: profile key bundle was not created.")
             return self._store(cursor, bundle, key, value)
         return self._write(operation, max_retries)
 
@@ -1037,7 +1039,7 @@ class Kist:
             return True
         return self._write(operation)
 
-    def delete_profile(self, profile_name: Optional[str] = None) -> bool:
+    def delete_profile(self, profile_name: str | None = None) -> bool:
         target_profile = _validate_profile_name(profile_name or self.profile_name)
         with safe_db_connect(self._require_database()) as connection:
             with connection.cursor() as cursor:
@@ -1121,13 +1123,14 @@ class Kist:
 
     def lock_yaml(self, yaml_string: str, prune: bool = False) -> tuple[int, int]:
         try:
-            loaded = yaml.load(yaml_string, Loader=_UniqueSafeLoader)
+            loaded = yaml.load(yaml_string, Loader=_UniqueSafeLoader)  # noqa: S506 - subclass of yaml.SafeLoader
         except (yaml.YAMLError, RecursionError) as exc:
             raise KistError("Invalid secret YAML.") from exc
         flattened = self.flatten({} if loaded is None else loaded)
         def operation(cursor: psycopg.Cursor[Any]) -> tuple[int, int]:
             bundle = self._load_bundle(cursor, create=True)
-            assert bundle is not None
+            if bundle is None:
+                raise KistError("Internal error: profile key bundle was not created.")
             removed = 0
             if prune:
                 wanted = {self._lookup_token(bundle, k) for k in flattened}
@@ -1187,7 +1190,7 @@ class Kist:
         self._write(operation)
         self.password = new_password
 
-    def secret_count(self) -> Optional[int]:
+    def secret_count(self) -> int | None:
         """Number of secrets in this profile, or None if it has no key bundle yet.
 
         Opening the bundle also proves the current password is correct.

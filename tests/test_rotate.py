@@ -14,8 +14,19 @@ import uuid
 import pytest
 
 from kist import Kist, KistScope, main
-from kist.core import DecryptionError, KistError, decrypt_envelope, git_context, safe_db_connect
-from kist.rotate import find_profile_git_files, plan_rotation, restage_git_with_current_key, rotate_profile
+from kist.core import (
+    DecryptionError,
+    KistError,
+    decrypt_envelope,
+    git_context,
+    safe_db_connect,
+)
+from kist.rotate import (
+    find_profile_git_files,
+    plan_rotation,
+    restage_git_with_current_key,
+    rotate_profile,
+)
 
 OLD = "old-rotation-password-0123456789abcdef"
 NEW = "new-rotation-password-0123456789abcdef"
@@ -114,9 +125,9 @@ def test_database_rotate_keys_reencrypts_everything(db_url, scope):
     after = rows(db_url, store)
 
     assert [r[0] for r in after] == [r[0] for r in before]                # same records
-    assert all(a[2] == b[2] + 1 for a, b in zip(after, before))           # versions bumped
-    assert all(a[1] != b[1] for a, b in zip(after, before))               # new lookup tokens (new index key)
-    assert all(a[3] != b[3] for a, b in zip(after, before))               # new ciphertext
+    assert all(a[2] == b[2] + 1 for a, b in zip(after, before, strict=True))           # versions bumped
+    assert all(a[1] != b[1] for a, b in zip(after, before, strict=True))               # new lookup tokens (new index key)
+    assert all(a[3] != b[3] for a, b in zip(after, before, strict=True))               # new ciphertext
     with safe_db_connect(db_url) as c:
         assert c.execute("SELECT wrapper_revision FROM kist_key_bundles WHERE profile_id = %s",
                          (store.profile_id,)).fetchone()[0] == rev_before + 1
@@ -393,7 +404,8 @@ def test_two_rotations_both_old_revisions_open(repo, home):
     git("commit", "-q", "-m", "rotate 1")
     (repo / "secrets" / "device.yaml").write_text("v: 2\n")
     git("commit", "-q", "-am", "v2")             # NEW
-    import time; time.sleep(1.1)                 # distinct retired-key timestamps
+    import time
+    time.sleep(1.1)                              # distinct retired-key timestamps
     rotate_profile("device", use_database=False, new_password=THIRD)
     git("commit", "-q", "-m", "rotate 2")
     assert len(list((home / ".kist").glob("pwd_device.old-*"))) == 2
@@ -432,6 +444,7 @@ def test_retired_keys_from_environment_for_ci(repo, home, monkeypatch):
 
 def test_key_history_never_used_for_encryption(home):
     import io
+
     from kist import git_clean_stream
     (home / ".kist" / "pwd_device.old-20200101-000000").write_text(NEW)
     (home / ".kist" / "pwd_device.old-20200101-000000").chmod(0o600)
@@ -445,6 +458,7 @@ def test_key_history_never_used_for_encryption(home):
 
 def test_decrypt_with_password_history_reports_original_error(home):
     import io
+
     from kist import git_clean_stream
     from kist.core import decrypt_with_password_history
     out = io.BytesIO()
@@ -465,7 +479,8 @@ def test_rotation_from_env_password_still_keeps_retired_key(repo, home, monkeypa
 def test_cli_retired_keys_list_and_delete(repo, home, monkeypatch, capsys):
     rotate_profile("device", use_database=False, new_password=NEW)
     git("commit", "-q", "-m", "r1")
-    import time; time.sleep(1.1)
+    import time
+    time.sleep(1.1)
     rotate_profile("device", use_database=False, new_password=THIRD)
     monkeypatch.setattr(sys, "argv", ["kist", "profile", "retired-passwords", "device"])
     main()
