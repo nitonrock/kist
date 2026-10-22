@@ -5,9 +5,8 @@ This document specifies every byte Kist writes: encrypted Git files, `kist share
 ## Compatibility promise
 
 - **Every Kist 1.x release opens every file and database written in format version 1.** Kist has written version 1 since 0.1.3: releases 0.1.3, 0.1.5, 0.1.6, 0.2.0, 0.2.4 and 0.2.8, installed from PyPI, all open the frozen samples below. (0.1.0 used an earlier, incompatible layout.)
-- Format version 1 is frozen. A change to anything below (layout, algorithms, contexts, labels) needs a new version number; Kist then keeps reading version 1 and refuses unknown versions instead of guessing.
+- Format version 1 is frozen. A change to anything below (layout, algorithms, contexts, labels) needs a new version number; Kist 1.x then keeps reading version 1, and always refuses unknown versions instead of guessing.
 - The frozen samples in [`tests/vectors/format_v1.json`](tests/vectors/format_v1.json) enforce this. Every release must open them, and [`tests/test_format_v1.py`](tests/test_format_v1.py) opens them with Kist and with an independent decoder written from this document. The samples are never regenerated: a test pins their SHA-256.
-- Before 1.0, Kist may still add a new format version, but it will not drop reading version 1 without a migration path (`kist profile rotate` re-encrypts everything with the current format).
 
 Not covered by the promise: Python APIs whose name starts with `_`, command output wording, and the layout of `kist status`.
 

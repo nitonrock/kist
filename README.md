@@ -179,7 +179,7 @@ Kist is currently an **alpha** project.
 
 The current release supports one encryption mode, password-wrapped keys, in **format version 1** (see [How it works](#how-it-works) for the envelope model).
 
-**Format promise:** format version 1 is frozen and specified byte by byte in [FORMAT.md](https://github.com/nitonrock/kist/blob/main/FORMAT.md). Every Kist 1.x release will open every file and database written in it; Kist has written it since 0.1.3. A future format gets a new version number, and Kist keeps reading version 1. Frozen test vectors enforce this on every release.
+**Format promise:** format version 1 is frozen and specified byte by byte in [FORMAT.md](https://github.com/nitonrock/kist/blob/main/FORMAT.md). Every Kist 1.x release will open every file and database written in it; Kist has written it since 0.1.3. A future format gets a new version number, and Kist 1.x keeps reading version 1. Frozen test vectors enforce this on every release.
 
 Planned for future releases:
 
