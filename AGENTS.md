@@ -93,3 +93,9 @@ A generic password must never override another profile's own password. `kist loc
 - Never upload to PyPI from a laptop or with an API token, and never set `attestations: false`. Pin actions in `release.yml` to full commit SHAs.
 - Commits are authored by the maintainer: no `Co-authored-by:` trailers for AI agents or tools.
 - Never commit real secrets, plaintext secret files or `~/.kist` contents.
+
+## Format version 1 is frozen
+
+- `FORMAT.md` specifies every byte Kist writes. Keep it in sync with the code.
+- Never edit or regenerate `tests/vectors/format_v1.json`; `tests/test_format_v1.py` pins its SHA-256. A failing vector test means a compatibility break, not a test to update.
+- A format change needs a new version number and must keep reading version 1.

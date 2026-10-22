@@ -1,0 +1,81 @@
+{
+  "format": "kist-format-v1-test-vectors",
+  "note": "Frozen. Never regenerate or edit: every Kist 1.x must open these.",
+  "password": "format-v1-test-vector-password",
+  "vectors": [
+    {
+      "name": "git-file-default-scope",
+      "kind": "git-file",
+      "context": {
+        "format": "kist-git-v1",
+        "organization": "local",
+        "project": "default",
+        "profile": "team_a",
+        "repository": "local-repository",
+        "path": "secrets/secrets_team_a.yml"
+      },
+      "plaintext_hex": "64617461626173653a0a202070617373776f72643a207333637233740a6170693a0a2020746f6b656e3a206162633132330a",
+      "envelope_hex": "4b4953540101010000010000000000020004a2f3037177fb4e08d7e11a4c73c3abd77883fde753f2f4ceae1c300b3d7f8f164aa7c6d91aceb798ec4e68ff874d9eb0fc1f0b49fb176275135254772e3c9d77afe0752d2bb08993b3a137791a8cd776bc3459e9fc23e617033b61f3ad9bad71ea815c12bd0f5cd8cd3744885d95183ad41feb060c34664e493f375b3b051e3c2b674b627ffd4b83d181227a8ebfdd0eebb34ed985ba21f140177d162233a7219650625bd5747324613d4b6a050cc81b928b3a4541357f14fe8b"
+    },
+    {
+      "name": "git-file-configured-scope",
+      "kind": "git-file",
+      "context": {
+        "format": "kist-git-v1",
+        "organization": "example-org",
+        "project": "project-a",
+        "profile": "team_a",
+        "repository": "app-config",
+        "path": "secrets/secrets_team_a.yml"
+      },
+      "plaintext_hex": "64617461626173653a0a202070617373776f72643a207333637233740a6170693a0a2020746f6b656e3a206162633132330a",
+      "envelope_hex": "4b4953540101010000010000000000020004b2bfe95bd9638425d2b254d63e0f7d1c1f8e4df8cf1ff723e235c48d8fcb0f7eeb99fdaea8175788ce8e592f3f79cf013de7aeb37da86c91617b29091c6efbb7e0f785f24eae9367f606f2bf165bb00f98c0b0dea507081ece2ea193777919ec6b7b68c7deb986fb929907d95d10b26cdbb1b7012f27e4ff2a5de0bc31e7388e353ce585fb8b25726978524a8351dd4db1ede07066a9701d13bee884e1a0e6e906f3beac7e3f37be98c5336a171bdc9a3f516df1c98b3f83c58c"
+    },
+    {
+      "name": "share-file",
+      "kind": "share-file",
+      "context": {
+        "format": "kist-share-v1",
+        "profile": "team_a"
+      },
+      "plaintext_hex": "64617461626173653a0a202070617373776f72643a207333637233740a6170693a0a2020746f6b656e3a206162633132330a",
+      "envelope_hex": "4b495354010101000001000000000002000438d967ec40a5d5387437418c34c0bd924420a60fbcb717d2d604355757d711175c3af9850877f9802ae15a1f94cec1ae5c1fca72823ea8c8fe1ee22f2f9a7d87e9783719c912f36f2c5e8d4362e529a109bb691b0ccead2a076b1e66c792a11e3e933eb728244a49fd7572093886bd0923efa79e7f49e9458f31daaf08a95835b48525aea746cc5e8d26f0c0e993c0dc70a291291b2ea66211f4b757e0355ab99b77b8b56b1787503ffc6120b38c70a18ff082ca9a3770b3b6bb"
+    },
+    {
+      "name": "database-key-bundle-and-record",
+      "kind": "database",
+      "scope_ids": {
+        "organization_id": "00000000-0000-4000-8000-000000000001",
+        "project_id": "00000000-0000-4000-8000-000000000002",
+        "profile_id": "00000000-0000-4000-8000-000000000003"
+      },
+      "key_bundles_row": {
+        "id": "00000000-0000-4000-8000-000000000004",
+        "access_mode": "password-wrap-v1",
+        "bundle_version": 1,
+        "wrapped_bundle_hex": "4b4953540101010000010000000000020004b31b5be60edbb87d712fd3eb0e54a6154e2be8132a67296067063df8c203404b70cc6a94f181532c7a185f5745014c8ae87a89b33c181959803da9ad5df0454bebf86d9ec9239362b2907aa223fb6042b50d707cb9c78b860c46f83b7e9b3809b23484bbba728505582ceba845abe882f82ef5f33f49fc5013165a78977e26d3f2d851cae723f7cbf9ddd18ff35b5359d3339952a30057b7ef9c6dbafa38c48728deb91853eb6d5702866bc055a34d0ef1d58e64351e36614fd3bea1a7bb26459fc8ea8a7b756ab1aab4732a"
+      },
+      "bundle_context": {
+        "format": "kist-db-key-bundle-v1",
+        "organization_id": "00000000-0000-4000-8000-000000000001",
+        "project_id": "00000000-0000-4000-8000-000000000002",
+        "profile_id": "00000000-0000-4000-8000-000000000003",
+        "bundle_id": "00000000-0000-4000-8000-000000000004",
+        "bundle_version": "1",
+        "access_mode": "password-wrap-v1"
+      },
+      "content_key_hex": "5e976b4de06d88b5e397bf8c44f45300fe0c6f41c0a90ebced5426ab4d4263db",
+      "index_key_hex": "c95017f33f87803787d45e4b79592ad2c770ea9e75264a70212b608f447f9628",
+      "secrets_row": {
+        "id": "00000000-0000-4000-8000-000000000005",
+        "lookup_token_hex": "71ffd6a4a03bda2fd9fff8eedd663d3e54fa0be2f1b08a3f35a67e286fc45039",
+        "key_bundle_id": "00000000-0000-4000-8000-000000000004",
+        "crypto_version": 1,
+        "secret_version": 3,
+        "encrypted_blob_hex": "4b53545201f99ae0f7c587857accfd462e2f043dd73cfed5b0ab9a748a0dd4718bd2fd9a2cb710340eac457d3190da5cba9750c16172d83832ce0a8f2017c34ca6d65f8c78e2c878ee31469da9"
+      },
+      "secret_key": "database.password",
+      "secret_value": "s3cr3t"
+    }
+  ]
+}
