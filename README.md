@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/badge/pypi-v0.2.6-blue?logo=pypi&amp;logoColor=white" alt="PyPI" /></a>
+  <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/badge/pypi-v0.2.7-blue?logo=pypi&amp;logoColor=white" alt="PyPI" /></a>
   <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/pypi/pyversions/kist?logo=python&amp;logoColor=white" alt="Python versions" /></a>
   <a href="https://github.com/nitonrock/kist/actions/workflows/tests.yml"><img src="https://github.com/nitonrock/kist/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
   <a href="https://github.com/nitonrock/kist/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License" /></a>
@@ -726,7 +726,7 @@ kist status
 `kist status` is read-only and shows everything in one place:
 
 ```text
-Git filter command: /home/you/project/.venv/bin/kist (kist 0.2.6, project virtual environment): OK
+Git filter command: /home/you/project/.venv/bin/kist (kist 0.2.7, project virtual environment): OK
 Git clean filter: OK
 Git smudge filter: OK
 Git diff driver: OK
@@ -1346,6 +1346,14 @@ git diff --cached
 If a real credential was staged in plaintext, remove it, rotate it if needed, and use the approved Kist workflow. If you believe it is a false positive, adjust policy deliberately rather than treating `--no-verify` as a normal workflow.
 
 ## Development and release notes
+
+Releases are built and published by GitHub Actions ([`release.yml`](https://github.com/nitonrock/kist/blob/main/.github/workflows/release.yml)) when a version tag is pushed, using [PyPI Trusted Publishing](https://docs.pypi.org/trusted-publishers/): no PyPI token exists to leak. Each file carries a signed [attestation](https://docs.pypi.org/attestations/) linking it to this repository and workflow. To check a release before installing it:
+
+```bash
+uvx pypi-attestations verify pypi --repository https://github.com/nitonrock/kist pypi:kist-0.2.7-py3-none-any.whl
+```
+
+Releases up to 0.2.6 were uploaded manually and have no attestation.
 
 Kist is designed to be understandable before it is expansive. If you find a security issue, report it privately through the repository’s security-advisory process rather than opening a public issue with exploit details.
 
