@@ -169,7 +169,7 @@ The trade-off is honest: you own backups, key custody and access control. Kist k
 - It is **not** a replacement for Vault, a cloud secret manager or an identity platform.
 - It does **not** support cloud KMS or HSM yet.
 - It does **not** protect a secret once an authorised application has decrypted it.
-- It does **not** make Git protections impossible to bypass: `git -c filter.kist.clean=cat commit` remains an effective way to shoot oneself in the foot. (`git commit --no-verify` only skips the hook; the filter still encrypts.) The required CI guard is what catches it ([Local hook limits](#local-hook-limits)).
+- It does **not** stop someone determined to commit plaintext: switching off Kist's filter for one command is still an effective way to shoot oneself in the foot. Only the required CI guard catches it.
 
 Kist reduces moving parts; it does not replace operational judgement, backups or the uncomfortable meeting after a leaked credential.
 
