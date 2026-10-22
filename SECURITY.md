@@ -30,5 +30,6 @@ repository: do not install it, and please report it.
 ## Scope notes
 
 Kist has not yet undergone an independent security audit. See the
-[Security boundaries](README.md#security-boundaries) section for what Kist does and
-does not protect against.
+[threat model](THREAT_MODEL.md) for what Kist protects, from whom, and where it stops,
+and the [format specification](FORMAT.md) for the exact bytes. Reports that show the
+threat model is wrong are welcome too.
