@@ -1119,7 +1119,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.13"   # Kist requires Python 3.13+
+          python-version: "3.13"   # Kist requires Python 3.11+
       - run: pip install kist
       # No KIST_PASSWORD here: CI handles ciphertext only.
       - run: kist export secrets/gateway.yaml -o rootfs/usr/share/gateway/gateway.kist --rev "$GITHUB_REF_NAME"
