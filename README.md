@@ -279,9 +279,9 @@ Like passwords in `~/.kist/pwd_<profile>`, the other settings can live in files 
 
 ```text
 ~/.kist/
-├── pwd_ma_jpn      # password of profile ma_jpn
+├── pwd_team_a      # password of profile team_a
 ├── env             # settings for all profiles on this machine
-└── env_ma_jpn      # settings for profile ma_jpn only
+└── env_team_a      # settings for profile team_a only
 ```
 
 `~/.kist/env`:
@@ -295,11 +295,11 @@ KIST_ORG_ID=nitonrock
 KIST_PROJECT_ID=markets
 ```
 
-`~/.kist/env_ma_jpn` (only what differs for this profile):
+`~/.kist/env_team_a` (only what differs for this profile):
 
 ```sh
-KIST_PROJECT_ID=japan
-KIST_REPOSITORY_ID=trading-config
+KIST_PROJECT_ID=project-a
+KIST_REPOSITORY_ID=app-config
 ```
 
 Each setting is looked up on its own, first match wins:
@@ -309,7 +309,7 @@ Each setting is looked up on its own, first match wins:
 3. `~/.kist/env`;
 4. Kist's built-in default (`local`, `default`, `local-repository`, no database).
 
-With the files above, profile `ma_jpn` gets `KIST_ORG_ID=nitonrock` (from `env`), `KIST_PROJECT_ID=japan` (from `env_ma_jpn`, overriding `env`) and `KIST_REPOSITORY_ID=trading-config`. A profile without its own file uses `env` entirely.
+With the files above, profile `team_a` gets `KIST_ORG_ID=nitonrock` (from `env`), `KIST_PROJECT_ID=project-a` (from `env_team_a`, overriding `env`) and `KIST_REPOSITORY_ID=app-config`. A profile without its own file uses `env` entirely.
 
 | Setting | `env_<profile>` | `env` |
 |---|---|---|
@@ -326,10 +326,10 @@ Rules:
 - **`kist status` shows each value and where it came from,** with the database password masked:
 
 ```text
-- ma_jpn: secrets/secrets_ma_jpn.yml; password source: local password file (~/.kist/pwd_ma_jpn); opens committed version: OK
+- team_a: secrets/secrets_team_a.yml; password source: local password file (~/.kist/pwd_team_a); opens committed version: OK
     KIST_ORG_ID=nitonrock (~/.kist/env)
-    KIST_PROJECT_ID=japan (~/.kist/env_ma_jpn)
-    KIST_REPOSITORY_ID=trading-config (~/.kist/env_ma_jpn)
+    KIST_PROJECT_ID=project-a (~/.kist/env_team_a)
+    KIST_REPOSITORY_ID=app-config (~/.kist/env_team_a)
     KIST_DATABASE_URL=postgresql://kist:***@127.0.0.1:5432/kist (~/.kist/env)
 ```
 
@@ -682,7 +682,7 @@ Edit the file, then `git add` and commit as usual; Git stores only ciphertext. W
 - **Locked files.** When no password opens a file at checkout, Kist leaves it encrypted in the working tree instead of failing, as git-crypt does. Applications reading it fail; commits, checkouts and diffs keep working. In multi-team repositories each developer sees plaintext only for their own profiles. Content that is not a Kist envelope is still refused.
 - **Stable ciphertext.** Encryption is randomised, so `git add` reuses the existing envelope when the plaintext has not changed. Untouched files never show up as modified and commits contain only real changes. Password rotation always re-encrypts; set `KIST_FRESH_ENCRYPTION=1` to force it manually.
 - **Renames.** Each envelope is bound to its path. After `git mv`, re-encrypt for the new path with `git add --renormalize <new-path>`; the pre-commit guard blocks the commit until you do.
-- **Password check.** Before re-encrypting a changed file, Kist checks that the password it found also opens the version already in Git. If not (typically a `KIST_PASSWORD` meant for another profile), `git add` stops with "the password for profile 'ma_jpn' (from KIST_PASSWORD) does not open the version already in Git", instead of silently switching the file to another password. Content that only a retired password opens is accepted, and moves to the current password. `kist profile rotate` changes passwords on purpose; `KIST_ALLOW_PASSWORD_CHANGE=1` allows it for one command. The check costs nothing extra in the normal case: the previous version is decrypted anyway to keep ciphertext stable.
+- **Password check.** Before re-encrypting a changed file, Kist checks that the password it found also opens the version already in Git. If not (typically a `KIST_PASSWORD` meant for another profile), `git add` stops with "the password for profile 'team_a' (from KIST_PASSWORD) does not open the version already in Git", instead of silently switching the file to another password. Content that only a retired password opens is accepted, and moves to the current password. `kist profile rotate` changes passwords on purpose; `KIST_ALLOW_PASSWORD_CHANGE=1` allows it for one command. The check costs nothing extra in the normal case: the previous version is decrypted anyway to keep ciphertext stable.
 
 Kist will not silently overwrite an unrelated pre-commit hook. Review the hook first, then use the explicit force option only when appropriate.
 
@@ -733,7 +733,7 @@ Git diff driver: OK
 Git merge driver: OK
 ...
 Profiles:
-- ma_jpn: secrets/secrets_ma_jpn.yml; password source: local password file (~/.kist/pwd_ma_jpn); opens committed version: OK
+- team_a: secrets/secrets_team_a.yml; password source: local password file (~/.kist/pwd_team_a); opens committed version: OK
 ```
 
 It warns when the recorded `kist` is missing or a different version than the one you run, and when no password opens a committed file. Other commands (`kist lock`, `kist export`, …) print a one-line hint when this clone's setup is missing or broken; repairs go through `kist init`, which is safe to re-run.
@@ -743,8 +743,8 @@ It warns when the recorded `kist` is missing or a different version than the one
 Files in your working copy are plaintext, so attaching one to an email sends readable secrets. Use `kist share` instead:
 
 ```bash
-kist share secrets/secrets_ma_jpn.yml                 # writes ~/secrets_ma_jpn.yml.kist
-kist share secrets/secrets_ma_jpn.yml -o ~/Desktop/ma_jpn.kist
+kist share secrets/secrets_team_a.yml                 # writes ~/secrets_team_a.yml.kist
+kist share secrets/secrets_team_a.yml -o ~/Desktop/team_a.kist
 ```
 
 - It encrypts the file **as you see it now** (uncommitted edits included, with a note) with the profile's usual password.
@@ -754,8 +754,8 @@ kist share secrets/secrets_ma_jpn.yml -o ~/Desktop/ma_jpn.kist
 The recipient runs:
 
 ```bash
-kist show secrets_ma_jpn.yml.kist                          # prints it; nothing written to disk
-kist show secrets_ma_jpn.yml.kist -o secrets/secrets_ma_jpn.yml --force   # into their own repository
+kist show secrets_team_a.yml.kist                          # prints it; nothing written to disk
+kist show secrets_team_a.yml.kist -o secrets/secrets_team_a.yml --force   # into their own repository
 ```
 
 They need the profile password, sent through another channel than the file. `kist show` finds the profile from the file name, `~/.kist/pwd_*` or `KIST_PASSWORD_*`, or takes `--profile`. It also prints envelopes taken from this repository (for example with `git show HEAD:<file>`). For devices and offline builds, use `kist export`, which keeps the exact committed envelope.

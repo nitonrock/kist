@@ -51,10 +51,10 @@ def write(directory: Path, name: str, text: str, mode: int = 0o600) -> Path:
 
 def test_profile_file_overrides_machine_file_per_setting(kist_dir):
     write(kist_dir, "env", "KIST_ORG_ID=nitonrock\nKIST_PROJECT_ID=markets\n")
-    write(kist_dir, "env_ma_jpn", "KIST_PROJECT_ID=japan\nKIST_REPOSITORY_ID=trading-config\n")
-    assert kist_setting_with_source("KIST_ORG_ID", "ma_jpn") == ("nitonrock", "~/.kist/env")
-    assert kist_setting_with_source("KIST_PROJECT_ID", "ma_jpn") == ("japan", "~/.kist/env_ma_jpn")
-    assert kist_setting_with_source("KIST_REPOSITORY_ID", "ma_jpn") == ("trading-config", "~/.kist/env_ma_jpn")
+    write(kist_dir, "env_team_a", "KIST_PROJECT_ID=project-a\nKIST_REPOSITORY_ID=app-config\n")
+    assert kist_setting_with_source("KIST_ORG_ID", "team_a") == ("nitonrock", "~/.kist/env")
+    assert kist_setting_with_source("KIST_PROJECT_ID", "team_a") == ("project-a", "~/.kist/env_team_a")
+    assert kist_setting_with_source("KIST_REPOSITORY_ID", "team_a") == ("app-config", "~/.kist/env_team_a")
     # Another profile without its own file uses ~/.kist/env entirely.
     assert kist_setting_with_source("KIST_PROJECT_ID", "other") == ("markets", "~/.kist/env")
     assert kist_setting_with_source("KIST_REPOSITORY_ID", "other") == (None, "default")
@@ -62,27 +62,27 @@ def test_profile_file_overrides_machine_file_per_setting(kist_dir):
 
 def test_environment_variable_wins_over_both_files(kist_dir, monkeypatch):
     write(kist_dir, "env", "KIST_PROJECT_ID=markets\n")
-    write(kist_dir, "env_ma_jpn", "KIST_PROJECT_ID=japan\n")
+    write(kist_dir, "env_team_a", "KIST_PROJECT_ID=project-a\n")
     monkeypatch.setenv("KIST_PROJECT_ID", "from-ci")
-    assert kist_setting_with_source("KIST_PROJECT_ID", "ma_jpn") == ("from-ci", "environment")
+    assert kist_setting_with_source("KIST_PROJECT_ID", "team_a") == ("from-ci", "environment")
 
 
 def test_empty_environment_variable_falls_through(kist_dir, monkeypatch):
-    write(kist_dir, "env_ma_jpn", "KIST_PROJECT_ID=japan\n")
+    write(kist_dir, "env_team_a", "KIST_PROJECT_ID=project-a\n")
     monkeypatch.setenv("KIST_PROJECT_ID", "")
-    assert kist_setting("KIST_PROJECT_ID", "ma_jpn") == "japan"
+    assert kist_setting("KIST_PROJECT_ID", "team_a") == "project-a"
 
 
 def test_no_files_means_built_in_defaults(kist_dir):
-    assert KistScope.from_environment("ma_jpn") == KistScope("local", "default")
-    assert git_context("ma_jpn", "secrets/secrets_ma_jpn.yml")["repository"] == "local-repository"
+    assert KistScope.from_environment("team_a") == KistScope("local", "default")
+    assert git_context("team_a", "secrets/secrets_team_a.yml")["repository"] == "local-repository"
 
 
 def test_missing_kist_directory_is_fine(tmp_path, monkeypatch):
     monkeypatch.setenv("KIST_DIR", str(tmp_path / "absent"))
     for name in SETTINGS:
         monkeypatch.delenv(name, raising=False)
-    assert kist_setting("KIST_ORG_ID", "ma_jpn") is None
+    assert kist_setting("KIST_ORG_ID", "team_a") is None
 
 
 # --- file format and safety ----------------------------------------------------
@@ -109,13 +109,13 @@ def test_symlinked_file_is_refused(kist_dir, tmp_path):
 
 
 def test_passwords_are_refused_in_settings_files(kist_dir):
-    write(kist_dir, "env_ma_jpn", "KIST_PASSWORD_MA_JPN=nope\n")
+    write(kist_dir, "env_team_a", "KIST_PASSWORD_TEAM_A=nope\n")
     with pytest.raises(KistError, match="pwd_<profile>"):
-        kist_setting("KIST_ORG_ID", "ma_jpn")
+        kist_setting("KIST_ORG_ID", "team_a")
 
 
 def test_unknown_and_profile_names_are_refused(kist_dir):
-    write(kist_dir, "env", "KIST_PROFILE=ma_jpn\n")
+    write(kist_dir, "env", "KIST_PROFILE=team_a\n")
     with pytest.raises(KistError, match="KIST_PROFILE cannot be set"):
         kist_setting("KIST_ORG_ID")
     write(kist_dir, "env", "NOT_KIST=1\n")
@@ -124,9 +124,9 @@ def test_unknown_and_profile_names_are_refused(kist_dir):
 
 
 def test_machine_settings_are_refused_in_profile_files(kist_dir):
-    write(kist_dir, "env_ma_jpn", "KIST_TLS_MODE=disable\n")
-    with pytest.raises(KistError, match="KIST_TLS_MODE cannot be set in env_ma_jpn"):
-        kist_setting("KIST_ORG_ID", "ma_jpn")
+    write(kist_dir, "env_team_a", "KIST_TLS_MODE=disable\n")
+    with pytest.raises(KistError, match="KIST_TLS_MODE cannot be set in env_team_a"):
+        kist_setting("KIST_ORG_ID", "team_a")
 
 
 def test_machine_env_file_controls_production_tls_policy(kist_dir):
@@ -139,11 +139,11 @@ def test_machine_env_file_controls_production_tls_policy(kist_dir):
 
 def test_kist_uses_profile_database_url_and_scope(kist_dir):
     write(kist_dir, "env", "KIST_DATABASE_URL=postgresql://kist:machine@127.0.0.1:5432/kist\nKIST_ORG_ID=acme\n")
-    write(kist_dir, "env_ma_jpn", "KIST_DATABASE_URL=postgresql://kist:profile@10.0.0.5:5432/kist\n"
-                                  "KIST_PROJECT_ID=japan\n")
-    store = Kist(profile_name="ma_jpn", password=PASSWORD)
+    write(kist_dir, "env_team_a", "KIST_DATABASE_URL=postgresql://kist:profile@10.0.0.5:5432/kist\n"
+                                  "KIST_PROJECT_ID=project-a\n")
+    store = Kist(profile_name="team_a", password=PASSWORD)
     assert "10.0.0.5" in store.db_url
-    assert store.scope == KistScope("acme", "japan")
+    assert store.scope == KistScope("acme", "project-a")
     other = Kist(profile_name="other", password=PASSWORD)
     assert "127.0.0.1" in other.db_url and other.scope == KistScope("acme", "default")
 
@@ -151,9 +151,9 @@ def test_kist_uses_profile_database_url_and_scope(kist_dir):
 @pytest.mark.skipif(shutil.which("git") is None, reason="git not installed")
 def test_git_filters_use_settings_files_without_environment(kist_dir, tmp_path, monkeypatch):
     """The IDE case: no KIST_* variables at all, everything from ~/.kist."""
-    write(kist_dir, "pwd_ma_jpn", PASSWORD)
+    write(kist_dir, "pwd_team_a", PASSWORD)
     write(kist_dir, "env", "KIST_ORG_ID=nitonrock\n")
-    write(kist_dir, "env_ma_jpn", "KIST_PROJECT_ID=japan\nKIST_REPOSITORY_ID=trading-config\n")
+    write(kist_dir, "env_team_a", "KIST_PROJECT_ID=project-a\nKIST_REPOSITORY_ID=app-config\n")
     root = tmp_path / "repo"
     root.mkdir()
     monkeypatch.chdir(root)
@@ -170,34 +170,34 @@ def test_git_filters_use_settings_files_without_environment(kist_dir, tmp_path, 
     git("config", "filter.kist.smudge", f"{kist} --smudge %f")
     git("config", "diff.kist.textconv", f"{kist} --textconv")
     (root / "secrets").mkdir()
-    (root / "secrets" / "secrets_ma_jpn.yml").write_text("# Japan\ndb_password: example-1\n")
+    (root / "secrets" / "secrets_team_a.yml").write_text("# Team A\ndb_password: example-1\n")
     minimal = {"HOME": str(tmp_path), "KIST_DIR": str(kist_dir), "PATH": os.environ["PATH"]}
     assert git("add", "-A", env=minimal).returncode == 0
     assert git("commit", "-q", "-m", "init", env=minimal).returncode == 0
-    stored = subprocess.run(["git", "cat-file", "blob", "HEAD:secrets/secrets_ma_jpn.yml"],
+    stored = subprocess.run(["git", "cat-file", "blob", "HEAD:secrets/secrets_team_a.yml"],
                             capture_output=True, check=True).stdout
     assert is_kist_envelope(stored)
-    context = git_context("ma_jpn", "secrets/secrets_ma_jpn.yml")
+    context = git_context("team_a", "secrets/secrets_team_a.yml")
     assert (context["organization"], context["project"], context["repository"]) == (
-        "nitonrock", "japan", "trading-config")
-    shown = git("show", "--textconv", "HEAD:secrets/secrets_ma_jpn.yml", env=minimal)
+        "nitonrock", "project-a", "app-config")
+    shown = git("show", "--textconv", "HEAD:secrets/secrets_team_a.yml", env=minimal)
     assert "db_password: example-1" in shown.stdout
     # With other identifiers the same password no longer opens the file.
     wrong = dict(minimal, KIST_PROJECT_ID="markets")
-    assert "example-1" not in git("show", "--textconv", "HEAD:secrets/secrets_ma_jpn.yml", env=wrong).stdout
+    assert "example-1" not in git("show", "--textconv", "HEAD:secrets/secrets_team_a.yml", env=wrong).stdout
 
 
 def test_status_shows_sources(kist_dir, tmp_path, monkeypatch, capsys):
-    write(kist_dir, "pwd_ma_jpn", PASSWORD)
+    write(kist_dir, "pwd_team_a", PASSWORD)
     write(kist_dir, "env", "KIST_ORG_ID=nitonrock\nKIST_DATABASE_URL=postgresql://kist:hidden-db-pw@127.0.0.1:9/kist\n")
-    write(kist_dir, "env_ma_jpn", "KIST_PROJECT_ID=japan\n")
+    write(kist_dir, "env_team_a", "KIST_PROJECT_ID=project-a\n")
     project = tmp_path / "project"
     (project / "secrets").mkdir(parents=True)
-    (project / "secrets" / "secrets_ma_jpn.yml").write_text("a: 1\n")
+    (project / "secrets" / "secrets_team_a.yml").write_text("a: 1\n")
     monkeypatch.chdir(project)
     run_status()
     out = capsys.readouterr().out
     assert "KIST_ORG_ID=nitonrock (~/.kist/env)" in out
-    assert "KIST_PROJECT_ID=japan (~/.kist/env_ma_jpn)" in out
+    assert "KIST_PROJECT_ID=project-a (~/.kist/env_team_a)" in out
     assert "KIST_REPOSITORY_ID=local-repository (default)" in out
     assert "hidden-db-pw" not in out and "(~/.kist/env)" in out

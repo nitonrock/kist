@@ -247,7 +247,7 @@ def main() -> None:
 
     share_parser = subparsers.add_parser(
         "share", help="Write an encrypted, portable copy of a secret file to send to someone")
-    share_parser.add_argument("file", help="Secret file, e.g. secrets/secrets_ma_jpn.yml")
+    share_parser.add_argument("file", help="Secret file, e.g. secrets/secrets_team_a.yml")
     share_parser.add_argument("-o", "--output", default=None,
                               help="Destination outside the repository (default: ~/<file name>.kist)")
     share_parser.add_argument("--profile", default=argparse.SUPPRESS, help="Profile override (default: from the file name)")
@@ -255,7 +255,7 @@ def main() -> None:
 
     show_parser = subparsers.add_parser(
         "show", help="Print an encrypted Kist file (from kist share or a repository) without writing it to disk")
-    show_parser.add_argument("file", help="Encrypted file, e.g. secrets_ma_jpn.yml.kist")
+    show_parser.add_argument("file", help="Encrypted file, e.g. secrets_team_a.yml.kist")
     show_parser.add_argument("-o", "--output", default=None, help="Write the plaintext to this file (mode 600) instead")
     show_parser.add_argument("--profile", default=argparse.SUPPRESS, help="Profile override")
     show_parser.add_argument("--force", "-f", action="store_true", help="Overwrite an existing --output file")
