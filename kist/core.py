@@ -9,7 +9,7 @@ bundle. Names and values are encrypted together; exact name lookup uses HMAC.
 All mutations through this module share a transaction-scoped profile lock.
 
 No KMS, recipients, Guard, key caching, automatic content-Password rotation,
-collection-completeness proof, or rollback protection is implemented here.
+collection-completeness proof, or protection against old versions being put back is implemented here.
 Future access constructions must have explicit versions and fail closed.
 Profile labels, row counts, sizes, revisions, and access patterns remain visible.
 """

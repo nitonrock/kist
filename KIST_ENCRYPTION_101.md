@@ -254,7 +254,7 @@ kist_organizations
 
 ### Schema Guarantees:
 1. **No Plaintext Secret Names:** names (like `stripe.secret_key`) are never stored in database columns or sent as query parameters; lookups use 32-byte HMAC tokens. Organization, project and profile names are stored in clear.
-2. **Versioned Records:** every write increments `secret_version`, and the version is bound to the ciphertext. This does **not** prevent rollback: someone who can write to the database can restore an older row as a whole. Kist has no rollback protection and no proof that the set of rows is complete.
+2. **Versioned Records:** every write increments `secret_version`, and the version is bound to the ciphertext. This does **not** stop old versions being put back: someone who can write to the database can restore an older row as a whole, and Kist opens it without warning. Nothing proves that the set of rows is complete either.
 3. **Transaction Advisory Locking:** writes take a PostgreSQL advisory lock (`pg_advisory_xact_lock`) scoped to the profile, with automatic retries, so concurrent writers cannot interleave.
 4. **Rotation Isolation:** `kist profile rotate` re-encrypts all rows of a profile under `SELECT ... FOR UPDATE`.
 5. **Real-Time Cache Synchronization:** writes send PostgreSQL `NOTIFY kist_secret_updated`, allowing runtime stores (`DynamicSecretStore`) to invalidate in-memory caches.

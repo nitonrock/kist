@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/badge/pypi-v0.2.8-blue?logo=pypi&amp;logoColor=white" alt="PyPI" /></a>
+  <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/badge/pypi-v0.2.9-blue?logo=pypi&amp;logoColor=white" alt="PyPI" /></a>
   <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/pypi/pyversions/kist?logo=python&amp;logoColor=white" alt="Python versions" /></a>
   <a href="https://github.com/nitonrock/kist/actions/workflows/tests.yml"><img src="https://github.com/nitonrock/kist/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
   <a href="https://github.com/nitonrock/kist/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License" /></a>
@@ -96,7 +96,8 @@ The full setup, including production TLS, is in [Quick start](#quick-start).
 | Extra infrastructure | PostgreSQL (you likely have it) | None (+ KMS optional) | None | None | Vault cluster | SaaS or self-hosted server |
 | Encryption | Argon2id → AES-256-GCM, scope-bound AAD | AES-256-GCM, age / PGP / cloud KMS | AES-256-CTR, GPG | None | AES-256-GCM | AES-256-GCM |
 | Multi-team / multi-profile isolation | ✅ per-profile passwords, path-based routing | ⚠️ via `.sops.yaml` rules | ⚠️ multiple keys | ❌ | ✅ policies | ✅ projects/envs |
-| Anti-transplant / rollback protection | ✅ context + version bound | ⚠️ MAC per file | ❌ | ❌ | n/a | n/a |
+| Anti-transplant (content can't be moved to another file or row) | ✅ bound to path, profile, scope and row | ⚠️ MAC per file, not bound to the path | ❌ | ❌ | n/a | n/a |
+| Old versions can't be put back | ❌ an older genuine version opens without warning ([threat model](https://github.com/nitonrock/kist/blob/main/THREAT_MODEL.md#known-limits)) | ❌ | ❌ | ❌ | n/a | n/a |
 | Cloud KMS / HSM | 🔜 planned | ✅ | ❌ | ❌ | ✅ | ✅ |
 | Per-person access | ❌ one shared password per profile; 🔜 optional per-member delivery ([planned](#kist-and-sops-candidly)) | ✅ one key per person (age, PGP, KMS) | ✅ GPG users | ❌ | ✅ | ✅ |
 | File formats | ⚠️ YAML only | ✅ YAML, JSON, ENV, INI, binary | ✅ any file | `.env` | n/a | n/a |
@@ -728,7 +729,7 @@ kist status
 `kist status` is read-only and shows everything in one place:
 
 ```text
-Git filter command: /home/you/project/.venv/bin/kist (kist 0.2.8, project virtual environment): OK
+Git filter command: /home/you/project/.venv/bin/kist (kist 0.2.9, project virtual environment): OK
 Git clean filter: OK
 Git smudge filter: OK
 Git diff driver: OK
@@ -1238,7 +1239,7 @@ Kist is deliberately explicit about what it protects and what it does not. The f
 - A leaked profile password.
 - A developer intentionally bypassing Kist's Git filter (for example `git -c filter.kist.clean=cat`) or committing from a clone without `kist init`; only a required CI guard catches it.
 - A Git server, CI system, database administrator, or operating-system administrator compromised at a higher trust level.
-- Deletion, rollback, availability failures, or backup loss unless your infrastructure handles them.
+- Deletion, old versions being put back, availability failures, or backup loss unless your infrastructure handles them.
 - Business-sensitive metadata in logical secret names, project names, or environment variables.
 
 Do not put plaintext secret values, bearer tokens, passwords, or private keys into:
@@ -1269,7 +1270,7 @@ kist_organizations
 - **`kist_secrets`**:
   - `lookup_token`: 32-byte HMAC-SHA256 hash of the secret name (zero plaintext secret names in the database).
   - `encrypted_blob`: AES-256-GCM encrypted payload containing `{"key": ..., "value": ...}` bound to scope, bundle ID, and version via authenticated additional data (AAD).
-  - `secret_version`: Monotonically incremented version number preventing rollback and transplantation attacks.
+  - `secret_version`: incremented on every write and bound to the ciphertext. It does not stop someone with database write access from putting an older row back.
   - `updated_at`: Timestamp of the latest mutation.
 
 The database stores encrypted values and wrapped keys, never profile passwords or plaintext secret names. The profile password remains external to PostgreSQL.

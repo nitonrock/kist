@@ -178,7 +178,7 @@ with the context:
 
 A reader must also check that the decrypted payload has exactly the keys `key` and `value`, that the name is valid, and that recomputing the lookup token from the decrypted name gives the row's `lookup_token` (constant-time). Duplicate JSON keys and non-finite numbers are rejected.
 
-Each write increments `secret_version`. The version is bound to the ciphertext, but an attacker who can write to the database can still restore an older row as a whole: format version 1 has **no rollback protection** and no proof that the set of rows is complete.
+Each write increments `secret_version`. The version is bound to the ciphertext, but an attacker who can write to the database can still restore an older row as a whole: in format version 1, **old versions can be put back** without warning, and nothing proves that the set of rows is complete.
 
 ## Local password files
 
