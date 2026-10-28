@@ -11,7 +11,7 @@ definitions:
         name: Kist leak guard
         script:
           - apt-get update -qq && apt-get install -y -qq --no-install-recommends git >/dev/null
-          - pip install --quiet --root-user-action=ignore "kist==0.2.8"
+          - pip install --quiet --root-user-action=ignore "kist==0.2.9"
           # Must match what developers use when they commit:
           - export KIST_ORG_ID=local KIST_PROJECT_ID=default
           - kist pre-commit-guard --all-files
@@ -29,7 +29,7 @@ pipelines:
           deployment: production
           script:
             - apt-get update -qq && apt-get install -y -qq --no-install-recommends git >/dev/null
-            - pip install --quiet --root-user-action=ignore "kist==0.2.8"
+            - pip install --quiet --root-user-action=ignore "kist==0.2.9"
             - export KIST_ENV=production KIST_TLS_MODE=require KIST_ORG_ID=local KIST_PROJECT_ID=default
             - kist lock --all            # --prune deletes keys removed from YAML
       - step:
