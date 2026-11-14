@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/badge/pypi-v0.2.9-blue?logo=pypi&amp;logoColor=white" alt="PyPI" /></a>
+  <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/badge/pypi-v0.2.10-blue?logo=pypi&amp;logoColor=white" alt="PyPI" /></a>
   <a href="https://pypi.org/project/kist/"><img src="https://img.shields.io/pypi/pyversions/kist?logo=python&amp;logoColor=white" alt="Python versions" /></a>
   <a href="https://github.com/nitonrock/kist/actions/workflows/tests.yml"><img src="https://github.com/nitonrock/kist/actions/workflows/tests.yml/badge.svg" alt="Tests" /></a>
   <a href="https://github.com/nitonrock/kist/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License" /></a>
@@ -364,7 +364,7 @@ Run this once per repository, **before** you `git add` any secret file:
 kist init
 ```
 
-`kist init` registers the Kist clean/smudge filters, adds the `secrets*.yaml` rules to `.gitattributes`, ignores `.kist/`, and installs the pre-commit leak guard. From then on, `git add secrets/<profile>.yaml` stores an encrypted envelope while your working copy stays plaintext. Without it, Git commits secret files in plaintext.
+`kist init` registers the Kist clean/smudge filters, adds the `secrets*.yaml` rules to `.gitattributes`, ignores `.kist/`, installs the pre-commit leak guard, and decrypts any existing encrypted secret files in the working directory whose profile passwords are available (leaving plaintext files and locked profiles untouched). From then on, `git add secrets/<profile>.yaml` stores an encrypted envelope while your working copy stays plaintext. Without it, Git commits secret files in plaintext.
 
 Each developer must run `kist init` after cloning, because Git filter configuration lives in the local `.git/config` and is never shared through the repository. See [Git workflow](#git-workflow) for details, and `kist diagnose` if a file is not being encrypted.
 
@@ -622,7 +622,7 @@ Inside a Git work tree, and again after every fresh clone:
 kist init
 ```
 
-Kist configures local clean/smudge filters and the diff and merge drivers, appends missing Kist rules to `.gitattributes`, adds `.kist/` to `.gitignore`, and installs a local pre-commit guard when safe to do so.
+Kist configures local clean/smudge filters and the diff and merge drivers, appends missing Kist rules to `.gitattributes`, adds `.kist/` to `.gitignore`, installs a local pre-commit guard when safe to do so, and makes accessible encrypted working files readable while leaving plaintext files and locked profiles untouched.
 
 Expected Kist attribute rules include:
 
@@ -729,7 +729,7 @@ kist status
 `kist status` is read-only and shows everything in one place:
 
 ```text
-Git filter command: /home/you/project/.venv/bin/kist (kist 0.2.9, project virtual environment): OK
+Git filter command: /home/you/project/.venv/bin/kist (kist 0.2.10, project virtual environment): OK
 Git clean filter: OK
 Git smudge filter: OK
 Git diff driver: OK

@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -182,3 +183,197 @@ def test_log_follow_decrypts_across_rename(repo):
     log = git("log", "-p", "--follow", "--", "secrets/secrets_device.yaml").stdout
     assert "+  api_key: example-two" in log
     assert "+  api_key: example-one" in log                 # the original commit, at the old path
+
+
+def test_init_decrypts_encrypted_working_files_when_password_available(repo, monkeypatch):
+    """1. Encrypted file with the correct available profile password: decrypted on disk.
+    8. Comments and formatting survive byte-for-byte.
+    11. Git index and history remain unchanged.
+    """
+    custom_yaml = (
+        "# Top level comment\n"
+        "cloud:\n"
+        "  # Service API key\n"
+        "  api_key: example-secret-val\n"
+        "\n"
+        "  region: us-east-1\n"
+    )
+    (repo / "secrets" / "device.yaml").write_text(custom_yaml)
+    git("add", "secrets/device.yaml")
+    git("commit", "-q", "-m", "add device secret")
+    head_before = git("rev-parse", "HEAD").stdout.strip()
+    index_before = git("rev-parse", ":secrets/device.yaml").stdout.strip()
+
+    # Simulate fresh clone or locked state: working file contains stored ciphertext blob
+    envelope_data = blob(":secrets/device.yaml")
+    assert envelope_data.startswith(b"KIST")
+    (repo / "secrets" / "device.yaml").write_bytes(envelope_data)
+
+    monkeypatch.setenv("KIST_PASSWORD_DEVICE", DEVICE_PW)
+    run_git_setup(install_hook=False)
+
+    decrypted_text = (repo / "secrets" / "device.yaml").read_text()
+    assert decrypted_text == custom_yaml
+    # Index and history remain unchanged
+    assert git("rev-parse", "HEAD").stdout.strip() == head_before
+    assert git("rev-parse", ":secrets/device.yaml").stdout.strip() == index_before
+
+
+def test_init_already_plaintext_unchanged_and_not_rewritten(repo, monkeypatch):
+    """2. Already-plaintext file, including local edits: unchanged byte-for-byte and not rewritten."""
+    local_edit = "# Local uncommitted edits\ncloud:\n  api_key: local-draft\n"
+    target = repo / "secrets" / "device.yaml"
+    target.write_text(local_edit)
+    mtime_before = target.stat().st_mtime_ns
+
+    monkeypatch.setenv("KIST_PASSWORD_DEVICE", DEVICE_PW)
+    run_git_setup(install_hook=False)
+
+    assert target.read_text() == local_edit
+    assert target.stat().st_mtime_ns == mtime_before
+
+
+def test_init_encrypted_file_without_password_unchanged(repo, monkeypatch):
+    """3. Encrypted file without an available password: unchanged, initialization continues."""
+    envelope_data = blob(":secrets/device.yaml")
+    target = repo / "secrets" / "device.yaml"
+    target.write_bytes(envelope_data)
+
+    monkeypatch.delenv("KIST_PASSWORD_DEVICE", raising=False)
+    monkeypatch.delenv("KIST_PASSWORD", raising=False)
+    run_git_setup(install_hook=False)
+
+    assert target.read_bytes() == envelope_data
+
+
+def test_init_incorrect_password_or_corrupted_envelope_warns_and_continues(repo, monkeypatch, capsys):
+    """4. Incorrect password or corrupted envelope: unchanged, warning reported, other files still processed."""
+    device_envelope = blob(":secrets/device.yaml")
+    corrupt_envelope = device_envelope[:120] + b"\xff" * 40 + device_envelope[160:]
+    (repo / "secrets" / "corrupt.yaml").write_bytes(corrupt_envelope)
+    (repo / "secrets" / "device.yaml").write_bytes(device_envelope)
+
+    monkeypatch.setenv("KIST_PASSWORD_CORRUPT", "some-password")
+    monkeypatch.setenv("KIST_PASSWORD_DEVICE", DEVICE_PW)
+
+    run_git_setup(install_hook=False)
+    err = capsys.readouterr().err
+    assert "corrupt.yaml: decryption failed; leaving file encrypted" in err
+
+    # Corrupt file remains untouched ciphertext
+    assert (repo / "secrets" / "corrupt.yaml").read_bytes() == corrupt_envelope
+    # Valid file is still decrypted
+    assert "example-one" in (repo / "secrets" / "device.yaml").read_text()
+
+
+def test_init_multiple_profiles_partial_passwords(repo, monkeypatch):
+    """5. Multiple profiles with only some passwords available: only accessible files decrypted."""
+    (repo / "secrets" / "device.yaml").write_bytes(blob(":secrets/device.yaml"))
+    (repo / "secrets" / "payments.yaml").write_bytes(blob(":secrets/payments.yaml"))
+
+    monkeypatch.setenv("KIST_PASSWORD_DEVICE", DEVICE_PW)
+    monkeypatch.delenv("KIST_PASSWORD_PAYMENTS", raising=False)
+    monkeypatch.delenv("KIST_PASSWORD", raising=False)
+
+    run_git_setup(install_hook=False)
+
+    assert "example-one" in (repo / "secrets" / "device.yaml").read_text()
+    assert (repo / "secrets" / "payments.yaml").read_bytes().startswith(b"KIST")
+
+
+def test_init_repeated_initialization_idempotent(repo, monkeypatch):
+    """6. Repeated initialization: no further changes to already-decrypted files."""
+    (repo / "secrets" / "device.yaml").write_bytes(blob(":secrets/device.yaml"))
+    monkeypatch.setenv("KIST_PASSWORD_DEVICE", DEVICE_PW)
+
+    run_git_setup(install_hook=False)
+    target = repo / "secrets" / "device.yaml"
+    assert "example-one" in target.read_text()
+    mtime_first = target.stat().st_mtime_ns
+
+    run_git_setup(install_hook=False)
+    assert "example-one" in target.read_text()
+    assert target.stat().st_mtime_ns == mtime_first
+
+
+def test_init_password_becomes_available_between_runs(repo, monkeypatch):
+    """7. A password becomes available between initialization runs: the next run decrypts the corresponding file."""
+    (repo / "secrets" / "device.yaml").write_bytes(blob(":secrets/device.yaml"))
+    (repo / "secrets" / "payments.yaml").write_bytes(blob(":secrets/payments.yaml"))
+
+    # Run 1: only DEVICE_PW is available
+    monkeypatch.setenv("KIST_PASSWORD_DEVICE", DEVICE_PW)
+    monkeypatch.delenv("KIST_PASSWORD_PAYMENTS", raising=False)
+    monkeypatch.delenv("KIST_PASSWORD", raising=False)
+    run_git_setup(install_hook=False)
+
+    assert "example-one" in (repo / "secrets" / "device.yaml").read_text()
+    assert (repo / "secrets" / "payments.yaml").read_bytes().startswith(b"KIST")
+
+    # Run 2: PAY_PW becomes available
+    monkeypatch.setenv("KIST_PASSWORD_PAYMENTS", PAY_PW)
+    run_git_setup(install_hook=False)
+
+    assert "example-one" in (repo / "secrets" / "device.yaml").read_text()
+    assert "example-pay-one" in (repo / "secrets" / "payments.yaml").read_text()
+
+
+def test_init_working_tree_ciphertext_differs_from_committed_version(repo, monkeypatch):
+    """9. Current working-file ciphertext differs from the indexed or committed version:
+    the working-file content is what gets decrypted.
+    """
+    from kist.core import encrypt_envelope, git_context
+
+    different_plaintext = b"cloud:\n  api_key: working-tree-uncommitted-version\n"
+    context = git_context("device", "secrets/device.yaml")
+    different_envelope = encrypt_envelope(different_plaintext, DEVICE_PW, context)
+
+    (repo / "secrets" / "device.yaml").write_bytes(different_envelope)
+    monkeypatch.setenv("KIST_PASSWORD_DEVICE", DEVICE_PW)
+
+    run_git_setup(install_hook=False)
+
+    assert (repo / "secrets" / "device.yaml").read_bytes() == different_plaintext
+
+
+def test_init_concurrent_modification_safeguard(repo, monkeypatch, capsys):
+    """10. Write failure or concurrent file modification: no partial overwrite or loss of the original content."""
+    original_envelope = blob(":secrets/device.yaml")
+    target = repo / "secrets" / "device.yaml"
+    target.write_bytes(original_envelope)
+
+    # Simulate modification during init by altering file right after first read
+    real_read_bytes = Path.read_bytes
+    reads_count = 0
+
+    def mock_read_bytes(self):
+        nonlocal reads_count
+        data = real_read_bytes(self)
+        if self == target:
+            reads_count += 1
+            if reads_count == 2:
+                # Second read (verification check before replace): return modified bytes
+                return original_envelope + b"# concurrent modification"
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", mock_read_bytes)
+    monkeypatch.setenv("KIST_PASSWORD_DEVICE", DEVICE_PW)
+
+    run_git_setup(install_hook=False)
+    err = capsys.readouterr().err
+    assert "file changed during initialization; skipping" in err
+    assert target.read_bytes() == original_envelope
+
+
+def test_init_symlinks_ignored(repo, monkeypatch):
+    """Do not follow symlinks or modify files outside scope."""
+    outside_file = repo.parent / "outside_secrets.yaml"
+    outside_file.write_bytes(blob(":secrets/device.yaml"))
+    symlink_path = repo / "secrets" / "symlink_device.yaml"
+    symlink_path.symlink_to(outside_file)
+
+    monkeypatch.setenv("KIST_PASSWORD_SYMLINK_DEVICE", DEVICE_PW)
+    run_git_setup(install_hook=False)
+
+    assert symlink_path.is_symlink()
+    assert outside_file.read_bytes().startswith(b"KIST")

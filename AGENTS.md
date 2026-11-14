@@ -58,7 +58,7 @@ High-signal invariants, workflows and conventions for AI agents and contributors
 A generic password must never override another profile's own password. `kist lock --all` ignores the generic password unless `KIST_PROFILE` is set. Retired passwords (`pwd_<p>.old-<ts>`, `KIST_RETIRED_PASSWORDS_<P>`) are for decryption only.
 
 ### F. Separation of concerns
-- `kist init` is purely local (attributes, filters, diff and merge drivers, hook) and upgrades old attribute rules in place. No network, no database.
+- `kist init` is purely local (attributes, filters, diff and merge drivers, hook, decrypting accessible encrypted working files) and upgrades old attribute rules in place. No network, no database.
 - `kist status` is read-only and is the single place for setup checks (filter command and version, drivers, password sources, whether each committed file opens). Other user-facing commands only print a one-line hint from `setup_hint()`; repairs go through `kist init`.
 - `kist init-db` is the only DDL command.
 

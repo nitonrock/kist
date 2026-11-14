@@ -288,8 +288,8 @@ def _kist_filtered(paths: list[str], cwd: str | None) -> list[str]:
     return [fields[i] for i in range(0, len(fields) - 2, 3) if fields[i + 2] == "kist"]
 
 
-def _candidate_paths(history: bool) -> tuple[str | None, list[str]]:
-    top = _git_lines("rev-parse", "--show-toplevel")
+def _candidate_paths(history: bool, cwd: str | Path | None = None) -> tuple[str | None, list[str]]:
+    top = _git_lines("rev-parse", "--show-toplevel", cwd=str(cwd) if cwd else None)
     root = top[0].strip() if top else None
     if history:
         paths = sorted(set(_git_lines("log", "--all", "--format=", "--name-only", "-z", cwd=root)))
@@ -550,6 +550,111 @@ def configure_git_drivers(command: str) -> None:
     subprocess.run(["git", "config", "merge.kist.driver", f"{command} --merge %O %A %B %P %L"], check=True)
 
 
+def _decrypt_working_file(root: Path, rel_path: str) -> bool:
+    """Decrypt an encrypted working-tree secret file if its profile password is available.
+
+    Returns True if the file was decrypted, False otherwise.
+    Leaves plaintext files, locked profiles (no password), or unverified files untouched.
+    """
+    file_path = root / rel_path
+    if file_path.is_symlink() or os.path.islink(file_path):
+        return False
+    if not file_path.is_file():
+        return False
+    try:
+        file_path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+
+    try:
+        raw = file_path.read_bytes()
+    except OSError:
+        return False
+
+    if not is_kist_envelope(raw):
+        return False
+
+    try:
+        profile = profile_from_path(rel_path)
+    except KistError:
+        return False
+
+    password = get_profile_password(profile)
+    if not password:
+        return False
+
+    context = git_context(profile, rel_path)
+    try:
+        plaintext, retired = decrypt_with_password_history(raw, profile, context, password)
+    except (KistError, UnicodeDecodeError):
+        print(f"kist: warning: {rel_path}: decryption failed; leaving file encrypted.", file=sys.stderr)
+        return False
+
+    if retired:
+        print(f"kist: {rel_path}: opened with retired password {retired} (older content).", file=sys.stderr)
+
+    try:
+        stat_before = file_path.stat()
+        mode = stat_before.st_mode & 0o777
+    except OSError:
+        mode = 0o600
+
+    tmp_path: Path | None = None
+    try:
+        tmp_fd, tmp_path_str = tempfile.mkstemp(dir=file_path.parent, prefix=f".{file_path.name}.kist-init-")
+        tmp_path = Path(tmp_path_str)
+        with os.fdopen(tmp_fd, "wb") as handle:
+            handle.write(plaintext)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        try:
+            os.chmod(tmp_path, mode)
+        except OSError:
+            pass
+
+        try:
+            current_raw = file_path.read_bytes()
+        except OSError:
+            tmp_path.unlink(missing_ok=True)
+            print(f"kist: warning: {rel_path}: file changed during initialization; skipping.", file=sys.stderr)
+            return False
+
+        if current_raw != raw:
+            tmp_path.unlink(missing_ok=True)
+            print(f"kist: warning: {rel_path}: file changed during initialization; skipping.", file=sys.stderr)
+            return False
+
+        os.replace(tmp_path, file_path)
+        tmp_path = None
+        return True
+    except OSError as exc:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        print(f"kist: warning: {rel_path}: failed to update working copy ({exc}); leaving file encrypted.", file=sys.stderr)
+        return False
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+def decrypt_working_secret_files(root: Path | str | None = None) -> list[str]:
+    """Decrypt accessible encrypted working files in-place during kist init."""
+    top_root = Path(root) if root is not None else None
+    if top_root is None:
+        top = _git_lines("rev-parse", "--show-toplevel")
+        top_root = Path(top[0].strip()) if top else None
+    if top_root is None or not top_root.is_dir():
+        return []
+
+    _, paths = _candidate_paths(history=False, cwd=top_root)
+    decrypted = []
+    for rel_path in sorted(set(paths)):
+        if _decrypt_working_file(top_root, rel_path):
+            decrypted.append(rel_path)
+    return decrypted
+
+
 def run_git_setup(*, force_hook: bool = False, install_hook: bool = True, kist_path: str | None = None) -> None:
     """Configure Git filters without overwriting unrelated repository configuration."""
     if not _is_git_repo():
@@ -565,6 +670,8 @@ def run_git_setup(*, force_hook: bool = False, install_hook: bool = True, kist_p
     hook_changed = False
     if install_hook:
         hook_changed = _install_hook(Path(".git") / "hooks" / "pre-commit", force=force_hook)
+
+    decrypt_working_secret_files()
 
     changes = []
     if attributes_changed:

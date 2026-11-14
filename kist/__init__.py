@@ -47,6 +47,7 @@ from kist.core import (
 from kist.file_store import FileKist
 from kist.fix import run_diagnose, run_fix
 from kist.git import (
+    decrypt_working_secret_files,
     git_clean_stream,
     git_smudge_stream,
     print_hook,
@@ -119,6 +120,7 @@ __all__ = [
     "database_tls_mode",
     "safe_db_connect",
     "safe_async_db_connect",
+    "decrypt_working_secret_files",
     "run_git_setup",
     "run_leak_guard",
     "git_clean_stream",
