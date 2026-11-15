@@ -15,6 +15,7 @@ from kist.core import (
     DecryptionError,
     KistError,
     MissingKeyError,
+    configured_profile,
     decrypt_with_password_history,
     get_profile_password,
     git_context,
@@ -114,7 +115,7 @@ def lock_all(lock: Callable[[str, str, str, bool], tuple[int, int]], prune: bool
         relative = repo_relative(path)
         # The generic KIST_PASSWORD is ambiguous across many profiles: --all only
         # uses it for the profile named by KIST_PROFILE.
-        strict_generic = bool(os.getenv("KIST_PROFILE", "").strip())
+        strict_generic = configured_profile() is not None
         password = get_profile_password(profile, allow_generic=strict_generic)
         if not password:
             result.skipped.append((relative, profile))
@@ -138,7 +139,7 @@ def print_lock_all(result: LockAllResult, scope_for: Callable[[str], Any]) -> No
         print(f"locked   {path} -> {scope.organization}/{scope.project}/{profile} ({locked} secrets{extra})")
     for path, profile in result.skipped:
         print(f"skipped  {path} (no KIST_PASSWORD_{profile.upper()} in this job)")
-    if result.skipped and os.getenv("KIST_PASSWORD") and not os.getenv("KIST_PROFILE"):
+    if result.skipped and os.getenv("KIST_PASSWORD") and configured_profile() is None:
         print("note: the generic KIST_PASSWORD is not used by --all; set KIST_PASSWORD_<PROFILE> per profile.")
     for path, profile, error in result.failed:
         print(f"FAILED   {path} [{profile}]: {error}", file=sys.stderr)

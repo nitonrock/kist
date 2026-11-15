@@ -20,11 +20,13 @@ from pathlib import Path
 from typing import BinaryIO, TextIO
 
 from kist.core import (
+    MACHINE_FILE_SETTINGS,
     DecryptionError,
     InvalidEnvelopeError,
     KistError,
     MissingKeyError,
     _canonical_aad,
+    configured_profile,
     decrypt_envelope,
     decrypt_with_password_history,
     encrypt_envelope,
@@ -34,7 +36,9 @@ from kist.core import (
     is_kist_envelope,
     profile_from_path,
     profile_password_source,
+    read_settings_file,
     retired_profile_passwords,
+    settings_file_path,
 )
 
 HIGH_CONFIDENCE_PATTERNS = [
@@ -638,6 +642,21 @@ def _decrypt_working_file(root: Path, rel_path: str) -> bool:
             tmp_path.unlink(missing_ok=True)
 
 
+def _refresh_index_metadata(root: Path) -> None:
+    """Refresh stat data only: never pass paths, which could update blob entries.
+
+    Git may return 1 when unrelated files have real changes. That is expected;
+    refreshing metadata must not stage or discard those changes.
+    """
+    result = subprocess.run(
+        ["git", "update-index", "--refresh"], cwd=root,
+        capture_output=True, check=False,
+    )
+    if result.returncode not in (0, 1) or result.stderr:
+        print("kist: warning: Git index metadata refresh failed; "
+              "working files were not staged. Run git status to inspect.", file=sys.stderr)
+
+
 def decrypt_working_secret_files(root: Path | str | None = None) -> list[str]:
     """Decrypt accessible encrypted working files in-place during kist init."""
     top_root = Path(root) if root is not None else None
@@ -652,6 +671,8 @@ def decrypt_working_secret_files(root: Path | str | None = None) -> list[str]:
     for rel_path in sorted(set(paths)):
         if _decrypt_working_file(top_root, rel_path):
             decrypted.append(rel_path)
+    if decrypted:
+        _refresh_index_metadata(top_root)
     return decrypted
 
 
@@ -660,6 +681,9 @@ def run_git_setup(*, force_hook: bool = False, install_hook: bool = True, kist_p
     if not _is_git_repo():
         raise KistError("Not inside a Git repository. Initialize Git explicitly before running `kist init` (run `git init`).")
 
+    # Reject invalid machine settings before changing local Git configuration.
+    read_settings_file(settings_file_path(), MACHINE_FILE_SETTINGS)
+    configured_profile()
     command, location, warn = kist_command(kist_path)
     configure_git_drivers(command)
 

@@ -14,11 +14,17 @@ from kist.core import (
     Kist,
     KistError,
     KistScope,
+    configured_profile,
     enforce_ssl_url,
+    get_profile_and_password,
+    get_profile_password,
     git_context,
     is_kist_envelope,
     kist_setting,
     kist_setting_with_source,
+    profile_password_source,
+    resolve_profile_name,
+    resolve_secret_file_path,
 )
 from kist.status import run_status
 
@@ -114,10 +120,7 @@ def test_passwords_are_refused_in_settings_files(kist_dir):
         kist_setting("KIST_ORG_ID", "team_a")
 
 
-def test_unknown_and_profile_names_are_refused(kist_dir):
-    write(kist_dir, "env", "KIST_PROFILE=team_a\n")
-    with pytest.raises(KistError, match="KIST_PROFILE cannot be set"):
-        kist_setting("KIST_ORG_ID")
+def test_unknown_settings_are_refused(kist_dir):
     write(kist_dir, "env", "NOT_KIST=1\n")
     with pytest.raises(KistError, match="expected KIST_NAME=value"):
         kist_setting("KIST_ORG_ID")
@@ -201,3 +204,116 @@ def test_status_shows_sources(kist_dir, tmp_path, monkeypatch, capsys):
     assert "KIST_PROJECT_ID=project-a (~/.kist/env_team_a)" in out
     assert "KIST_REPOSITORY_ID=local-repository (default)" in out
     assert "hidden-db-pw" not in out and "(~/.kist/env)" in out
+
+
+# --- default profile resolution and file routing ------------------------------
+
+def test_machine_default_profile_is_accepted(kist_dir):
+    write(kist_dir, "env", "KIST_PROFILE=team_a\nKIST_ORG_ID=acme\n")
+    assert configured_profile() == "team_a"
+    assert resolve_profile_name() == "team_a"
+    assert kist_setting("KIST_ORG_ID", "team_b") == "acme"
+    assert kist_setting_with_source("KIST_PROFILE") == ("team_a", "~/.kist/env")
+
+
+def test_default_profile_precedence(kist_dir, monkeypatch):
+    write(kist_dir, "env", "KIST_PROFILE=team_a\n")
+    monkeypatch.setenv("KIST_PROFILE", "team_b")
+    assert resolve_profile_name() == "team_b"
+    assert resolve_profile_name("team_c") == "team_c"
+    assert kist_setting_with_source("KIST_PROFILE") == ("team_b", "environment")
+
+
+def test_empty_profile_environment_uses_machine_default(kist_dir, monkeypatch):
+    write(kist_dir, "env", "KIST_PROFILE=team_a\n")
+    monkeypatch.setenv("KIST_PROFILE", "  ")
+    assert resolve_profile_name() == "team_a"
+
+
+def test_absent_profile_uses_default(kist_dir):
+    assert configured_profile() is None
+    assert resolve_profile_name() == "default"
+
+
+def test_profile_default_is_not_allowed_in_profile_settings(kist_dir):
+    write(kist_dir, "env_team_a", "KIST_PROFILE=team_b\n")
+    with pytest.raises(KistError, match="KIST_PROFILE cannot be set in env_team_a"):
+        kist_setting("KIST_ORG_ID", "team_a")
+
+
+def test_invalid_default_profile_is_rejected(kist_dir):
+    write(kist_dir, "env", "KIST_PROFILE=../other\n")
+    with pytest.raises(KistError):
+        resolve_profile_name()
+
+
+def test_runtime_uses_machine_default_unless_explicit(kist_dir):
+    write(kist_dir, "env", "KIST_PROFILE=team_a\n")
+    assert Kist().profile_name == "team_a"
+    assert Kist(profile_name="team_b").profile_name == "team_b"
+
+
+def test_default_secret_path_uses_machine_profile(kist_dir, tmp_path, monkeypatch):
+    write(kist_dir, "env", "KIST_PROFILE=team_a\n")
+    monkeypatch.chdir(tmp_path)
+    assert resolve_secret_file_path() == "secrets_team_a.yaml"
+
+
+def test_file_profile_is_independent_of_default(kist_dir, monkeypatch):
+    write(kist_dir, "env", "KIST_PROFILE=team_a\n")
+    write(kist_dir, "pwd_team_b", "example-team-b-file-password")
+    monkeypatch.setenv("KIST_PASSWORD", "example-team-a-generic-password")
+    assert get_profile_and_password("secrets/secrets_team_b.yml") == (
+        "team_b", "example-team-b-file-password")
+    assert profile_password_source("team_b") == "file"
+    monkeypatch.setenv("KIST_PASSWORD_TEAM_B", "example-team-b-env-password")
+    assert get_profile_and_password("secrets/secrets_team_b.yml") == (
+        "team_b", "example-team-b-env-password")
+
+
+def test_generic_password_is_bound_to_machine_default(kist_dir, monkeypatch):
+    write(kist_dir, "env", "KIST_PROFILE=team_a\n")
+    write(kist_dir, "pwd_team_a", "example-team-a-file-password")
+    monkeypatch.setenv("KIST_PASSWORD", "example-team-a-generic-password")
+    assert get_profile_password("team_a") == "example-team-a-generic-password"
+    assert get_profile_password("team_b") is None
+    monkeypatch.setenv("KIST_PASSWORD_TEAM_A", "example-team-a-env-password")
+    assert get_profile_password("team_a") == "example-team-a-env-password"
+
+
+def test_environment_default_rebinds_generic_password(kist_dir, monkeypatch):
+    write(kist_dir, "env", "KIST_PROFILE=team_a\n")
+    monkeypatch.setenv("KIST_PROFILE", "team_b")
+    monkeypatch.setenv("KIST_PASSWORD", "example-team-b-generic-password")
+    assert get_profile_password("team_a") is None
+    assert get_profile_password("team_b") == "example-team-b-generic-password"
+
+
+def test_lock_all_generic_password_uses_configured_default(kist_dir, monkeypatch):
+    from kist import ci
+
+    write(kist_dir, "env", "KIST_PROFILE=team_a\n")
+    monkeypatch.setenv("KIST_PASSWORD", "example-team-a-generic-password")
+    monkeypatch.setattr(ci, "tracked_secret_files", lambda: [
+        "secrets/team_a.yaml", "secrets/team_b.yaml"])
+    monkeypatch.setattr(ci, "repo_relative", lambda path: path)
+    monkeypatch.setattr(ci, "read_yaml_for_lock", lambda *args: "a: 1\n")
+    calls = []
+
+    def lock(profile, password, text, prune):
+        calls.append((profile, password))
+        return 1, 0
+
+    result = ci.lock_all(lock)
+    assert calls == [("team_a", "example-team-a-generic-password")]
+    assert result.skipped == [("secrets/team_b.yaml", "team_b")]
+    assert result.failed == []
+
+
+def test_status_reports_default_profile_source(kist_dir, tmp_path, monkeypatch, capsys):
+    write(kist_dir, "env", "KIST_PROFILE=team_a\n")
+    project = tmp_path / "empty-project"
+    project.mkdir()
+    monkeypatch.chdir(project)
+    run_status()
+    assert "Default profile: team_a (~/.kist/env)" in capsys.readouterr().out

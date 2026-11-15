@@ -377,3 +377,53 @@ def test_init_symlinks_ignored(repo, monkeypatch):
 
     assert symlink_path.is_symlink()
     assert outside_file.read_bytes().startswith(b"KIST")
+
+
+def test_init_refresh_preserves_staged_and_unstaged_changes(repo, monkeypatch):
+    from kist.git import decrypt_working_secret_files
+
+    head_before = git("rev-parse", "HEAD").stdout
+    (repo / "staged.txt").write_text("staged example\n")
+    git("add", "staged.txt")
+    (repo / "staged.txt").write_text("unstaged example\n")
+    index_before = git("ls-files", "--stage", "-z").stdout
+    target = repo / "secrets" / "device.yaml"
+    target.write_bytes(blob(":secrets/device.yaml"))
+
+    monkeypatch.setenv("KIST_PROFILE", "payments")
+    result = decrypt_working_secret_files(repo)
+
+    assert "secrets/device.yaml" in result
+    assert target.read_bytes() == b"cloud:\n  api_key: example-one\n"
+    assert git("status", "--porcelain", "--", "secrets/").stdout == ""
+    assert git("ls-files", "--stage", "-z").stdout == index_before
+    assert git("rev-parse", "HEAD").stdout == head_before
+    assert blob(":staged.txt") == b"staged example\n"
+    assert (repo / "staged.txt").read_bytes() == b"unstaged example\n"
+
+
+def test_refresh_metadata_never_passes_positional_paths(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import kist.git as git_module
+
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return SimpleNamespace(returncode=1, stderr=b"")
+
+    monkeypatch.setattr(git_module.subprocess, "run", run)
+    git_module._refresh_index_metadata(tmp_path)
+    assert calls[0][0] == ["git", "update-index", "--refresh"]
+    assert calls[0][1]["cwd"] == tmp_path
+
+
+def test_init_does_not_refresh_when_no_file_was_decrypted(repo, monkeypatch):
+    import kist.git as git_module
+
+    def unexpected_refresh(root):
+        pytest.fail("Plaintext files must not trigger an index refresh")
+
+    monkeypatch.setattr(git_module, "_refresh_index_metadata", unexpected_refresh)
+    assert git_module.decrypt_working_secret_files(repo) == []
