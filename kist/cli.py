@@ -14,6 +14,7 @@ from kist.core import (
     get_profile_and_password,
     get_profile_password,
     remove_profile_password,
+    resolve_profile_name,
     resolve_secret_file_path,
 )
 from kist.fix import run_diagnose, run_fix
@@ -299,7 +300,8 @@ def main() -> None:
                 run_git_setup(force_hook=args.force_hook, install_hook=not args.no_hook, kist_path=args.kist_path)
             return
         if args.command == "init-db":
-            kist = Kist(profile_name=args.profile or "default", scope=_scope_from_args(args, args.profile or "default"))
+            profile_name = resolve_profile_name(args.profile)
+            kist = Kist(profile_name=profile_name, scope=_scope_from_args(args, profile_name))
             kist.init_db()
             print("Kist database schema initialized successfully.")
             return
@@ -368,7 +370,7 @@ def main() -> None:
             return
         if args.command in {"delete", "rm"}:
             explicit_profile = getattr(args, "profile", None)
-            profile_name = explicit_profile or os.getenv("KIST_PROFILE", "default")
+            profile_name = resolve_profile_name(explicit_profile)
             password = get_profile_password(profile_name)
             bypass_prompt = getattr(args, "force", False) or getattr(args, "yes", False)
             if not bypass_prompt and sys.stdin.isatty():
@@ -449,7 +451,7 @@ def main() -> None:
             return
         if args.command in {"lock", "unlock"}:
             explicit_profile = getattr(args, "profile", None)
-            active_profile = explicit_profile or os.getenv("KIST_PROFILE", "default")
+            active_profile = resolve_profile_name(explicit_profile)
 
             if getattr(args, "file", None):
                 target_file = resolve_secret_file_path(args.file)

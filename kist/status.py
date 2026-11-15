@@ -9,6 +9,7 @@ from pathlib import Path
 
 from kist.core import (
     KistError,
+    configured_profile,
     decrypt_with_password_history,
     get_profile_password,
     git_context,
@@ -197,6 +198,13 @@ def run_status() -> int:
     print("Kist status")
     print("=" * 50)
     healthy = True
+    try:
+        profile = configured_profile() or "default"
+        _, source = kist_setting_with_source("KIST_PROFILE")
+        print(f"Default profile: {profile} ({source}); Git files use their path's profile")
+    except (KistError, OSError):
+        print("Default profile: invalid or inaccessible configuration")
+        healthy = False
     in_repo = _inside_git_repo()
 
     if not in_repo:

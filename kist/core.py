@@ -285,7 +285,7 @@ def _profile_env_names(profile: str) -> list[str]:
 
 def _generic_password_applies(profile: str) -> bool:
     """KIST_PASSWORD belongs to KIST_PROFILE when that is set; otherwise it is a last-resort fallback."""
-    active = os.getenv("KIST_PROFILE", "").strip()
+    active = configured_profile()
     return not active or active == profile
 
 
@@ -301,7 +301,7 @@ def _password_sources(profile: str, allow_env: bool, allow_local_file: bool, all
     """
     sources: list[str] = list(_profile_env_names(profile)) if allow_env else []
     generic = allow_env and allow_generic and _generic_password_applies(profile)
-    explicit_active = bool(os.getenv("KIST_PROFILE", "").strip())
+    explicit_active = configured_profile() is not None
     if generic and explicit_active:
         sources.append("KIST_PASSWORD")
     if allow_local_file:
@@ -337,7 +337,9 @@ def password_history_enabled() -> bool:
 # the built-in default. Files hold KIST_NAME=value lines and are never executed.
 PROFILE_FILE_SETTINGS = ("KIST_ORG_ID", "KIST_PROJECT_ID", "KIST_REPOSITORY_ID", "KIST_DATABASE_URL")
 # Machine-wide only: one TLS/production policy per machine, whatever the profile.
-MACHINE_FILE_SETTINGS = PROFILE_FILE_SETTINGS + ("KIST_ENV", "KIST_TLS_MODE", "KIST_USE_RETIRED_PASSWORDS")
+MACHINE_FILE_SETTINGS = PROFILE_FILE_SETTINGS + (
+    "KIST_ENV", "KIST_TLS_MODE", "KIST_USE_RETIRED_PASSWORDS", "KIST_PROFILE",
+)
 _MAX_SETTINGS_BYTES = 64 * 1024
 
 def settings_file_path(profile: str | None = None) -> Path:
@@ -405,6 +407,23 @@ def kist_setting_with_source(name: str, profile: str | None = None) -> tuple[str
 
 def kist_setting(name: str, profile: str | None = None) -> str | None:
     return kist_setting_with_source(name, profile)[0]
+
+def configured_profile() -> str | None:
+    """Optional default profile: process environment, then the machine settings file.
+
+    Never read a default profile from env_<profile>; file-based operations still
+    select their target profile from their path.
+    """
+    value = kist_setting("KIST_PROFILE")
+    return _validate_profile_name(value) if value and value.strip() else None
+
+
+def resolve_profile_name(explicit: str | None = None) -> str:
+    """Resolve an unspecified CLI/runtime profile without changing file routing."""
+    if explicit is not None:
+        return _validate_profile_name(explicit)
+    return configured_profile() or "default"
+
 
 def retired_profile_password_files(profile_name: str) -> list[Path]:
     """Retired local passwords kept by 'kist profile rotate', newest first."""
@@ -500,7 +519,7 @@ def resolve_secret_file_path(path_or_name: str | None = None, profile: str | Non
         name = path_or_name if path_or_name.endswith((".yaml", ".yml")) else f"{path_or_name}.yaml"
         return os.path.join("secrets", name) if os.path.isdir("secrets") else name
 
-    target_profile = _validate_profile_name(profile or os.getenv("KIST_PROFILE", "default"))
+    target_profile = resolve_profile_name(profile)
     if target_profile == "default":
         candidates = [
             os.path.join("secrets", "default.yaml"),
@@ -791,8 +810,7 @@ class Kist:
     """
     def __init__(self, profile_name: str | None = None, password: str | None = None,
                  db_url: str | None = None, scope: KistScope | None = None) -> None:
-        resolved_profile = profile_name if profile_name is not None else os.getenv("KIST_PROFILE", "default")
-        self.profile_name = _validate_profile_name(resolved_profile)
+        self.profile_name = resolve_profile_name(profile_name)
         self.scope = (scope or KistScope.from_environment(self.profile_name)).validated()
         self.password = password if password is not None else get_profile_password(self.profile_name)
         if self.password is not None:
