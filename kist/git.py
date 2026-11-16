@@ -597,6 +597,10 @@ def _decrypt_working_file(root: Path, rel_path: str) -> bool:
     if retired:
         print(f"kist: {rel_path}: opened with retired password {retired} (older content).", file=sys.stderr)
 
+    checkout = _checkout_indexed_secret(root, rel_path, raw, plaintext)
+    if checkout is not None:
+        return checkout
+
     try:
         stat_before = file_path.stat()
         mode = stat_before.st_mode & 0o777
@@ -642,12 +646,9 @@ def _decrypt_working_file(root: Path, rel_path: str) -> bool:
             tmp_path.unlink(missing_ok=True)
 
 
-def _refresh_index_metadata(root: Path) -> None:
-    """Refresh stat data only: never pass paths, which could update blob entries.
 
-    Git may return 1 when unrelated files have real changes. That is expected;
-    refreshing metadata must not stage or discard those changes.
-    """
+def _refresh_index_metadata(root: Path) -> None:
+    """Refresh metadata only; do not pass positional paths or stage content."""
     result = subprocess.run(
         ["git", "update-index", "--refresh"], cwd=root,
         capture_output=True, check=False,
@@ -817,3 +818,92 @@ def run_leak_guard(all_files: bool = False) -> int:
             print("kist: rotate exposed credentials if this value is real, then use an approved secret workflow.", file=sys.stderr)
             return 1
     return 0
+
+
+def _checkout_indexed_secret(
+    root: Path, rel_path: str, raw: bytes, plaintext: bytes,
+) -> bool | None:
+    """Materialize unchanged indexed ciphertext through Git's smudge filter.
+
+    None selects the existing manual-decryption path for local ciphertext edits
+    or untracked files. False means checkout was unsafe or failed.
+    """
+    entry = subprocess.run(
+        ["git", "--literal-pathspecs", "ls-files", "--stage", "-z", "--", rel_path],
+        cwd=root, capture_output=True, check=False,
+    )
+    if entry.returncode:
+        return False
+    records = [record for record in entry.stdout.split(b"\0") if record]
+    if not records:
+        return None
+    if len(records) != 1:
+        return False
+    metadata = records[0].split(b"\t", 1)[0].split()
+    if len(metadata) != 3 or metadata[2] != b"0":
+        return False
+    if metadata[0] not in (b"100644", b"100755"):
+        return False
+    stored = subprocess.run(
+        ["git", "cat-file", "blob", metadata[1].decode("ascii")],
+        cwd=root, capture_output=True, check=False,
+    )
+    if stored.returncode:
+        return False
+    if stored.stdout != raw:
+        return None
+    target = root / rel_path
+    # Preserve an intentional executable-bit edit rather than resetting it.
+    try:
+        if bool(target.stat().st_mode & 0o111) != (metadata[0] == b"100755"):
+            return None
+        if target.is_symlink() or target.read_bytes() != raw:
+            print(f"kist: warning: {rel_path}: file changed during initialization; skipping.", file=sys.stderr)
+            return False
+    except OSError:
+        return False
+
+    backup_dir = Path(tempfile.mkdtemp(prefix=".kist-init-backup-", dir=target.parent))
+    backup = backup_dir / "ciphertext"
+    try:
+        os.replace(target, backup)
+        # Check the moved file too, in case it changed immediately before rename.
+        if backup.is_symlink() or backup.read_bytes() != raw:
+            raise OSError("file changed during initialization")
+        # No force: refuse to overwrite a file created by another process.
+        result = subprocess.run(
+            ["git", "checkout-index", "-u", "--", rel_path],
+            cwd=root, capture_output=True, check=False,
+        )
+        if result.returncode == 0 and not target.is_symlink() and target.read_bytes() == plaintext:
+            try:
+                backup.unlink()
+                backup_dir.rmdir()
+            except OSError:
+                print(
+                    f"kist: warning: {rel_path}: decrypted successfully, "
+                    f"but backup cleanup was incomplete at {backup_dir}.",
+                    file=sys.stderr,
+                )
+            return True
+    except OSError:
+        pass
+
+    # Restore only if the destination is absent. Never overwrite concurrent work.
+    if backup.exists() or backup.is_symlink():
+        try:
+            os.link(backup, target, follow_symlinks=False)
+            backup.unlink()
+        except OSError:
+            print(
+                f"kist: warning: {rel_path}: checkout failed or file changed; "
+                f"original retained at {backup}. Inspect before continuing.",
+                file=sys.stderr,
+            )
+            return False
+    try:
+        backup_dir.rmdir()
+    except OSError:
+        pass
+    print(f"kist: warning: {rel_path}: checkout failed; original file retained.", file=sys.stderr)
+    return False
