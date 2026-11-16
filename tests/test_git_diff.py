@@ -427,3 +427,82 @@ def test_init_does_not_refresh_when_no_file_was_decrypted(repo, monkeypatch):
 
     monkeypatch.setattr(git_module, "_refresh_index_metadata", unexpected_refresh)
     assert git_module.decrypt_working_secret_files(repo) == []
+
+@pytest.mark.parametrize("local_changes", [False, True])
+def test_init_fresh_clone_immediately_clean_without_staging(repo, monkeypatch, local_changes):
+    clone = repo.parent / "fresh-clone"
+    git("clone", "--quiet", str(repo), str(clone))
+    monkeypatch.chdir(clone)
+    device = clone / "secrets/device.yaml"
+    payments = clone / "secrets/payments.yaml"
+    assert device.read_bytes().startswith(b"KIST")
+    assert payments.read_bytes().startswith(b"KIST")
+    monkeypatch.delenv("KIST_PASSWORD_PAYMENTS", raising=False)
+    monkeypatch.delenv("KIST_PASSWORD", raising=False)
+    if local_changes:
+        (clone / "draft.txt").write_text("staged draft\n")
+        git("add", "draft.txt")
+        (clone / "draft.txt").write_text("unstaged draft\n")
+    index_before = git("ls-files", "--stage", "-z").stdout
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "from kist import run_git_setup; run_git_setup(install_hook=False)"],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    status = git("status", "--porcelain=v2", "--untracked-files=no").stdout
+    assert "secrets/device.yaml" not in status
+    assert "secrets/payments.yaml" not in status
+    assert device.read_bytes() == b"cloud:\n  api_key: example-one\n"
+    assert payments.read_bytes().startswith(b"KIST")
+    assert git("ls-files", "--stage", "-z").stdout == index_before
+    if local_changes:
+        assert "draft.txt" in status
+        assert blob(":draft.txt") == b"staged draft\n"
+        assert (clone / "draft.txt").read_bytes() == b"unstaged draft\n"
+    run_git_setup(install_hook=False)
+    assert "secrets/" not in git("status", "--porcelain=v2").stdout
+    assert git("ls-files", "--stage", "-z").stdout == index_before
+
+
+def test_init_checkout_preserves_staged_secret_and_local_plaintext_edit(repo):
+    from kist.git import decrypt_working_secret_files
+
+    target = repo / "secrets/device.yaml"
+    staged = b"cloud:\n  api_key: staged-example-value\n"
+    target.write_bytes(staged)
+    git("add", "secrets/device.yaml")
+    target.write_bytes(blob(":secrets/device.yaml"))
+    other = repo / "secrets/payments.yaml"
+    edited = b"stripe:\n  key: local-uncommitted-example\n"
+    other.write_bytes(edited)
+    before = git("ls-files", "--stage", "-z").stdout
+    decrypt_working_secret_files(repo)
+    status = git("status", "--porcelain=v2").stdout
+    assert target.read_bytes() == staged
+    assert other.read_bytes() == edited
+    assert git("ls-files", "--stage", "-z").stdout == before
+    assert "secrets/payments.yaml" in status
+    assert not list((repo / "secrets").glob(".kist-init-backup-*"))
+
+
+def test_init_checkout_failure_retains_original_ciphertext(repo, monkeypatch):
+    import kist.git as git_module
+
+    target = repo / "secrets/device.yaml"
+    original = blob(":secrets/device.yaml")
+    target.write_bytes(original)
+    before = git("ls-files", "--stage", "-z").stdout
+    real_run = subprocess.run
+
+    def run(command, **kwargs):
+        if command[:2] == ["git", "checkout-index"]:
+            return subprocess.CompletedProcess(command, 1, b"", b"test failure")
+        return real_run(command, **kwargs)
+
+    monkeypatch.setattr(git_module.subprocess, "run", run)
+    git_module.decrypt_working_secret_files(repo)
+    assert target.read_bytes() == original
+    assert git("ls-files", "--stage", "-z").stdout == before
+    assert not list((repo / "secrets").glob(".kist-init-backup-*"))
+
