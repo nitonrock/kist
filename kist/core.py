@@ -36,6 +36,7 @@ import yaml
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+from psycopg.conninfo import conninfo_to_dict
 
 KIST_DATABASE_URL = os.getenv("KIST_DATABASE_URL")
 KEY_MODE_PASSWORD = "password-wrap-v1"  # noqa: S105 - a format label
@@ -622,23 +623,50 @@ def database_tls_mode(db_url: str | None) -> str | None:
     normalized = enforce_ssl_url(db_url)
     return dict(parse_qsl(urlsplit(normalized).query)).get("sslmode") if normalized else None
 
-def _connection_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-    # Keep URL policy from being silently overridden by libpq kwargs.
+_DEFAULT_CONNECTION_OPTIONS = {
+    "connect_timeout": 10,
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 3,
+    "tcp_user_timeout": 20_000,
+}
+
+
+def _connection_kwargs(db_url: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Apply defaults without overriding explicit connection options."""
     if any(k in kwargs for k in ("sslmode", "sslrootcert", "sslcert", "sslkey", "service", "host", "hostaddr")):
         raise KistError("Specify transport settings in the database URL, not connection kwargs.")
-    return kwargs
+    explicit = conninfo_to_dict(db_url, **kwargs)
+    options = dict(kwargs)
+    for name, default in _DEFAULT_CONNECTION_OPTIONS.items():
+        if name in explicit:
+            continue
+        if name == "connect_timeout" and os.getenv("PGCONNECT_TIMEOUT"):
+            continue
+        options[name] = default
+    return options
+
 
 def safe_db_connect(db_url: str, **kwargs: Any) -> psycopg.Connection[Any]:
     try:
-        return psycopg.connect(enforce_ssl_url(db_url), **_connection_kwargs(kwargs))
+        normalized = enforce_ssl_url(db_url)
+        if normalized is None:
+            raise KistError("KIST_DATABASE_URL is not configured.")
+        return psycopg.connect(normalized, **_connection_kwargs(normalized, kwargs))
     except psycopg.OperationalError:
         raise psycopg.OperationalError(f"Database connection failed ({mask_db_url(db_url)}).") from None
 
+
 async def safe_async_db_connect(db_url: str, **kwargs: Any) -> psycopg.AsyncConnection[Any]:
     try:
-        return await psycopg.AsyncConnection.connect(enforce_ssl_url(db_url), **_connection_kwargs(kwargs))
+        normalized = enforce_ssl_url(db_url)
+        if normalized is None:
+            raise KistError("KIST_DATABASE_URL is not configured.")
+        return await psycopg.AsyncConnection.connect(normalized, **_connection_kwargs(normalized, kwargs))
     except psycopg.OperationalError:
         raise psycopg.OperationalError(f"Database connection failed ({mask_db_url(db_url)}).") from None
+
 
 def _canonical_aad(context: dict[str, Any]) -> bytes:
     try:
