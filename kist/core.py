@@ -820,6 +820,8 @@ class Kist:
         self.organization_id: uuid.UUID | None = None
         self.project_id: uuid.UUID | None = None
         self.profile_id: uuid.UUID | None = None
+        import threading
+        self._scope_init_lock = threading.RLock()
 
     @classmethod
     def from_file(cls, path: Any, **kwargs: Any) -> Any:
@@ -878,9 +880,10 @@ class Kist:
         return org, project, profile
 
     def _ensure_scope(self) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
-        if self.organization_id is None or self.project_id is None or self.profile_id is None:
-            return self.get_or_create_scope()
-        return self.organization_id, self.project_id, self.profile_id
+        with self._scope_init_lock:
+            if self.organization_id is None or self.project_id is None or self.profile_id is None:
+                return self.get_or_create_scope()
+            return self.organization_id, self.project_id, self.profile_id
 
     def _scope_context(self) -> dict[str, str]:
         org, project, profile = self._ensure_scope()
@@ -1038,6 +1041,25 @@ class Kist:
                 if row is None:
                     raise KeyError(key)
                 return self._decode_row(bundle, row, key)[1]
+
+    def get_many(self, keys, default: Any = ...) -> dict[str, Any]:
+        """Read requested names in one repeatable-read snapshot with one unlock."""
+        from kist.runtime_reads import get_many
+        return get_many(self, keys, default=default)
+
+    def session(self, *, unlock_ttl_seconds: float = 30.0):
+        """Create a bounded read-only unlock session. Use as a context manager."""
+        from kist.runtime_reads import ReadSession
+        return ReadSession(self, unlock_ttl_seconds)
+
+    def as_async(self):
+        """Return a native-async database reader over this configuration."""
+        from kist.runtime_reads import AsyncKist
+        return AsyncKist(kist=self)
+
+    def async_session(self, *, unlock_ttl_seconds: float = 30.0):
+        """Create the native-async equivalent of session()."""
+        return self.as_async().session(unlock_ttl_seconds=unlock_ttl_seconds)
 
     def delete(self, key: str) -> bool:
         key = _validate_secret_key(key)

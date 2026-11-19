@@ -904,7 +904,11 @@ def test_status_scopes_to_repository_files_only(tmp_path, monkeypatch, capsys):
     assert "staging: secrets/staging.yaml; password source: MISSING" in captured
 
 
-def test_run_fix_workflow(capsys):
+def test_run_fix_workflow(capsys, tmp_path, monkeypatch):
+    import subprocess
+
+    monkeypatch.chdir(tmp_path)
+    subprocess.run(["git", "init"], check=True, capture_output=True)
     with patch("subprocess.run") as mock_run:
         mock_run.return_value.returncode = 0
         run_fix(apply=True)
@@ -1325,6 +1329,7 @@ def test_kist_delete_profile_in_db(mock_db):
 
 
 def test_cli_delete_secret(mock_db, monkeypatch, capsys):
+    monkeypatch.setattr("kist.cli.get_profile_password", lambda *a, **kw: "pwd")
     with patch("psycopg.connect", side_effect=lambda *a, **kw: MockConnection(mock_db)):
         kist_inst = Kist(profile_name="default", password="pwd", db_url="postgresql://mock")
         kist_inst.set("stripe.api_key", "sk_live_123")
