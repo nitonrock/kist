@@ -62,48 +62,20 @@ class TTLSecretStore:
         self.policy = cache_policy or CachePolicy(enabled=True, ttl_seconds=ttl_seconds)
         if self.policy.ttl_seconds <= 0 or self.policy.max_entries <= 0:
             raise ValueError("Cache TTL and maximum entries must be positive.")
-        self._cache: dict[str, tuple[float, Any]] = {}
-        self._lock = threading.Lock()
+        from kist.runtime_reads import SyncCache
+        self._runtime_cache = SyncCache(self.policy)
+        self._cache = self._runtime_cache.entries
 
-    def get(self, key: str, default: Any = ...) -> Any:
-        now = time.monotonic()
-        if self.policy.enabled:
-            with self._lock:
-                cached = self._cache.get(key)
-                if cached and now - cached[0] < self.policy.ttl_seconds:
-                    logger.debug("Cache hit for secret key %r (profile: %s)", key, self.profile_name)
-                    return cached[1]
-                if cached:
-                    logger.debug("Cache expired for secret key %r (profile: %s)", key, self.profile_name)
-                    self._cache.pop(key, None)
-        logger.debug("Cache miss for secret key %r (profile: %s)", key, self.profile_name)
-        try:
-            value = self.kist.get(key)
-        except KeyError:
-            if default is not ...:
-                return default
-            raise
-        if self.policy.enabled:
-            with self._lock:
-                if len(self._cache) >= self.policy.max_entries:
-                    evicted_key = next(iter(self._cache))
-                    self._cache.pop(evicted_key)
-                    logger.debug("Evicted oldest cache entry %r (profile: %s, max_entries: %d)", evicted_key, self.profile_name, self.policy.max_entries)
-                self._cache[key] = (now, value)
-                logger.debug("Cached secret key %r (profile: %s)", key, self.profile_name)
-        return value
+    def get(self, key: str, default: Any=...) -> Any:
+        logger.debug('Lookup for secret key %r (profile: %s)', key, self.profile_name)
+        return self._runtime_cache.get(key, default, self.kist.get)
 
     def get_secret(self, key: str, default: Any = ...) -> Any:
         return self.get(key, default)
 
-    def invalidate(self, key: str | None = None) -> None:
-        with self._lock:
-            if key is None:
-                self._cache.clear()
-                logger.debug("Cleared entire cache for profile: %s", self.profile_name)
-            else:
-                self._cache.pop(key, None)
-                logger.debug("Invalidated cached secret key %r for profile: %s", key, self.profile_name)
+    def invalidate(self, key: str | None=None) -> None:
+        logger.debug('Invalidation for secret key %r (profile: %s)', key, self.profile_name)
+        self._runtime_cache.invalidate(key)
 
     clear = invalidate
 
@@ -206,6 +178,7 @@ class AsyncDynamicSecretStore:
         auto_start: bool = False,
         kist: Kist | None = None,
         cache_policy: CachePolicy | None = None,
+        async_kist: Any | None = None,
     ) -> None:
         self.profile_name = profile_name or os.getenv("KIST_PROFILE", "default")
         self.kist = kist or Kist(
@@ -216,8 +189,10 @@ class AsyncDynamicSecretStore:
         self.db_url = db_url or self.kist.db_url
         self.channel = channel
         self.policy = cache_policy or CachePolicy(enabled=True)
-        self._cache: dict[str, tuple[float, Any]] = {}
-        self._lock = asyncio.Lock()
+        from kist.runtime_reads import AsyncCache, AsyncKist
+        self._runtime_cache = AsyncCache(self.policy)
+        self._cache = self._runtime_cache.entries
+        self._async_kist = async_kist if async_kist is not None else AsyncKist(kist=self.kist)
         self._listener_task: asyncio.Task | None = None
         self._closing = False
         if auto_start:
@@ -227,6 +202,8 @@ class AsyncDynamicSecretStore:
                 pass
 
     async def start(self) -> None:
+        if self._runtime_cache.closed:
+            raise RuntimeError("Async store is closed; create a new instance.")
         if not self.db_url:
             raise RuntimeError("A database URL is required for dynamic invalidation.")
         if self._listener_task and not self._listener_task.done():
@@ -235,45 +212,16 @@ class AsyncDynamicSecretStore:
         logger.debug("Starting async notification listener for profile %s on channel %s", self.profile_name, self.channel)
         self._listener_task = asyncio.get_running_loop().create_task(self._listen_for_updates())
 
-    async def get(self, key: str, default: Any = ...) -> Any:
-        now = time.monotonic()
-        if self.policy.enabled:
-            async with self._lock:
-                cached = self._cache.get(key)
-                if cached and now - cached[0] < self.policy.ttl_seconds:
-                    logger.debug("Cache hit for secret key %r (profile: %s)", key, self.profile_name)
-                    return cached[1]
-                if cached:
-                    logger.debug("Cache expired for secret key %r (profile: %s)", key, self.profile_name)
-                    self._cache.pop(key, None)
-        logger.debug("Cache miss for secret key %r (profile: %s)", key, self.profile_name)
-        try:
-            value = await asyncio.to_thread(self.kist.get, key)
-        except KeyError:
-            if default is not ...:
-                return default
-            raise
-        if self.policy.enabled:
-            async with self._lock:
-                if len(self._cache) >= self.policy.max_entries:
-                    evicted_key = next(iter(self._cache))
-                    self._cache.pop(evicted_key)
-                    logger.debug("Evicted oldest cache entry %r (profile: %s, max_entries: %d)", evicted_key, self.profile_name, self.policy.max_entries)
-                self._cache[key] = (now, value)
-                logger.debug("Cached secret key %r (profile: %s)", key, self.profile_name)
-        return value
+    async def get(self, key: str, default: Any=...) -> Any:
+        logger.debug('Lookup for secret key %r (profile: %s)', key, self.profile_name)
+        return await self._runtime_cache.get(key, default, self._async_kist.get)
 
     async def get_secret(self, key: str, default: Any = ...) -> Any:
         return await self.get(key, default)
 
-    async def invalidate(self, key: str | None = None) -> None:
-        async with self._lock:
-            if key is None:
-                self._cache.clear()
-                logger.debug("Cleared entire cache for profile: %s", self.profile_name)
-            else:
-                self._cache.pop(key, None)
-                logger.debug("Invalidated cached secret key %r for profile: %s", key, self.profile_name)
+    async def invalidate(self, key: str | None=None) -> None:
+        logger.debug('Invalidation for secret key %r (profile: %s)', key, self.profile_name)
+        self._runtime_cache.invalidate(key)
 
     async def _listen_for_updates(self) -> None:
         while not self._closing:
@@ -310,17 +258,23 @@ class AsyncDynamicSecretStore:
             logger.warning("Failed to process notification payload for profile %s; invalidating cache (%s)", self.profile_name, type(exc).__name__)
             await self.invalidate()
 
-    async def close(self) -> None:
+    async def _finish_close(self) -> None:
         self._closing = True
         if self._listener_task and not self._listener_task.done():
             self._listener_task.cancel()
-            try:
-                await self._listener_task
-            except asyncio.CancelledError:
-                pass
+            await asyncio.gather(self._listener_task, return_exceptions=True)
         self._listener_task = None
-        await self.invalidate()
-        logger.debug("Closed async notification listener for profile: %s", self.profile_name)
+        await self._runtime_cache.close()
+
+    async def close(self) -> None:
+        from kist.runtime_reads import _observe
+        task = getattr(self, "_runtime_close_task", None)
+        if task is None:
+            self._closing = True
+            task = asyncio.create_task(self._finish_close())
+            self._runtime_close_task = task
+            task.add_done_callback(_observe)
+        await asyncio.shield(task)
 
     async def __aenter__(self):
         await self.start()
@@ -343,3 +297,24 @@ __all__ = [
     "TTLStore",
     "AsyncDynamicStore",
 ]
+
+
+class AsyncTTLSecretStore(AsyncDynamicSecretStore):
+    """Async TTL store; notification listening is disabled."""
+
+    def __init__(self, ttl_seconds: float = 30.0, **kwargs: Any) -> None:
+        policy = kwargs.pop("cache_policy", None)
+        kwargs.pop("auto_start", None)
+        super().__init__(auto_start=False, cache_policy=(policy if policy is not None
+                         else CachePolicy(ttl_seconds=ttl_seconds)), **kwargs)
+
+    async def __aenter__(self):
+        if self._runtime_cache.closed:
+            raise RuntimeError("Async TTL store is closed.")
+        return self
+
+    async def start(self) -> None:
+        raise RuntimeError("Use AsyncDynamicSecretStore for notification listening.")
+
+
+__all__.append("AsyncTTLSecretStore")

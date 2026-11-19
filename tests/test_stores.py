@@ -1,7 +1,7 @@
 import json
 import logging
 import time
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -157,56 +157,38 @@ def test_dynamic_store_lifecycle():
 @pytest.mark.asyncio
 async def test_async_store_cache_and_invalidation():
     mock_kist = MagicMock(spec=Kist)
-    mock_kist.get.return_value = {"nested": "value", "count": 42}
-    mock_kist.db_url = "postgresql://mock"
+    mock_kist.get = AsyncMock(return_value={'nested': 'value', 'count': 42})
+    mock_kist.db_url = 'postgresql://mock'
     mock_kist.profile_id = 10
-    mock_kist.profile_name = "async_prod"
-
-    store = AsyncDynamicSecretStore(
-        profile_name="async_prod",
-        auto_start=False,
-        kist=mock_kist,
-    )
-
-    val1 = await store.get("config.json")
-    assert val1 == {"nested": "value", "count": 42}
-    assert mock_kist.get.call_count == 1
-
-    # Cache hit
-    mock_kist.get.return_value = {"nested": "new"}
-    val2 = await store.get_secret("config.json")
-    assert val2 == {"nested": "value", "count": 42}
-    assert mock_kist.get.call_count == 1
-
-    # Invalidate via notification
+    mock_kist.profile_name = 'async_prod'
+    store = AsyncDynamicSecretStore(profile_name='async_prod', auto_start=False, kist=mock_kist, async_kist=mock_kist)
+    val1 = await store.get('config.json')
+    assert val1 == {'nested': 'value', 'count': 42}
+    assert mock_kist.get.await_count == 1
+    mock_kist.get.return_value = {'nested': 'new'}
+    val2 = await store.get_secret('config.json')
+    assert val2 == {'nested': 'value', 'count': 42}
+    assert mock_kist.get.await_count == 1
     mock_notify = MagicMock()
-    mock_notify.payload = json.dumps({
-        "profile_name": "async_prod",
-        "profile_id": 10,
-        "secret_key": "config.json",
-    })
+    mock_notify.payload = json.dumps({'profile_name': 'async_prod', 'profile_id': 10, 'secret_key': 'config.json'})
     await store._handle_notification(mock_notify)
-
-    val3 = await store.get("config.json")
-    assert val3 == {"nested": "new"}
-    assert mock_kist.get.call_count == 2
-
+    val3 = await store.get('config.json')
+    assert val3 == {'nested': 'new'}
+    assert mock_kist.get.await_count == 2
     await store.close()
 
 
 @pytest.mark.asyncio
 async def test_async_context_manager():
     mock_kist = MagicMock(spec=Kist)
-    mock_kist.get.return_value = {"nested": "value", "count": 42}
-    mock_kist.db_url = "postgresql://mock"
+    mock_kist.get = AsyncMock(return_value={'nested': 'value', 'count': 42})
+    mock_kist.db_url = 'postgresql://mock'
     mock_kist.profile_id = 10
-    mock_kist.profile_name = "async_prod"
-
-    async with AsyncDynamicSecretStore(profile_name="async_prod", auto_start=False, kist=mock_kist) as store:
-        val = await store.get("key")
-        assert val == {"nested": "value", "count": 42}
+    mock_kist.profile_name = 'async_prod'
+    async with AsyncDynamicSecretStore(profile_name='async_prod', auto_start=False, kist=mock_kist, async_kist=mock_kist) as store:
+        val = await store.get('key')
+        assert val == {'nested': 'value', 'count': 42}
         assert len(store._cache) == 1
-
     assert len(store._cache) == 0
 
 
@@ -240,3 +222,5 @@ def test_logging_does_not_leak_secret_value(caplog):
     # Strictly verify the sensitive secret payload is NEVER in any log message
     for record in caplog.records:
         assert secret_val not in record.message
+
+# runtime-read parity regression fix: native async loader injection, key-only logging.
