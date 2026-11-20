@@ -55,3 +55,8 @@ For each block: public contract, deterministic regression tests, relevant live P
 2. Write the read-budget and safe-error contracts; identify blockers to a genuine wall-clock guarantee.
 3. Implement bounded-read foundations in reviewable PRs, then prioritise reusable connections.
 4. Update README links and current limitations alongside the audit; do not document proposed APIs as available.
+
+
+## Read-budget foundation checkpoint
+
+Implementation started for requirement 1: cooperative budget validation, remaining-time accounting and an internal typed timeout, with deterministic tests. Read integration, cancellation and fault-injection coverage remain pending. Requirement 2 is not completed: full driver error classification and a public exception contract still need implementation. No original requirement is closed by this checkpoint. Dedicated runtime PostgreSQL tests now have an explicit database CI step. Test execution and released versions must be recorded after validation and release, not assumed.

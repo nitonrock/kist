@@ -1394,3 +1394,8 @@ See [CHANGELOG.md](CHANGELOG.md) for completed changes and the [runtime reliabil
 Current read sessions cache unlocked bundles, not database connections, and serialize reads within each session. Connection timeouts and TCP settings do not provide an end-to-end read deadline. Cache single-flight sharing does not impose a loader or waiter timeout. Dynamic stores already use TTL expiry, but notification connectivity and reconnect freshness remain separate concerns.
 
 A missing profile password is a configuration failure, not a missing secret. Store defaults and negative caching must not suppress it. Runtime store lookup, invalidation and notification debug messages omit secret names; this is not a claim that every diagnostic surface has been audited.
+
+
+### Read-budget implementation status
+
+Internal read-budget primitives are under development; they do not yet add timeout arguments, cancel database operations, or bound public reads. See the [foundation contract](docs/read-budget-foundations.md) and [roadmap](docs/ROADMAP.md). These internals are not a supported public API.
