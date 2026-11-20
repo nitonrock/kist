@@ -217,8 +217,12 @@ def test_logging_does_not_leak_secret_value(caplog):
 
     # Verify logs were generated
     assert len(caplog.records) > 0
-    # Verify secret_key name is in logs
-    assert any("db.secret_key" in record.message for record in caplog.records)
+    # Neither secret names nor values may appear in rendered logs or arguments.
+    for record in caplog.records:
+        assert "db.secret_key" not in record.getMessage()
+        assert secret_val not in record.getMessage()
+        assert "db.secret_key" not in repr(record.args)
+        assert secret_val not in repr(record.args)
     # Strictly verify the sensitive secret payload is NEVER in any log message
     for record in caplog.records:
         assert secret_val not in record.message

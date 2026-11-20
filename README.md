@@ -1385,3 +1385,12 @@ See [LICENSE](https://github.com/nitonrock/kist/blob/main/LICENSE) and [NOTICE](
   <strong>Keep It Simple and Trusted.</strong><br />
   Encrypt the value. Review the change. Protect the boundary. Keep the drama for production incidents you did not have.
 </p>
+
+
+## Runtime reliability and release notes
+
+See [CHANGELOG.md](CHANGELOG.md) for completed changes and the [runtime reliability roadmap](docs/ROADMAP.md) for planned work. Unreleased changes are not yet available in published packages.
+
+Current read sessions cache unlocked bundles, not database connections, and serialize reads within each session. Connection timeouts and TCP settings do not provide an end-to-end read deadline. Cache single-flight sharing does not impose a loader or waiter timeout. Dynamic stores already use TTL expiry, but notification connectivity and reconnect freshness remain separate concerns.
+
+A missing profile password is a configuration failure, not a missing secret. Store defaults and negative caching must not suppress it. Runtime store lookup, invalidation and notification debug messages omit secret names; this is not a claim that every diagnostic surface has been audited.

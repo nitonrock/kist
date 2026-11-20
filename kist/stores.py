@@ -67,14 +67,14 @@ class TTLSecretStore:
         self._cache = self._runtime_cache.entries
 
     def get(self, key: str, default: Any=...) -> Any:
-        logger.debug('Lookup for secret key %r (profile: %s)', key, self.profile_name)
+        logger.debug('Secret lookup (profile: %s)', self.profile_name)
         return self._runtime_cache.get(key, default, self.kist.get)
 
     def get_secret(self, key: str, default: Any = ...) -> Any:
         return self.get(key, default)
 
     def invalidate(self, key: str | None=None) -> None:
-        logger.debug('Invalidation for secret key %r (profile: %s)', key, self.profile_name)
+        logger.debug('Secret cache invalidation (profile: %s)', self.profile_name)
         self._runtime_cache.invalidate(key)
 
     clear = invalidate
@@ -148,7 +148,7 @@ class DynamicSecretStore(TTLSecretStore):
             if not isinstance(payload, dict) or not _notification_matches(payload, self.profile_name, self.kist.profile_id):
                 return
             key = payload.get("secret_key")
-            logger.debug("Notification received on channel %s; invalidating key %r for profile: %s", self.channel, key, self.profile_name)
+            logger.debug("Notification received on channel %s; invalidating cache for profile: %s", self.channel, self.profile_name)
             self.invalidate(key if isinstance(key, str) else None)
         except Exception as exc:
             logger.warning("Failed to process notification payload for profile %s; invalidating cache (%s)", self.profile_name, type(exc).__name__)
@@ -213,14 +213,14 @@ class AsyncDynamicSecretStore:
         self._listener_task = asyncio.get_running_loop().create_task(self._listen_for_updates())
 
     async def get(self, key: str, default: Any=...) -> Any:
-        logger.debug('Lookup for secret key %r (profile: %s)', key, self.profile_name)
+        logger.debug('Secret lookup (profile: %s)', self.profile_name)
         return await self._runtime_cache.get(key, default, self._async_kist.get)
 
     async def get_secret(self, key: str, default: Any = ...) -> Any:
         return await self.get(key, default)
 
     async def invalidate(self, key: str | None=None) -> None:
-        logger.debug('Invalidation for secret key %r (profile: %s)', key, self.profile_name)
+        logger.debug('Secret cache invalidation (profile: %s)', self.profile_name)
         self._runtime_cache.invalidate(key)
 
     async def _listen_for_updates(self) -> None:
@@ -252,7 +252,7 @@ class AsyncDynamicSecretStore:
             if not isinstance(payload, dict) or not _notification_matches(payload, self.profile_name, self.kist.profile_id):
                 return
             key = payload.get("secret_key")
-            logger.debug("Notification received on channel %s; invalidating key %r for profile: %s", self.channel, key, self.profile_name)
+            logger.debug("Notification received on channel %s; invalidating cache for profile: %s", self.channel, self.profile_name)
             await self.invalidate(key if isinstance(key, str) else None)
         except Exception as exc:
             logger.warning("Failed to process notification payload for profile %s; invalidating cache (%s)", self.profile_name, type(exc).__name__)
