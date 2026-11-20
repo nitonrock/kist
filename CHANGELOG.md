@@ -5,10 +5,12 @@ User-facing changes are recorded here. Planned work is tracked in [the roadmap](
 ## Unreleased
 
 ### Fixed
+- Explicitly run the dedicated runtime-read PostgreSQL tests in database CI jobs instead of excluding them through name filtering.
 - Remove plaintext secret names from runtime store lookup, invalidation and notification debug logs.
 - Add regression coverage ensuring missing profile passwords remain errors rather than defaults or negative-cache entries.
 
 ### Added
+- Internal cooperative read-budget and typed timeout foundations, with deterministic tests; public read methods remain unchanged.
 - A runtime reliability roadmap covering the 14 user requests, delivery blocks, and acceptance criteria.
 - This changelog. Earlier releases are not exhaustively reconstructed here.
 
