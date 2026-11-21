@@ -21,6 +21,7 @@ from kist._read_budget import (
     _connection,
     _lock,
 )
+from kist._read_sql import _async_cursor, _cursor
 from kist.core import (
     ENVELOPE_VERSION,
     KEY_MODE_PASSWORD,
@@ -122,7 +123,7 @@ def get_many(reader, keys, default=..., *, timeout=None):
     reader._ensure_scope()
     values = {}
     with _connection(safe_db_connect, reader._require_database()) as connection:
-        with connection.cursor() as cursor:
+        with _cursor(connection) as cursor:
             _call("query", cursor.execute, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             _call("schema_check", reader._check_schema, cursor)
             bundle = reader._load_bundle(cursor)
@@ -240,7 +241,7 @@ class AsyncKist:
 
     async def get_or_create_scope(self) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
         async with _async_connection(safe_async_db_connect, self._require_database()) as connection:
-            async with connection.cursor() as cursor:
+            async with _async_cursor(connection) as cursor:
                 await _await("schema_check", self._check_schema, cursor)
                 await _await("query", cursor.execute, 'INSERT INTO kist_organizations (id, slug) VALUES (%s, %s)\n                    ON CONFLICT (slug) DO UPDATE SET slug = EXCLUDED.slug RETURNING id', (uuid.uuid4(), self.scope.organization))
                 org = uuid.UUID(str((await _await("query", cursor.fetchone))[0]))
@@ -277,7 +278,7 @@ class AsyncKist:
         await self._ensure_scope()
         values = {}
         async with _async_connection(safe_async_db_connect, self._sync._require_database()) as connection:
-            async with connection.cursor() as cursor:
+            async with _async_cursor(connection) as cursor:
                 await _await("query", cursor.execute, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
                 await _await("schema_check", self._check_schema, cursor)
                 bundle = await self._load_bundle(cursor)
