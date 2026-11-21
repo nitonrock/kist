@@ -8,6 +8,7 @@ from contextvars import ContextVar
 from functools import wraps
 
 from kist._read_policy import _ReadDeadline, _ReadTimeoutError
+from kist.read_errors import ReadError, _redact
 
 _DEADLINE: ContextVar[_ReadDeadline | None] = ContextVar("kist_read_deadline", default=None)
 
@@ -56,7 +57,14 @@ def _budgeted(function):
     @wraps(function)
     def wrapped(*args, timeout=None, **kwargs):
         with _operation(timeout):
-            return function(*args, **kwargs)
+            failure = None
+            try:
+                with _redact("read"):
+                    return function(*args, **kwargs)
+            except ReadError as error:
+                failure = error
+            failure.__context__ = failure.__cause__ = None
+            raise failure from None
     return wrapped
 
 
@@ -64,20 +72,43 @@ def _async_budgeted(function):
     @wraps(function)
     async def wrapped(*args, timeout=None, **kwargs):
         with _operation(timeout):
-            return await function(*args, **kwargs)
+            failure = None
+            try:
+                with _redact("read"):
+                    return await function(*args, **kwargs)
+            except ReadError as error:
+                failure = error
+            failure.__context__ = failure.__cause__ = None
+            raise failure from None
     return wrapped
 
 
 def _call(phase, function, *args, **kwargs):
     _check(phase)
-    result = function(*args, **kwargs)
+    failure = None
+    try:
+        with _redact(phase):
+            result = function(*args, **kwargs)
+    except ReadError as error:
+        failure = error
+    if failure is not None:
+        failure.__context__ = failure.__cause__ = None
+        raise failure from None
     _check(phase)
     return result
 
 
 async def _await(phase, function, *args, **kwargs):
     _check(phase)
-    result = await function(*args, **kwargs)
+    failure = None
+    try:
+        with _redact(phase):
+            result = await function(*args, **kwargs)
+    except ReadError as error:
+        failure = error
+    if failure is not None:
+        failure.__context__ = failure.__cause__ = None
+        raise failure from None
     _check(phase)
     return result
 
@@ -85,20 +116,27 @@ async def _await(phase, function, *args, **kwargs):
 @contextmanager
 def _connection(connect, db_url):
     _check("connect")
+    with _redact("connect"):
+        connection = connect(db_url)
     # Enter ownership before checking a connection that arrived after expiry.
-    with connect(db_url) as connection:
-        _check("connect")
-        yield connection
-    # Never replace an operation or cleanup failure with a timeout.
+    with _redact("cleanup"):
+        with connection as opened:
+            with _redact("read"):
+                _check("connect")
+                yield opened
     _check("cleanup")
 
 
 @asynccontextmanager
 async def _async_connection(connect, db_url):
     _check("connect")
-    async with await connect(db_url) as connection:
-        _check("connect")
-        yield connection
+    with _redact("connect"):
+        connection = await connect(db_url)
+    with _redact("cleanup"):
+        async with connection as opened:
+            with _redact("read"):
+                _check("connect")
+                yield opened
     _check("cleanup")
 
 
