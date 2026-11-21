@@ -654,8 +654,12 @@ def safe_db_connect(db_url: str, **kwargs: Any) -> psycopg.Connection[Any]:
         if normalized is None:
             raise KistError("KIST_DATABASE_URL is not configured.")
         return psycopg.connect(normalized, **_connection_kwargs(normalized, kwargs))
-    except psycopg.OperationalError:
-        raise psycopg.OperationalError(f"Database connection failed ({mask_db_url(db_url)}).") from None
+    except psycopg.OperationalError as error:
+        from kist.read_errors import _connection_failure
+        failure = _connection_failure(error)
+        if failure is None:
+            raise psycopg.OperationalError(f"Database connection failed ({mask_db_url(db_url)}).") from None
+    raise failure from None
 
 
 async def safe_async_db_connect(db_url: str, **kwargs: Any) -> psycopg.AsyncConnection[Any]:
@@ -664,8 +668,12 @@ async def safe_async_db_connect(db_url: str, **kwargs: Any) -> psycopg.AsyncConn
         if normalized is None:
             raise KistError("KIST_DATABASE_URL is not configured.")
         return await psycopg.AsyncConnection.connect(normalized, **_connection_kwargs(normalized, kwargs))
-    except psycopg.OperationalError:
-        raise psycopg.OperationalError(f"Database connection failed ({mask_db_url(db_url)}).") from None
+    except psycopg.OperationalError as error:
+        from kist.read_errors import _connection_failure
+        failure = _connection_failure(error)
+        if failure is None:
+            raise psycopg.OperationalError(f"Database connection failed ({mask_db_url(db_url)}).") from None
+    raise failure from None
 
 
 def _canonical_aad(context: dict[str, Any]) -> bytes:
