@@ -889,8 +889,9 @@ class Kist:
 
     def get_or_create_scope(self) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
         from kist._read_budget import _call, _connection
+        from kist._read_sql import _cursor
         with _connection(safe_db_connect, self._require_database()) as connection:
-            with connection.cursor() as cursor:
+            with _cursor(connection) as cursor:
                 _call("schema_check", self._check_schema, cursor)
                 _call("query", cursor.execute, """INSERT INTO kist_organizations (id, slug) VALUES (%s, %s)
                     ON CONFLICT (slug) DO UPDATE SET slug = EXCLUDED.slug RETURNING id""",
@@ -1063,10 +1064,11 @@ class Kist:
 
     def _get(self, key: str) -> Any:
         from kist._read_budget import _call, _connection
+        from kist._read_sql import _cursor
         key = _validate_secret_key(key)
         self._ensure_scope()
         with _connection(safe_db_connect, self._require_database()) as connection:
-            with connection.cursor() as cursor:
+            with _cursor(connection) as cursor:
                 _call("query", cursor.execute, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
                 _call("schema_check", self._check_schema, cursor)
                 bundle = self._load_bundle(cursor)
