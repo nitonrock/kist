@@ -888,29 +888,31 @@ class Kist:
                 self._check_schema(cursor)
 
     def get_or_create_scope(self) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
-        with safe_db_connect(self._require_database()) as connection:
+        from kist._read_budget import _call, _connection
+        with _connection(safe_db_connect, self._require_database()) as connection:
             with connection.cursor() as cursor:
-                self._check_schema(cursor)
-                cursor.execute("""INSERT INTO kist_organizations (id, slug) VALUES (%s, %s)
+                _call("schema_check", self._check_schema, cursor)
+                _call("query", cursor.execute, """INSERT INTO kist_organizations (id, slug) VALUES (%s, %s)
                     ON CONFLICT (slug) DO UPDATE SET slug = EXCLUDED.slug RETURNING id""",
                     (uuid.uuid4(), self.scope.organization))
-                org = uuid.UUID(str(cursor.fetchone()[0]))
-                cursor.execute("""INSERT INTO kist_projects (id, organization_id, slug) VALUES (%s, %s, %s)
+                org = uuid.UUID(str(_call("query", cursor.fetchone)[0]))
+                _call("query", cursor.execute, """INSERT INTO kist_projects (id, organization_id, slug) VALUES (%s, %s, %s)
                     ON CONFLICT (organization_id, slug) DO UPDATE SET slug = EXCLUDED.slug RETURNING id""",
                     (uuid.uuid4(), org, self.scope.project))
-                project = uuid.UUID(str(cursor.fetchone()[0]))
-                cursor.execute("""INSERT INTO kist_profiles (id, project_id, profile_name) VALUES (%s, %s, %s)
+                project = uuid.UUID(str(_call("query", cursor.fetchone)[0]))
+                _call("query", cursor.execute, """INSERT INTO kist_profiles (id, project_id, profile_name) VALUES (%s, %s, %s)
                     ON CONFLICT (project_id, profile_name) DO UPDATE
                     SET profile_name = EXCLUDED.profile_name RETURNING id""",
                     (uuid.uuid4(), project, self.profile_name))
-                profile = uuid.UUID(str(cursor.fetchone()[0]))
+                profile = uuid.UUID(str(_call("query", cursor.fetchone)[0]))
         self.organization_id, self.project_id, self.profile_id = org, project, profile
         return org, project, profile
 
     def _ensure_scope(self) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
-        with self._scope_init_lock:
+        from kist._read_budget import _call, _lock
+        with _lock(self._scope_init_lock, "scope_wait"):
             if self.organization_id is None or self.project_id is None or self.profile_id is None:
-                return self.get_or_create_scope()
+                return _call("scope_init", self.get_or_create_scope)
             return self.organization_id, self.project_id, self.profile_id
 
     def _scope_context(self) -> dict[str, str]:
@@ -922,10 +924,11 @@ class Kist:
                 "bundle_id": str(bundle_id), "bundle_version": "1", "access_mode": KEY_MODE_PASSWORD}
 
     def _load_bundle(self, cursor: psycopg.Cursor[Any], *, create: bool = False) -> _KeyBundle | None:
+        from kist._read_budget import _call
         _, _, profile = self._ensure_scope()
-        cursor.execute("""SELECT id, access_mode, bundle_version, wrapped_bundle
+        _call("query", cursor.execute, """SELECT id, access_mode, bundle_version, wrapped_bundle
                           FROM kist_key_bundles WHERE profile_id = %s""", (profile,))
-        row = cursor.fetchone()
+        row = _call("query", cursor.fetchone)
         if row is None:
             if not create:
                 return None
@@ -933,7 +936,7 @@ class Kist:
             # Binary payload contains two separately generated keys.
             wrapped = encrypt_envelope(b"KKB1" + bundle.content_key + bundle.index_key,
                                        self._require_password(), self._bundle_context(bundle.id))
-            cursor.execute("""INSERT INTO kist_key_bundles
+            _call("query", cursor.execute, """INSERT INTO kist_key_bundles
                 (id, profile_id, access_mode, bundle_version, wrapped_bundle)
                 VALUES (%s, %s, %s, 1, %s)""", (bundle.id, profile, KEY_MODE_PASSWORD, wrapped))
             return bundle
@@ -943,7 +946,8 @@ class Kist:
         raw_blob = bytes(blob)
         if len(raw_blob) < 5 or raw_blob[4] != ENVELOPE_VERSION:
             raise InvalidEnvelopeError("Database key bundles require envelope v1.")
-        raw = decrypt_envelope(raw_blob, self._require_password(), self._bundle_context(uuid.UUID(str(bundle_id))))
+        raw = _call("key_unlock", decrypt_envelope, raw_blob, self._require_password(),
+                    self._bundle_context(uuid.UUID(str(bundle_id))))
         if len(raw) != 68 or not raw.startswith(b"KKB1"):
             raise DecryptionError("Invalid key bundle payload.")
         return _KeyBundle(uuid.UUID(str(bundle_id)), raw[4:36], raw[36:68])
@@ -1052,28 +1056,34 @@ class Kist:
             return self._store(cursor, bundle, key, value)
         return self._write(operation, max_retries)
 
-    def get(self, key: str) -> Any:
+    def get(self, key: str, *, timeout: float | None = None) -> Any:
+        """Read one value with an optional cooperative budget in seconds."""
+        from kist.runtime_reads import get_one
+        return get_one(self, key, timeout=timeout)
+
+    def _get(self, key: str) -> Any:
+        from kist._read_budget import _call, _connection
         key = _validate_secret_key(key)
         self._ensure_scope()
-        with safe_db_connect(self._require_database()) as connection:
+        with _connection(safe_db_connect, self._require_database()) as connection:
             with connection.cursor() as cursor:
-                cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-                self._check_schema(cursor)
+                _call("query", cursor.execute, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                _call("schema_check", self._check_schema, cursor)
                 bundle = self._load_bundle(cursor)
                 if bundle is None:
                     raise KeyError(key)
-                cursor.execute("""SELECT id, lookup_token, key_bundle_id, crypto_version, secret_version, encrypted_blob
+                _call("query", cursor.execute, """SELECT id, lookup_token, key_bundle_id, crypto_version, secret_version, encrypted_blob
                     FROM kist_secrets WHERE profile_id = %s AND lookup_token = %s""",
                     (self.profile_id, self._lookup_token(bundle, key)))
-                row = cursor.fetchone()
+                row = _call("query", cursor.fetchone)
                 if row is None:
                     raise KeyError(key)
-                return self._decode_row(bundle, row, key)[1]
+                return _call("decrypt", self._decode_row, bundle, row, key)[1]
 
-    def get_many(self, keys, default: Any = ...) -> dict[str, Any]:
+    def get_many(self, keys, default: Any = ..., *, timeout: float | None = None) -> dict[str, Any]:
         """Read requested names in one repeatable-read snapshot with one unlock."""
         from kist.runtime_reads import get_many
-        return get_many(self, keys, default=default)
+        return get_many(self, keys, default=default, timeout=timeout)
 
     def session(self, *, unlock_ttl_seconds: float = 30.0):
         """Create a bounded read-only unlock session. Use as a context manager."""

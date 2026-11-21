@@ -11,6 +11,16 @@ from typing import Any
 
 import psycopg
 
+from kist._read_budget import (
+    _async_budgeted,
+    _async_connection,
+    _async_lock,
+    _await,
+    _budgeted,
+    _call,
+    _connection,
+    _lock,
+)
 from kist.core import (
     ENVELOPE_VERSION,
     KEY_MODE_PASSWORD,
@@ -62,7 +72,7 @@ def _decode_rows(reader, bundle, tokens, rows):
         token = bytes(row[1])
         if token not in tokens:
             raise DecryptionError("Unexpected lookup token in bulk result.")
-        key, value = reader._decode_row(bundle, row, tokens[token])
+        key, value = _call("decrypt", reader._decode_row, bundle, row, tokens[token])
         if key in values:
             raise DecryptionError("Duplicate decrypted secret names.")
         values[key] = value
@@ -77,7 +87,8 @@ def _unlock(reader, row):
     if len(blob) < 5 or blob[4] != ENVELOPE_VERSION:
         raise InvalidEnvelopeError("Database key bundles require envelope v1.")
     bundle_id = uuid.UUID(str(bundle_id))
-    raw = decrypt_envelope(blob, reader._require_password(), reader._bundle_context(bundle_id))
+    raw = _call("key_unlock", decrypt_envelope, blob, reader._require_password(),
+                reader._bundle_context(bundle_id))
     if len(raw) != 68 or not raw.startswith(b"KKB1"):
         raise DecryptionError("Invalid key bundle payload.")
     return _KeyBundle(bundle_id, raw[4:36], raw[36:68])
@@ -98,24 +109,30 @@ def _ttl(value):
     return value
 
 
-def get_many(reader, keys, default=...):
+@_budgeted
+def get_one(reader, key, *, timeout=None):
+    return reader._get(key)
+
+
+@_budgeted
+def get_many(reader, keys, default=..., *, timeout=None):
     names = _names(keys)
     if not names:
         return {}
     reader._ensure_scope()
     values = {}
-    with safe_db_connect(reader._require_database()) as connection:
+    with _connection(safe_db_connect, reader._require_database()) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-            reader._check_schema(cursor)
+            _call("query", cursor.execute, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            _call("schema_check", reader._check_schema, cursor)
             bundle = reader._load_bundle(cursor)
             if bundle is not None:
                 tokens = {reader._lookup_token(bundle, key): key for key in names}
-                cursor.execute(
+                _call("query", cursor.execute,
                     _SELECT_MANY_SQL,
                     (reader.profile_id, list(tokens)),
                 )
-                values = _decode_rows(reader, bundle, tokens, cursor.fetchall())
+                values = _decode_rows(reader, bundle, tokens, _call("query", cursor.fetchall))
     return _finish(names, values, default)
 
 
@@ -123,8 +140,8 @@ class _SessionReader(Kist):
     def _load_bundle(self, cursor, *, create=False):
         if create:
             raise KistError("Read sessions cannot create key bundles.")
-        cursor.execute(_BUNDLE_SQL, (self.profile_id,))
-        row = cursor.fetchone()
+        _call("query", cursor.execute, _BUNDLE_SQL, (self.profile_id,))
+        row = _call("query", cursor.fetchone)
         identity = None if row is None else _identity(self, row)
         if (identity is not None and self._cached is not None
                 and identity == self._identity and time.monotonic() < self._expires):
@@ -133,7 +150,7 @@ class _SessionReader(Kist):
         self._expires = 0.0
         if row is None:
             return None
-        bundle = _unlock(self, row)
+        bundle = _call("key_unlock", _unlock, self, row)
         self._cached, self._identity = bundle, identity
         self._expires = time.monotonic() + self._ttl
         return bundle
@@ -162,13 +179,15 @@ class ReadSession:
         if self._closed:
             raise KistError("Read session is closed.")
 
-    def get(self, key):
-        with self._lock:
+    @_budgeted
+    def get(self, key, *, timeout=None):
+        with _lock(self._lock, "cache_wait"):
             self._check()
             return self._reader.get(key)
 
-    def get_many(self, keys, default=...):
-        with self._lock:
+    @_budgeted
+    def get_many(self, keys, default=..., *, timeout=None):
+        with _lock(self._lock, "cache_wait"):
             self._check()
             return self._reader.get_many(keys, default=default)
 
@@ -211,63 +230,65 @@ class AsyncKist:
         raise AttributeError(name)
 
     async def _check_schema(cls, cursor: psycopg.AsyncCursor[Any]) -> None:
-        await cursor.execute("SELECT to_regclass('kist_schema')")
-        if (await cursor.fetchone())[0] is None:
+        await _await("query", cursor.execute, "SELECT to_regclass('kist_schema')")
+        if (await _await("query", cursor.fetchone))[0] is None:
             raise SchemaVersionError('Initialize the v1 schema explicitly with init_db().')
-        await cursor.execute('SELECT version FROM kist_schema WHERE singleton = TRUE')
-        row = await cursor.fetchone()
+        await _await("query", cursor.execute, 'SELECT version FROM kist_schema WHERE singleton = TRUE')
+        row = await _await("query", cursor.fetchone)
         if row is None or row[0] != SCHEMA_VERSION:
             raise SchemaVersionError('Unsupported Kist schema version.')
 
     async def get_or_create_scope(self) -> tuple[uuid.UUID, uuid.UUID, uuid.UUID]:
-        async with await safe_async_db_connect(self._require_database()) as connection:
+        async with _async_connection(safe_async_db_connect, self._require_database()) as connection:
             async with connection.cursor() as cursor:
-                await self._check_schema(cursor)
-                await cursor.execute('INSERT INTO kist_organizations (id, slug) VALUES (%s, %s)\n                    ON CONFLICT (slug) DO UPDATE SET slug = EXCLUDED.slug RETURNING id', (uuid.uuid4(), self.scope.organization))
-                org = uuid.UUID(str((await cursor.fetchone())[0]))
-                await cursor.execute('INSERT INTO kist_projects (id, organization_id, slug) VALUES (%s, %s, %s)\n                    ON CONFLICT (organization_id, slug) DO UPDATE SET slug = EXCLUDED.slug RETURNING id', (uuid.uuid4(), org, self.scope.project))
-                project = uuid.UUID(str((await cursor.fetchone())[0]))
-                await cursor.execute('INSERT INTO kist_profiles (id, project_id, profile_name) VALUES (%s, %s, %s)\n                    ON CONFLICT (project_id, profile_name) DO UPDATE\n                    SET profile_name = EXCLUDED.profile_name RETURNING id', (uuid.uuid4(), project, self.profile_name))
-                profile = uuid.UUID(str((await cursor.fetchone())[0]))
+                await _await("schema_check", self._check_schema, cursor)
+                await _await("query", cursor.execute, 'INSERT INTO kist_organizations (id, slug) VALUES (%s, %s)\n                    ON CONFLICT (slug) DO UPDATE SET slug = EXCLUDED.slug RETURNING id', (uuid.uuid4(), self.scope.organization))
+                org = uuid.UUID(str((await _await("query", cursor.fetchone))[0]))
+                await _await("query", cursor.execute, 'INSERT INTO kist_projects (id, organization_id, slug) VALUES (%s, %s, %s)\n                    ON CONFLICT (organization_id, slug) DO UPDATE SET slug = EXCLUDED.slug RETURNING id', (uuid.uuid4(), org, self.scope.project))
+                project = uuid.UUID(str((await _await("query", cursor.fetchone))[0]))
+                await _await("query", cursor.execute, 'INSERT INTO kist_profiles (id, project_id, profile_name) VALUES (%s, %s, %s)\n                    ON CONFLICT (project_id, profile_name) DO UPDATE\n                    SET profile_name = EXCLUDED.profile_name RETURNING id', (uuid.uuid4(), project, self.profile_name))
+                profile = uuid.UUID(str((await _await("query", cursor.fetchone))[0]))
         self._sync.organization_id, self._sync.project_id, self._sync.profile_id = (org, project, profile)
         return (org, project, profile)
 
     async def _ensure_scope(self):
-        async with self._scope_lock:
+        async with _async_lock(self._scope_lock, "scope_wait"):
             if (self.organization_id is None or self.project_id is None
                     or self.profile_id is None):
-                await self.get_or_create_scope()
+                await _await("scope_init", self.get_or_create_scope)
 
     async def _load_bundle(self, cursor):
-        await cursor.execute(_BUNDLE_SQL, (self.profile_id,))
-        row = await cursor.fetchone()
+        await _await("query", cursor.execute, _BUNDLE_SQL, (self.profile_id,))
+        row = await _await("query", cursor.fetchone)
         if row is None:
             return None
-        return await asyncio.to_thread(_unlock, self._sync, row)
+        return await _await("key_unlock", asyncio.to_thread, _unlock, self._sync, row)
 
-    async def get(self, key):
+    @_async_budgeted
+    async def get(self, key, *, timeout=None):
         key = _validate_secret_key(key)
         return (await self.get_many([key]))[key]
 
-    async def get_many(self, keys, default=...):
+    @_async_budgeted
+    async def get_many(self, keys, default=..., *, timeout=None):
         names = _names(keys)
         if not names:
             return {}
         await self._ensure_scope()
         values = {}
-        async with await safe_async_db_connect(self._sync._require_database()) as connection:
+        async with _async_connection(safe_async_db_connect, self._sync._require_database()) as connection:
             async with connection.cursor() as cursor:
-                await cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-                await self._check_schema(cursor)
+                await _await("query", cursor.execute, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                await _await("schema_check", self._check_schema, cursor)
                 bundle = await self._load_bundle(cursor)
                 if bundle is not None:
                     tokens = {self._sync._lookup_token(bundle, key): key for key in names}
-                    await cursor.execute(
+                    await _await("query", cursor.execute,
                         _SELECT_MANY_SQL,
                         (self.profile_id, list(tokens)),
                     )
-                    rows = await cursor.fetchall()
-                    values = await asyncio.to_thread(_decode_rows, self._sync, bundle, tokens, rows)
+                    rows = await _await("query", cursor.fetchall)
+                    values = await _await("decrypt", asyncio.to_thread, _decode_rows, self._sync, bundle, tokens, rows)
         return _finish(names, values, default)
 
     def session(self, *, unlock_ttl_seconds=30):
@@ -284,8 +305,8 @@ class AsyncReadSession(AsyncKist):
         self._expires = 0.0
 
     async def _load_bundle(self, cursor):
-        await cursor.execute(_BUNDLE_SQL, (self.profile_id,))
-        row = await cursor.fetchone()
+        await _await("query", cursor.execute, _BUNDLE_SQL, (self.profile_id,))
+        row = await _await("query", cursor.fetchone)
         identity = None if row is None else _identity(self._sync, row)
         if (identity is not None and self._cached is not None
                 and identity == self._identity and time.monotonic() < self._expires):
@@ -295,13 +316,14 @@ class AsyncReadSession(AsyncKist):
         if row is None:
             return None
         # The worker returns a value only; it never publishes into session state.
-        bundle = await asyncio.to_thread(_unlock, self._sync, row)
+        bundle = await _await("key_unlock", asyncio.to_thread, _unlock, self._sync, row)
         self._cached, self._identity = bundle, identity
         self._expires = time.monotonic() + self._ttl
         return bundle
 
-    async def get_many(self, keys, default=...):
-        async with self._read_lock:
+    @_async_budgeted
+    async def get_many(self, keys, default=..., *, timeout=None):
+        async with _async_lock(self._read_lock, "cache_wait"):
             if self._closed:
                 raise KistError("Read session is closed.")
             return await super().get_many(keys, default=default)
