@@ -1,4 +1,4 @@
-"""Internal read-budget primitives; not yet wired into public read methods."""
+"""Internal monotonic budget primitives for database-backed read APIs."""
 from __future__ import annotations
 
 import math
@@ -6,34 +6,8 @@ import time
 from collections.abc import Callable
 from numbers import Real
 
-from kist.core import KistError
-
-_PHASES = frozenset({
-    "read", "scope_wait", "scope_init", "connection_acquire", "connect",
-    "schema_check", "derivation_wait", "key_unlock", "query", "decrypt",
-    "cache_wait", "cleanup",
-})
-
-
-def _phase(value: str) -> str:
-    if not isinstance(value, str) or value not in _PHASES:
-        raise ValueError("Unknown read phase.")
-    return value
-
-
-class _ReadTimeoutError(KistError, TimeoutError):
-    """Internal timeout type. No driver exception or credentials are retained.
-
-    retryable=False is conservative: this layer cannot decide whether repeating
-    the operation is appropriate. This is not yet a public exception contract.
-    """
-
-    def __init__(self, *, phase: str, elapsed_seconds: float) -> None:
-        self.phase = _phase(phase)
-        self.elapsed_seconds = elapsed_seconds
-        self.reason_code = "read_deadline_exceeded"
-        self.retryable = False
-        super().__init__(f"Read deadline exceeded during {self.phase}.")
+from kist.read_errors import ReadTimeoutError as _ReadTimeoutError
+from kist.read_errors import _phase
 
 
 class _ReadDeadline:

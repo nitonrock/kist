@@ -62,6 +62,7 @@ from kist.kms import (
     WrappedDataKey,
     get_kms_provider,
 )
+from kist.read_errors import ReadDatabaseError, ReadError, ReadTimeoutError
 from kist.status import run_status
 from kist.stores import (
     AsyncDynamicSecretStore,
@@ -84,6 +85,9 @@ __all__ = [
     "FileKist",
     "KistScope",
     "KistError",
+    "ReadError",
+    "ReadDatabaseError",
+    "ReadTimeoutError",
     "MissingKeyError",
     "InvalidEnvelopeError",
     "DecryptionError",

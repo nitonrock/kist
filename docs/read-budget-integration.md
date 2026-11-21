@@ -45,28 +45,30 @@ acknowledgement may take longer. External CancelledError is not translated.
 
 ## Timeout attribution and errors
 
-The existing internal timeout is catchable as KistError and TimeoutError, with
-phase, elapsed_seconds, reason_code, and conservative retryable=False fields.
-No stable named public exception is introduced. A database timeout uses the
-query phase; it can occur during scope initialization or the read transaction.
+ReadTimeoutError is now a named public exception, inheriting ReadError,
+KistError, and TimeoutError. It retains phase, elapsed_seconds, reason_code,
+retryable=False, and adds sqlstate=None. The former private name is an alias.
 
-A server QueryCanceled is translated only when the read installed a strictly
-tighter statement limit than the original server limit (or the original limit
-was disabled), and the monotonic read deadline has expired. An operator timeout
-that was already smaller or equal remains a driver error. An early external
-server cancellation remains a driver error. If an external server cancellation
-coincides with expiry of a read-owned limit, the two cannot be distinguished by
-SQLSTATE alone and are reported as a read timeout. No localized message parsing
-is used. For a huge budget beyond the server maximum, a cancellation at the
-clamped limit is not attributed to expiry of that larger budget.
+Read-owned server cancellations retain the existing conservative attribution:
+the read installed a strictly tighter limit (or the server limit was disabled)
+and the monotonic deadline has expired. A pre-existing smaller/equal operator
+limit or an early external server cancellation is not a read deadline.
+Simultaneous external cancellation and expiry of a read-owned limit cannot be
+distinguished by SQLSTATE alone. Huge budgets clamped to the server maximum
+are not treated as expired merely because that smaller server cap was reached.
 
-An async timeout is translated only when its own timeout guard expired, rather
-than catching an unrelated TimeoutError raised by the driver.
-Translated errors are raised outside the driver exception handler and retain
-no driver exception in __context__ or __cause__. Their messages do not interpolate
-SQL, credentials, connection URLs, or secret names. This is not a complete driver
-error taxonomy: unclassified driver failures retain their previous behaviour.
-Existing operation and cleanup failures are not replaced by a deadline error.
+At public database-backed read boundaries, other driver failures are now
+ReadDatabaseError with controlled metadata, including reason_code and SQLSTATE.
+Thus an operator or early server cancellation is database_query_cancelled,
+not ReadTimeoutError. Direct private SQL helpers still expose their original
+driver errors. This is an intentional unreleased public error-contract change.
+See read-errors.md for the mapping, catch examples, and compatibility limits.
+
+Async timeout attribution still requires expiry of the read's own timeout guard.
+Public error boundaries clear driver context/cause; this does not protect
+traceback-local capture or PostgreSQL logs. Existing non-driver errors and
+external asyncio cancellation are preserved. No hard end-to-end deadline or
+complete non-database error taxonomy is implied.
 
 ## Limits: not a hard wall-clock deadline
 
@@ -99,8 +101,8 @@ native-async, single, bulk, and session reads; scope-row contention; pg_sleep;
 stricter operator statement limits; and external async cancellation. Tests assert
 connection closure and successful subsequent reads; the async scope test also
 checks release of the scope lock. Operator limits are checked after rollback.
-The existing explicit CI step runs this entire module, so no workflow selector
-change is needed. These tests require KIST_TEST_DATABASE_URL pointing to a
+The explicit CI step now runs this module and the 8-case read-error module
+(27 cases total). These tests require KIST_TEST_DATABASE_URL pointing to a
 disposable PostgreSQL database. Never run them against production.
 
 An isolated dependency-stubbed harness passed 83 tests across the supplied
