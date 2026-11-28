@@ -37,6 +37,7 @@ from kist.core import (
     safe_async_db_connect,
     safe_db_connect,
 )
+from kist.read_errors import _secret_not_found
 
 _MISSING = object()
 _SELECT_MANY_SQL = """
@@ -61,7 +62,7 @@ def _finish(names, values, default):
         if key in values:
             result[key] = values[key]
         elif default is ...:
-            raise KeyError(key)
+            raise _secret_not_found()
         else:
             result[key] = default
     return result
@@ -120,6 +121,7 @@ def get_many(reader, keys, default=..., *, timeout=None):
     names = _names(keys)
     if not names:
         return {}
+    reader._require_password()
     reader._ensure_scope()
     values = {}
     with _connection(safe_db_connect, reader._require_database()) as connection:
@@ -158,11 +160,12 @@ class _SessionReader(Kist):
 
 
 def _copy_reader(source, cls=Kist):
-    reader = cls(profile_name=source.profile_name, password=source.password,
-                 db_url=source.db_url, scope=source.scope)
-    reader.organization_id = source.organization_id
-    reader.project_id = source.project_id
-    reader.profile_id = source.profile_id
+    # Snapshot explicit state, including password=None, without consulting env/files.
+    reader = cls.__new__(cls)
+    for name in ("profile_name", "password", "db_url", "scope", "organization_id",
+                 "project_id", "profile_id"):
+        setattr(reader, name, getattr(source, name))
+    reader._scope_init_lock = threading.RLock()
     return reader
 
 
@@ -275,6 +278,7 @@ class AsyncKist:
         names = _names(keys)
         if not names:
             return {}
+        self._sync._require_password()
         await self._ensure_scope()
         values = {}
         async with _async_connection(safe_async_db_connect, self._sync._require_database()) as connection:

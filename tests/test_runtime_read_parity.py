@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from kist import core
+from kist import SecretNotFoundError, core
 from kist import runtime_reads as rr
 
 
@@ -220,7 +220,7 @@ def test_bulk_missing_and_integrity():
     with pytest.raises(core.DecryptionError):
         rr._decode_rows(reader, bundle, {b"a": "a"}, [(1, b"a"), (2, b"a")])
     assert rr._finish(["a"], {}, None) == {"a": None}
-    with pytest.raises(KeyError, match="a"):
+    with pytest.raises(SecretNotFoundError):
         rr._finish(["a", "b"], {}, ...)
 
 

@@ -62,7 +62,12 @@ from kist.kms import (
     WrappedDataKey,
     get_kms_provider,
 )
-from kist.read_errors import ReadDatabaseError, ReadError, ReadTimeoutError
+from kist.read_errors import (
+    ReadDatabaseError,
+    ReadError,
+    ReadTimeoutError,
+    SecretNotFoundError,
+)
 from kist.status import run_status
 from kist.stores import (
     AsyncDynamicSecretStore,
@@ -88,6 +93,7 @@ __all__ = [
     "ReadError",
     "ReadDatabaseError",
     "ReadTimeoutError",
+    "SecretNotFoundError",
     "MissingKeyError",
     "InvalidEnvelopeError",
     "DecryptionError",

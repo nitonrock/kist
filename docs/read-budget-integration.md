@@ -112,6 +112,7 @@ psycopg, or real Argon2 work was exercised. Ruff, the complete Kist suite, and
 live PostgreSQL results still need local/CI validation.
 
 This increment does not complete the 0.3.1 release gate: connection/crypto/cleanup
-limits, full typed failures, diagnostics/health checks, and consistent missing-key
-behaviour still require their agreed implementation and validation. No package
+limits, remaining typed failures, and diagnostics/health checks still require
+their agreed implementation and validation. Missing-secret semantics are now
+documented in missing-secrets.md. No package
 version, ciphertext format, dependency minimum, or release tag is changed.
