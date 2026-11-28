@@ -68,6 +68,7 @@ from kist.read_errors import (
     ReadTimeoutError,
     SecretNotFoundError,
 )
+from kist.read_trace import PhaseTiming, ReadTrace, trace_reads
 from kist.status import run_status
 from kist.stores import (
     AsyncDynamicSecretStore,
@@ -94,6 +95,9 @@ __all__ = [
     "ReadDatabaseError",
     "ReadTimeoutError",
     "SecretNotFoundError",
+    "PhaseTiming",
+    "ReadTrace",
+    "trace_reads",
     "MissingKeyError",
     "InvalidEnvelopeError",
     "DecryptionError",
