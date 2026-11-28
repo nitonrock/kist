@@ -20,6 +20,7 @@ _PHASES = frozenset({
 })
 _MESSAGES = {
     "read_deadline_exceeded": "Read deadline exceeded",
+    "secret_not_found": "Secret not found",
     "database_authentication_failed": "Database authentication failed",
     "database_permission_denied": "Database permission denied",
     "database_connection_failed": "Database connection failed",
@@ -62,6 +63,25 @@ class ReadError(KistError):
         self.sqlstate = _sqlstate(sqlstate)
         self.retryable = reason_code in _RETRYABLE
         super().__init__(f"{_MESSAGES[reason_code]} during {self.phase}.")
+
+
+class SecretNotFoundError(ReadError, KeyError):
+    """An absent database secret, without retaining its requested name.
+
+    KeyError compatibility is intentional; args contains only a generic message.
+    MissingKeyError continues to mean missing password material, not an absent row.
+    """
+
+    def __init__(self, *, elapsed_seconds=0.0):
+        super().__init__(phase="query", elapsed_seconds=elapsed_seconds,
+                         reason_code="secret_not_found")
+
+    def __str__(self):
+        return self.args[0]
+
+
+def _secret_not_found():
+    return SecretNotFoundError(elapsed_seconds=_elapsed())
 
 
 class ReadDatabaseError(ReadError):

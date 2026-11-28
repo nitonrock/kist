@@ -77,4 +77,4 @@ jobs:
       - name: PostgreSQL tests
         run: uv run pytest -q --ignore=tests/test_ci_projects_e2e.py -k "database or cli_delete_secret or cli_profile_delete"
       - name: Runtime read PostgreSQL integration tests
-        run: uv run pytest -q tests/test_runtime_read_postgres.py tests/test_read_errors_postgres.py
+        run: uv run pytest -q tests/test_runtime_read_postgres.py tests/test_read_errors_postgres.py tests/test_missing_secrets_postgres.py

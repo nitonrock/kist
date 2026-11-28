@@ -354,7 +354,8 @@ def test_sync_scope_uses_one_budget(clock, monkeypatch):
     def scope():
         clock[0] = 6
 
-    reader = SimpleNamespace(_ensure_scope=scope, _require_database=lambda: "unused")
+    reader = SimpleNamespace(_ensure_scope=scope, _require_database=lambda: "unused",
+                             _require_password=lambda: "unit-test-password")
     monkeypatch.setattr(reads, "safe_db_connect", connection.connect)
     with pytest.raises(_ReadTimeoutError) as caught:
         reads.get_many(reader, ["example"], timeout=10)
@@ -421,7 +422,8 @@ def test_async_scope_uses_one_budget(clock, monkeypatch):
 
     connection = DB(clock)
     reader = object.__new__(AsyncKist)
-    reader._sync = SimpleNamespace(_require_database=lambda: "unused")
+    reader._sync = SimpleNamespace(_require_database=lambda: "unused",
+                                   _require_password=lambda: "unit-test-password")
 
     async def scope():
         clock[0] = 6

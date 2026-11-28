@@ -1073,7 +1073,9 @@ class Kist:
     def _get(self, key: str) -> Any:
         from kist._read_budget import _call, _connection
         from kist._read_sql import _cursor
+        from kist.read_errors import _secret_not_found
         key = _validate_secret_key(key)
+        self._require_password()
         self._ensure_scope()
         with _connection(safe_db_connect, self._require_database()) as connection:
             with _cursor(connection) as cursor:
@@ -1081,13 +1083,13 @@ class Kist:
                 _call("schema_check", self._check_schema, cursor)
                 bundle = self._load_bundle(cursor)
                 if bundle is None:
-                    raise KeyError(key)
+                    raise _secret_not_found()
                 _call("query", cursor.execute, """SELECT id, lookup_token, key_bundle_id, crypto_version, secret_version, encrypted_blob
                     FROM kist_secrets WHERE profile_id = %s AND lookup_token = %s""",
                     (self.profile_id, self._lookup_token(bundle, key)))
                 row = _call("query", cursor.fetchone)
                 if row is None:
-                    raise KeyError(key)
+                    raise _secret_not_found()
                 return _call("decrypt", self._decode_row, bundle, row, key)[1]
 
     def get_many(self, keys, default: Any = ..., *, timeout: float | None = None) -> dict[str, Any]:

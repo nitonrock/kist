@@ -47,10 +47,11 @@ error behaviour; they are not the public read-error contract.
 Ordinary write/CLI/admin connections outside a read context retain their prior
 exception behaviour. If a user callback performs a write inside a read context,
 it inherits that context; the isolation guarantee is not for such reentrant use.
-Missing-key, missing-password, malformed-envelope, decryption, input-validation,
-and schema-version exceptions are unchanged in this patch. They are not all
-subclasses of ReadError. Missing-key consistency and health checks remain work
-for the subsequent block, not implied features of this base error class.
+Missing database secrets now use SecretNotFoundError, inheriting ReadError and
+KeyError; see missing-secrets.md for the name-redaction and default semantics.
+Missing-password, malformed-envelope, decryption, input-validation, and schema-
+version exceptions retain their existing types and are not all ReadError.
+Health checks remain subsequent work, not an implied feature of this base class.
 
 ## Classification
 
@@ -115,5 +116,6 @@ crypto, import-graph, or live PostgreSQL validation. Ruff, the full project suit
 and both PostgreSQL CI jobs must still be checked locally/in CI.
 
 No version, ciphertext format, dependency minimum, or release-tag changes.
-No health-check API, successful-read trace callback, or missing-key redesign is
-introduced by this database-error slice. It does not complete the 0.3.1 gate.
+The later missing-secret increment is documented in missing-secrets.md.
+No health-check API or successful-read trace callback is introduced here.
+These changes do not complete the 0.3.1 gate.
